@@ -1,0 +1,68 @@
+{
+  "model": {
+    "name": "dinov2_vits14",
+    "description": "DINOv2 ViT-S/14 without registers, 21M parameters, patch size 14",
+    "sourceRepository": "https://github.com/facebookresearch/dinov2",
+    "modelCard": "https://github.com/facebookresearch/dinov2/blob/7764ea0f912e53c92e82eb78a2a1631e92725fc8/MODEL_CARD.md",
+    "repositoryRevision": "7764ea0f912e53c92e82eb78a2a1631e92725fc8",
+    "torchHubEntrypoint": "torch.hub.load('facebookresearch/dinov2:7764ea0f912e53c92e82eb78a2a1631e92725fc8', 'dinov2_vits14', pretrained=True, trust_repo=True)"
+  },
+  "checkpoint": {
+    "url": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth",
+    "filename": "dinov2_vits14_pretrain.pth",
+    "sha256": "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+  },
+  "descriptor": {
+    "layer": "forward_features(pixel_values)['x_norm_clstoken']",
+    "dimension": 384,
+    "normalization": "L2-normalized by the browser embedding engine after inference (not baked into the ONNX graph)"
+  },
+  "onnxContract": {
+    "inputName": "pixel_values",
+    "inputShape": [
+      "batch_size",
+      3,
+      224,
+      224
+    ],
+    "inputType": "float32",
+    "outputName": "image_features",
+    "outputShape": [
+      "batch_size",
+      384
+    ],
+    "dynamicBatchAxis": true,
+    "opset": 17
+  },
+  "toolchain": {
+    "python": "3.13.13",
+    "torch": "2.12.0+cu130",
+    "torchvision": "0.27.0+cu130",
+    "dinov2RepositoryRevision": "7764ea0f912e53c92e82eb78a2a1631e92725fc8",
+    "transformers": "not used (official Meta torch.hub implementation)",
+    "onnx": "1.22.0",
+    "onnxruntimePython": "1.27.0",
+    "onnxruntimeWeb": "1.26.0",
+    "exporter": {
+      "name": "export_dinov2_vits14_onnx.py",
+      "version": "1.0.0",
+      "sha256": "3a3835235f9a900c9dd1f0e6385ffbf5a71bb67d52ca7e0f707dedd3138f4a66"
+    }
+  },
+  "export": {
+    "command": "python3 tools/model-export/export_dinov2_vits14_onnx.py --output-dir Models/downloads",
+    "torchOnnxExportCall": "torch.onnx.export(wrapper, dummy, 'dinov2_vits14.onnx', input_names=['pixel_values'], output_names=['image_features'], dynamic_axes={'pixel_values': {0: 'batch_size'}, 'image_features': {0: 'batch_size'}}, opset_version=17, do_constant_folding=True)",
+    "xFormersDisabled": true,
+    "date": "2026-07-22T09:44:25.843214+00:00"
+  },
+  "artifacts": {
+    "onnx": {
+      "path": "Models/downloads/dinov2_vits14.onnx",
+      "sha256": "5f3f1192ec107a89e4add77eaf88635a5fe1bd044f7c085b2999c1ab4608601b"
+    },
+    "config": {
+      "path": "Models/dinov2_vits14_config.json",
+      "sha256": "544ccf4f57fa95858a260010042b6c809b9cf366d8d075779222e25e81d4d9a5"
+    }
+  }
+}

@@ -1,0 +1,195 @@
+:root {
+  --yp-red:    #b71c1c;
+  --yp-red-dark: #7f1d1d;
+  --yp-orange: #e65100;
+  --yp-orange-dark: #a63e00;
+  --yp-text-light: #ffffff;
+  --yp-font:  system-ui, -apple-system, sans-serif;
+  /* One size for every line of body copy on every warning kind (issue #76);
+     only the heading is larger. */
+  --yp-text-size: 18px;
+}
+
+* , *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--yp-bg, var(--yp-red));
+  color: var(--yp-text-light);
+  font-family: var(--yp-font);
+  padding: 24px;
+}
+
+/* Only the warn-level kinds override the background; every blocking kind keeps
+   the default red. The device-flow page belongs to the latter (issue #75/#76):
+   it is only ever reached for a hard block, since a non-blocking device-code
+   arrival shows the in-page banner instead of an interstitial. */
+body.yp-kind-interrupted {
+  --yp-bg: var(--yp-orange);
+}
+
+body.yp-kind-clickfix-warn {
+  --yp-bg: var(--yp-orange);
+}
+
+.yp-card {
+  max-width: 560px;
+  text-align: center;
+}
+
+/* The ClickFix kinds are the only ones carrying a command preview. The card
+   widens to hold it, because a preview wider than its container cannot be
+   centered by `margin: auto` -- it simply overflows to one side and takes the
+   whole page's balance with it (issue #62). */
+body.yp-kind-clickfix-block .yp-card,
+body.yp-kind-clickfix-warn .yp-card {
+  max-width: 720px;
+}
+
+/* Brand + severity line (issue #62). */
+.yp-brand {
+  font-size: var(--yp-text-size);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin-bottom: 12px;
+}
+
+.yp-icon {
+  display: inline-block;
+  margin-bottom: 16px;
+}
+
+.yp-icon svg {
+  display: block;
+  width: 48px;
+  height: 48px;
+}
+
+h1 {
+  font-size: 30px;
+  margin-bottom: 16px;
+}
+
+.yp-message {
+  font-size: var(--yp-text-size);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+.yp-hint {
+  font-size: var(--yp-text-size);
+  line-height: 1.5;
+  opacity: 0.85;
+  margin-bottom: 32px;
+}
+
+/* "Do not enter your credentials on this page." is the whole point of the
+   phishing page, so it is not dimmed supporting text here. Weight carries the
+   emphasis; the size stays the shared body size. */
+.yp-kind-phishing .yp-hint {
+  font-weight: 700;
+  opacity: 1;
+}
+
+/* Prose on a ClickFix page reads like prose on every other kind: centered,
+   inheriting the card's alignment (issue #62). Only the command itself keeps a
+   left edge, below. */
+.yp-command-reason {
+  margin: 18px auto 0;
+  padding: 12px 14px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.16);
+  font-size: var(--yp-text-size);
+  line-height: 1.45;
+}
+
+.yp-command-label {
+  margin: 24px 0 8px;
+  font-size: var(--yp-text-size);
+  font-weight: 700;
+}
+
+.yp-command-preview {
+  width: 100%;
+  max-height: 280px;
+  overflow: auto;
+  margin: 0 auto 28px;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  color: #fff;
+  /* Monospace at the shared body size reads larger than the prose around it;
+     one step down keeps the blocked command level with it. */
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: calc(var(--yp-text-size) - 2px);
+  line-height: 1.45;
+  direction: ltr;
+  unicode-bidi: isolate;
+  /* The one deliberate exception to the card's centering: a shell command read
+     from its true left edge is what lets the user see its actual structure.
+     The box around it is centered instead. */
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* Read-only evidence: the blocked command must not be selectable and
+     re-copied from the warning page itself (issue #68). */
+  user-select: none;
+}
+
+.yp-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.yp-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 4px;
+  font-size: var(--yp-text-size);
+  font-family: var(--yp-font);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.yp-btn-close,
+.yp-btn-reanalyse {
+  background: #ffffff;
+  color: var(--yp-bg, var(--yp-red));
+}
+
+.yp-btn-close:hover,
+.yp-btn-reanalyse:hover {
+  background: #f0f0f0;
+}
+
+.yp-btn-proceed,
+.yp-btn-continue,
+.yp-btn-leave {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.yp-btn-proceed:hover,
+.yp-btn-continue:hover,
+.yp-btn-leave:hover {
+  color: #ffffff;
+  border-color: #ffffff;
+}
+
+.yp-btn-proceed-confirm {
+  background: var(--yp-red-dark);
+  color: #ffffff;
+  border-color: var(--yp-red-dark);
+}
+
+.yp-btn-proceed-confirm:hover {
+  background: #991b1b;
+  border-color: #991b1b;
+}

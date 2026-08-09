@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Yodel Phish — Settings</title>
+  <link rel="stylesheet" href="settings.css" />
+</head>
+<body>
+
+  <header>
+    <h1>Yodel Phish</h1>
+    <nav>
+      <button class="tab-btn active" data-tab="trusted">Trusted Sites</button>
+      <button class="tab-btn" data-tab="muted">Muted Sites</button>
+      <button class="tab-btn" data-tab="advanced">Advanced</button>
+    </nav>
+  </header>
+
+  <main>
+
+    <!-- TRUSTED SITE LIST -->
+    <section id="tab-trusted" class="tab-panel active">
+      <p class="hint">Sites you have confirmed as safe. The extension shows a green banner when you visit them.</p>
+      <div id="trusted-list" class="entry-list">
+        <p class="empty-state">No trusted sites yet.</p>
+      </div>
+    </section>
+
+    <!-- MUTED SITE LIST -->
+    <section id="tab-muted" class="tab-panel">
+      <p class="hint">Sites where normal phishing detection is muted. A grey muted-site banner is shown; ClickFix and Device Code protection remain enforced.</p>
+      <div id="muted-list" class="entry-list">
+        <p class="empty-state">No muted sites yet.</p>
+      </div>
+    </section>
+
+    <!-- ADVANCED SETTINGS -->
+    <section id="tab-advanced" class="tab-panel">
+      <!-- BANNER TEXT SIZE (issue #3) -->
+      <div class="setting-row">
+        <div>
+          <strong>Banner text size</strong>
+          <p class="setting-desc">Size of the text in the banners shown on web pages.</p>
+        </div>
+        <div class="font-size-btns" role="radiogroup" aria-label="Banner text size">
+          <button class="font-size-btn font-size-small" data-size="small" title="Small" aria-label="Small text">A</button>
+          <button class="font-size-btn font-size-medium" data-size="medium" title="Medium" aria-label="Medium text">A</button>
+          <button class="font-size-btn font-size-large" data-size="large" title="Large" aria-label="Large text">A</button>
+        </div>
+      </div>
+      <div class="banner-preview" id="banner-font-preview" data-size="small" aria-hidden="true">
+        <span class="banner-preview-brand">Yodel Phish</span>
+        <span class="banner-preview-text">Warning. Potential risk detected. Ask your IT team before entering your credentials.</span>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <strong>Advanced Settings</strong>
+          <p class="setting-desc">Enables diagnostic history and supported advanced protection controls.</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="developer-mode-toggle" />
+          <span class="slider"></span>
+        </label>
+      </div>
+      <!-- MANUAL TRUSTED/MUTED SITES (issue #93) — shown in Developer mode only -->
+      <div class="clickfix-subsection" id="manual-sites-section" hidden>
+        <strong>Manually add Trusted or Muted Sites</strong>
+        <p class="setting-desc">
+          Exact hostnames only (e.g. login.example.com) — no scheme, path, port, or wildcard.
+          An entry covers only that exact hostname, also appears in the Trusted Sites or
+          Muted Sites tab, and stays active when Advanced Settings is turned off.
+        </p>
+        <div class="manual-site-subsection">
+          <strong>Trusted Site</strong>
+          <div class="tag-list" id="manual-trusted-list"></div>
+          <div class="word-input-row">
+            <input type="text" id="manual-trusted-input" class="word-input" placeholder="login.example.com" maxlength="253" />
+            <button id="manual-trusted-add" class="btn-add-word">Add</button>
+            <button id="manual-trusted-cancel" class="btn-secondary" hidden>Cancel</button>
+          </div>
+          <p class="clickfix-error" id="manual-trusted-error" hidden></p>
+        </div>
+        <div class="manual-site-subsection">
+          <strong>Muted Site</strong>
+          <div class="tag-list" id="manual-muted-list"></div>
+          <div class="word-input-row">
+            <input type="text" id="manual-muted-input" class="word-input" placeholder="login.example.com" maxlength="253" />
+            <button id="manual-muted-add" class="btn-add-word">Add</button>
+            <button id="manual-muted-cancel" class="btn-secondary" hidden>Cancel</button>
+          </div>
+          <p class="clickfix-error" id="manual-muted-error" hidden></p>
+        </div>
+      </div>
+
+      <!-- CLICKFIX PROTECTION (issue #26) — shown in Developer mode only (issue #3) -->
+      <div class="setting-row" id="clickfix-warn-mode-row" hidden>
+        <div>
+          <strong>Enable ClickFix warn mode</strong>
+          <p class="setting-desc">
+            Strict mode (default, for everyone) blocks copying a terminal or administrative
+            command from a web page outright.<br>
+            Warn mode is for technical and administrative
+            users: it only prompts when a system tool is combined with suspicious download or
+            execution syntax, and it is less restrictive protection.
+          </p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="clickfix-warn-mode-toggle" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div id="clickfix-exclusions" hidden>
+        <div class="clickfix-subsection">
+          <strong>Trusted domains</strong>
+          <p class="setting-desc">Command lines copy-paste on these domains are never checked while warn mode is enabled.</p>
+          <div class="tag-list" id="clickfix-domain-list"></div>
+          <div class="word-input-row">
+            <input type="text" id="clickfix-domain-input" class="word-input" placeholder="example.com" maxlength="253" />
+            <button id="clickfix-domain-add" class="btn-add-word">Add</button>
+          </div>
+          <p class="clickfix-error" id="clickfix-domain-error" hidden></p>
+        </div>
+      </div>
+
+      <!-- DEVICE CODE AUTHENTICATION (issue #75) — shown in Developer mode only -->
+      <div class="setting-row" id="device-code-auth-row" hidden>
+        <div>
+          <strong>Allow Device Code Authentication</strong>
+          <p class="setting-desc">
+            Block (default) interrupts every device-code sign-in page with a blocking
+            warning page.<br>
+            Allow only warns, except when the page was opened by an
+            unrelated website — that is still blocked.
+          </p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="device-code-auth-toggle" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <!-- DEVICE-CODE PHISHING PROTECTION (issue #39) — shown in Developer mode only (issue #3) -->
+      <div class="clickfix-subsection" id="device-flow-section" hidden>
+        <strong>Device-code login endpoints</strong>
+        <p class="setting-desc">
+          Exact provider sign-in pages that always show a High Risk Login warning, and are
+          interrupted with a warning page when opened by another website. Built-in endpoints
+          cannot be edited or removed.
+        </p>
+        <div class="tag-list" id="device-flow-builtin-list"></div>
+        <p class="setting-desc">
+          Recognized initiator domains (built-in, read-only):
+        </p>
+        <div class="tag-list" id="device-flow-trusted-initiator-list"></div>
+        <p class="setting-desc">Your endpoints:</p>
+        <div class="tag-list" id="device-flow-user-list"></div>
+        <p class="setting-desc">
+          A custom endpoint recognizes only its own registered domain as a trusted initiator.
+        </p>
+        <div class="word-input-row">
+          <input type="text" id="device-flow-endpoint-input" class="word-input" placeholder="login.example.com/device" maxlength="461" />
+          <button id="device-flow-endpoint-add" class="btn-add-word">Add</button>
+          <button id="device-flow-endpoint-cancel" class="btn-secondary" hidden>Cancel</button>
+        </div>
+        <p class="clickfix-error" id="device-flow-endpoint-error" hidden></p>
+      </div>
+
+      <section id="analysis-history-section" class="analysis-history" hidden>
+        <div class="analysis-history-header">
+          <div>
+            <strong>Analysis history</strong>
+            <p class="setting-desc">Detailed diagnostics for the last 25 analyses performed while Advanced Settings is enabled.</p>
+          </div>
+          <div class="analysis-history-actions">
+            <button id="export-analysis-history" class="btn-secondary">Export JSON</button>
+            <button id="clear-analysis-history" class="btn-danger">Clear history</button>
+          </div>
+        </div>
+        <div id="analysis-history-list" class="analysis-history-list"></div>
+      </section>
+
+      <!-- RESET TO SECURE DEFAULTS (issue #75) — shown in Developer mode only -->
+      <div class="setting-row" id="reset-defaults-row" hidden>
+        <div>
+          <strong>Reset to default settings</strong>
+          <p class="setting-desc">Restores every setting on this tab to its secure default, including turning Advanced Settings off. Trusted and Muted Sites added manually above are removed; sites added through page banners are kept.</p>
+        </div>
+        <button id="reset-defaults-btn" class="btn-danger">Reset to defaults</button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ENTRY TEMPLATE — trusted -->
+  <template id="tpl-trusted-entry">
+    <div class="entry-card" data-fqdn="">
+      <div class="entry-header">
+        <div class="entry-meta">
+          <span class="entry-fqdn"></span>
+          <span class="entry-badges">
+            <span class="badge badge-protocol"></span>
+          </span>
+        </div>
+        <button class="btn-remove" title="Remove from trusted list">Remove</button>
+      </div>
+
+      <div class="entry-body">
+        <div class="entry-logo-wrap">
+          <img class="entry-logo" src="" alt="Detected logo" />
+          <span class="entry-logo-missing" hidden>No logo detected</span>
+          <button class="btn-modify-logo">Modify logo</button>
+        </div>
+        <div class="entry-details">
+          <div class="field-row">
+            <span class="field-label">Domain</span>
+            <span class="field-value entry-etld1"></span>
+          </div>
+          <div class="field-row">
+            <span class="field-label">Last visited</span>
+            <span class="field-value entry-last-visited"></span>
+          </div>
+          <div class="field-row advanced-field" hidden>
+            <span class="field-label">Extracted words</span>
+            <div class="tag-list entry-ocr-words"></div>
+          </div>
+          <div class="field-row advanced-field" hidden>
+            <span class="field-label">Your words</span>
+            <div class="user-words-wrap">
+              <div class="tag-list entry-user-words"></div>
+              <div class="word-input-row">
+                <input type="text" class="word-input" placeholder="Add a word…" maxlength="50" />
+                <button class="btn-add-word">Add</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ENTRY TEMPLATE — muted -->
+  <template id="tpl-muted-entry">
+    <div class="entry-card" data-fqdn="">
+      <div class="entry-header">
+        <div class="entry-meta">
+          <span class="entry-fqdn"></span>
+          <span class="entry-badges">
+            <span class="badge badge-protocol"></span>
+          </span>
+        </div>
+        <div class="entry-actions">
+          <button class="btn-move-trusted">Move to Trusted</button>
+          <button class="btn-remove" title="Remove from muted list">Remove</button>
+        </div>
+      </div>
+
+      <div class="entry-body">
+        <div class="entry-details">
+          <div class="field-row">
+            <span class="field-label">Domain</span>
+            <span class="field-value entry-etld1"></span>
+          </div>
+          <div class="field-row">
+            <span class="field-label">Last visited</span>
+            <span class="field-value entry-last-visited"></span>
+          </div>
+          <div class="field-row">
+            <span class="field-label">Muted until</span>
+            <select class="muted-until-select">
+              <option value="forever">Forever</option>
+              <option value="next_login">Next login</option>
+            </select>
+          </div>
+          <div class="field-row advanced-field" hidden>
+            <span class="field-label">Your words</span>
+            <div class="user-words-wrap">
+              <div class="tag-list entry-user-words"></div>
+              <div class="word-input-row">
+                <input type="text" class="word-input" placeholder="Add a word…" maxlength="50" />
+                <button class="btn-add-word">Add</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script src="settings.js"></script>
+</body>
+</html>

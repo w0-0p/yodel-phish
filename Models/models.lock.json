@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "release": "models-v0.1.0",
+  "assets": [
+    {
+      "id": "dinov2-vits14-cls384-opset17",
+      "url": "https://github.com/w0-0p/yodel-phish/releases/download/models-v0.1.0/dinov2-vits14-cls384-opset17-5f3f1192.onnx",
+      "destination": "downloads/dinov2_vits14.onnx",
+      "runtimePath": "models/dinov2_vits14.onnx",
+      "download": {
+        "bytes": 88356485,
+        "sha256": "5f3f1192ec107a89e4add77eaf88635a5fe1bd044f7c085b2999c1ab4608601b",
+        "compression": "none"
+      },
+      "output": {
+        "bytes": 88356485,
+        "sha256": "5f3f1192ec107a89e4add77eaf88635a5fe1bd044f7c085b2999c1ab4608601b"
+      }
+    },
+    {
+      "id": "yodel-logo-yolov8n-opset12",
+      "url": "https://github.com/w0-0p/yodel-phish/releases/download/models-v0.1.0/yodel-logo-yolov8n-opset12-2fab9d36.onnx",
+      "destination": "downloads/yolo-logo.onnx",
+      "runtimePath": "models/yolo-logo.onnx",
+      "download": {
+        "bytes": 12265283,
+        "sha256": "2fab9d367a0d740730e54e72e14b4a507b3aad89b98a9252fa2413cdb216bf8b",
+        "compression": "none"
+      },
+      "output": {
+        "bytes": 12265283,
+        "sha256": "2fab9d367a0d740730e54e72e14b4a507b3aad89b98a9252fa2413cdb216bf8b"
+      }
+    },
+    {
+      "id": "tesseract-eng-best-int",
+      "url": "https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int/eng.traineddata.gz",
+      "destination": "downloads/eng.traineddata",
+      "runtimePath": "tesseract/lang/eng.traineddata",
+      "download": {
+        "bytes": 2952873,
+        "sha256": "45b4cb346724ac1774f1c36f42f182b887bcdb28ebe63e6fff90ac41f3fcff91",
+        "compression": "gzip"
+      },
+      "output": {
+        "bytes": 5199098,
+        "sha256": "5dc5d8d640a212c9d6184921ba103b186f50e0fed9ee716c53e6b312b400d747"
+      }
+    }
+  ]
+}

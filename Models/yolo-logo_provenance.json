@@ -1,0 +1,60 @@
+{
+  "model": {
+    "name": "Yodel logo detector",
+    "architecture": "Ultralytics YOLOv8n",
+    "task": "detect",
+    "classes": { "0": "logo" },
+    "inputShape": [1, 3, 640, 640],
+    "outputShape": [1, 5, 8400]
+  },
+  "export": {
+    "format": "ONNX",
+    "opset": 12,
+    "precision": "FP32",
+    "simplified": true,
+    "dynamic": false,
+    "ultralyticsVersion": "8.4.60",
+    "pytorchVersion": "2.12.0",
+    "date": "2026-06-07T22:44:29.288355",
+    "sha256": "2fab9d367a0d740730e54e72e14b4a507b3aad89b98a9252fa2413cdb216bf8b"
+  },
+  "license": {
+    "name": "AGPL-3.0",
+    "url": "https://www.gnu.org/licenses/agpl-3.0.html"
+  },
+  "training": {
+    "baseModel": "yolov8n.pt",
+    "epochs": 100,
+    "imageSize": 640,
+    "batchSize": 16,
+    "validationFraction": 0.2,
+    "splitSeed": 42,
+    "ultralyticsSeed": 0,
+    "scale": 0.3,
+    "degrees": 5.0,
+    "translate": 0.1,
+    "horizontalFlipProbability": 0.5,
+    "mosaic": 0.5,
+    "mixup": 0.1,
+    "freezeLayers": 10,
+    "note": "These values describe the actual exported model run. In particular, it used scale 0.3 rather than the later experimental scale 0.7 recipe."
+  },
+  "trainingData": {
+    "includedInRepository": false,
+    "title": "Phishing Website Dataset",
+    "creator": "I Kadek Agus Ariesta Putra",
+    "version": "1",
+    "doi": "10.5281/zenodo.8041387",
+    "url": "https://doi.org/10.5281/zenodo.8041387",
+    "license": "CC-BY-4.0",
+    "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+    "selectedScreenshots": 500,
+    "annotatedScreenshots": 494,
+    "emptyLabelScreenshots": 6,
+    "trainingScreenshots": 400,
+    "validationScreenshots": 100,
+    "changes": "Yodel Phish selected a 500-screenshot subset, added logo bounding-box annotations, created a deterministic 400/100 training/validation split, fine-tuned YOLOv8n, and exported the detector to ONNX.",
+    "note": "The original dataset is not redistributed with the extension or source repository. No endorsement by the dataset creator is implied."
+  }
+}
+

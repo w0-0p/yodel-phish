@@ -1,0 +1,42 @@
+# Dependencies
+**/node_modules/
+
+# Downloaded model and language-data cache
+/Models/downloads/
+*.onnx
+*.pt
+*.traineddata
+
+# Generated extension and release artifacts
+/build/
+**/dist/
+*.zip
+*.crx
+*.pem
+
+# Test and analysis output
+/coverage/
+/test-results/
+/playwright-report/
+/.cache/
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+/.claude/
+/.codex/
+/.idea/
+/.vscode/
+
+# Python and operating-system noise
+**/.venv/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.tmp
+

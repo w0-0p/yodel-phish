@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phishing warning — Yodel Phish</title>
+  <link rel="stylesheet" href="interstitial.css" />
+</head>
+<body>
+
+  <main class="yp-card" role="alert" aria-live="assertive" aria-atomic="false">
+    <!-- Says who is speaking and how serious this is, before the specific
+         heading. Upgraded to "Yodel Phish Alert" (blocking) or "Yodel Phish
+         Warning" (warn-level) only when a real warning is displayed; an
+         expired or inactive request keeps the plain brand line. -->
+    <p class="yp-brand" id="yp-brand">Yodel Phish</p>
+    <span class="yp-icon" id="yp-icon"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm5 13.59L15.59 17 12 13.41 8.41 17 7 15.59 10.59 12 7 8.41 8.41 7 12 10.59 15.59 7 17 8.41 13.41 12 17 15.59z"/></svg></span>
+    <h1 id="yp-title" tabindex="-1">Deceptive site ahead</h1>
+    <p class="yp-message" id="yp-message">
+      This site is highly likely impersonating a trusted site.
+    </p>
+    <p class="yp-hint" id="yp-hint">Do not enter your credentials on this page.</p>
+    <p class="yp-command-reason" id="yp-command-reason" hidden></p>
+    <p class="yp-command-label" id="yp-command-label" hidden>Clipboard text (control characters shown as ⟦…⟧)</p>
+    <pre class="yp-command-preview" id="yp-command-preview" dir="ltr" aria-labelledby="yp-command-label" hidden></pre>
+
+    <div class="yp-actions">
+      <button id="yp-btn-close" class="yp-btn yp-btn-close">Close</button>
+      <!-- Only ClickFix warn mode ever reveals this button; it sets its own
+           label. Blocking phishing and device-code pages have no proceed
+           action (issue #93). -->
+      <button id="yp-btn-proceed" class="yp-btn yp-btn-proceed" hidden></button>
+      <button id="yp-btn-reanalyse" class="yp-btn yp-btn-reanalyse" hidden>Analyse updated page</button>
+      <button id="yp-btn-continue" class="yp-btn yp-btn-continue" hidden>Continue without analysis</button>
+      <button id="yp-btn-leave" class="yp-btn yp-btn-leave" hidden>Leave page</button>
+    </div>
+  </main>
+
+  <script src="interstitial.js"></script>
+</body>
+</html>

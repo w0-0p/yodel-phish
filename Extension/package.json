@@ -1,0 +1,37 @@
+{
+  "name": "yodel-phish-extension",
+  "version": "0.1.0",
+  "description": "Local anti-phishing protection for Chromium browsers",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "4.12.0-release.1",
+    "onnxruntime-web": "1.26.0",
+    "tesseract.js": "5.1.1",
+    "tldts": "6.1.86"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0",
+    "ts-loader": "9.6.0",
+    "typescript": "5.9.3",
+    "webpack": "5.107.2",
+    "webpack-cli": "5.1.4"
+  },
+  "scripts": {
+    "models:download": "node ../scripts/download-models.mjs",
+    "models:verify": "node ../scripts/verify-models.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test",
+    "test:integration:build": "webpack --config ../tests/integration/webpack.config.cjs",
+    "test:integration:ui": "node ../tests/integration/test_ui_cover_boxes_browser.mjs",
+    "test:integration:dino": "npm run test:integration:build && node ../tests/integration/test_dinov2_browser.mjs",
+    "test:integration": "npm run test:integration:ui && npm run test:integration:dino",
+    "build": "npm run models:verify && webpack --config webpack.config.js",
+    "package:verify": "node ../scripts/validate-package.mjs",
+    "package": "npm run build && npm run package:verify && node ../scripts/package-extension.mjs",
+    "scan": "node ../scripts/scan-public-tree.mjs"
+  }
+}

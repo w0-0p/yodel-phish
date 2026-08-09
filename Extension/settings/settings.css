@@ -1,0 +1,516 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* The UA rule behind the hidden attribute is a plain `display: none`, so any
+   author `display` below (.setting-row, .field-row, …) would outrank it and
+   paint a row the page has hidden. Every visibility toggle on this page goes
+   through that attribute — keep it authoritative. */
+[hidden] { display: none !important; }
+
+:root {
+  --green:  #2e7d32;
+  --red:    #b71c1c;
+  --grey:   #757575;
+  --border: #e0e0e0;
+  --bg:     #fafafa;
+  --card:   #ffffff;
+  --text:   #212121;
+  --muted:  #757575;
+  --font:   system-ui, -apple-system, sans-serif;
+}
+
+body {
+  font-family: var(--font);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  min-width: 700px;
+}
+
+/* HEADER */
+header {
+  background: #1a1a2e;
+  color: #fff;
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  gap: 32px;
+}
+
+header h1 {
+  font-size: 18px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+nav {
+  display: flex;
+  gap: 4px;
+}
+
+.tab-btn {
+  background: transparent;
+  border: none;
+  color: rgba(255,255,255,0.7);
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.tab-btn:hover  { background: rgba(255,255,255,0.1); color: #fff; }
+.tab-btn.active { background: rgba(255,255,255,0.2); color: #fff; }
+
+/* MAIN */
+main { padding: 24px; max-width: 900px; }
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.hint {
+  color: var(--muted);
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+.empty-state {
+  color: var(--muted);
+  font-style: italic;
+  padding: 32px 0;
+  text-align: center;
+}
+
+/* ENTRY CARD */
+.entry-list { display: flex; flex-direction: column; gap: 16px; }
+
+/* Groups the (up to 2) stored reference variants for the same trusted fqdn so
+   they visually read as one site, set apart from neighboring entries. */
+.entry-group {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 14px 0 16px;
+  border-top: 2px solid var(--grey);
+  border-bottom: 2px solid var(--grey);
+}
+
+.entry-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 2px;
+}
+
+.entry-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.entry-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #f5f5f5;
+  border-bottom: 1px solid var(--border);
+}
+
+.entry-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.entry-fqdn {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.entry-badges { display: flex; gap: 4px; }
+
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.badge-protocol { background: #e3f2fd; color: #0d47a1; }
+
+.entry-actions { display: flex; gap: 8px; }
+
+.btn-remove {
+  background: transparent;
+  border: 1px solid #e0e0e0;
+  color: var(--red);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.btn-remove:hover { background: #ffebee; }
+
+.btn-move-trusted {
+  background: var(--green);
+  border: none;
+  color: #fff;
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.btn-move-trusted:hover { background: #1b5e20; }
+
+/* ENTRY BODY */
+.entry-body {
+  display: flex;
+  gap: 16px;
+  padding: 16px;
+}
+
+.entry-logo-wrap {
+  flex-shrink: 0;
+  width: 120px;
+  min-height: 80px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.entry-logo {
+  width: 120px;
+  height: 80px;
+  object-fit: contain;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #eee;
+}
+
+.entry-logo-missing {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.entry-details {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 12px;
+  width: 120px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.field-value {
+  font-size: 13px;
+}
+
+/* TAGS */
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tag {
+  background: #e8f5e9;
+  color: #2e7d32;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tag-remove {
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: #555;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.tag-remove:hover { color: var(--red); }
+
+.tag-edit {
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  color: #555;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.tag-edit:hover { color: var(--text); }
+
+/* USER WORD INPUT */
+.user-words-wrap { display: flex; flex-direction: column; gap: 6px; }
+
+.word-input-row {
+  display: flex;
+  gap: 6px;
+}
+
+.word-input {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+  width: 160px;
+}
+
+.btn-add-word {
+  background: var(--green);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-add-word:hover { background: #1b5e20; }
+
+/* MUTED UNTIL SELECT */
+.muted-until-select {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* ADVANCED SETTINGS */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.setting-desc { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+.analysis-history { padding-top: 20px; }
+
+.analysis-history-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.analysis-history-actions { display: flex; gap: 8px; }
+
+.btn-secondary, .btn-danger {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.btn-danger { color: var(--red); }
+.btn-secondary:disabled, .btn-danger:disabled { opacity: 0.45; cursor: default; }
+
+.analysis-history-list { display: flex; flex-direction: column; gap: 10px; }
+
+.analysis-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--grey);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.analysis-card.verdict-phishing { border-left-color: var(--red); }
+.analysis-card.verdict-suspicious { border-left-color: #ef6c00; }
+.analysis-card.verdict-trusted { border-left-color: var(--green); }
+
+.analysis-summary {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 100px 110px 170px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  background: #f5f5f5;
+}
+
+.analysis-summary-title { font-weight: 600; overflow-wrap: anywhere; }
+.analysis-verdict { font-size: 12px; font-weight: 600; }
+.analysis-score, .analysis-date { font-size: 12px; color: var(--muted); }
+.analysis-date { text-align: right; }
+.analysis-body { padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+
+.analysis-block h3 { font-size: 13px; margin-bottom: 8px; }
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 5px 12px;
+  font-size: 12px;
+}
+
+.metric-grid dt { color: var(--muted); }
+.metric-grid dd { overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.analysis-error {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--red);
+  font: 12px var(--font);
+}
+
+/* BANNER TEXT SIZE (issue #3) */
+.font-size-btns { display: flex; gap: 8px; flex-shrink: 0; }
+
+.font-size-btn {
+  width: 48px;
+  height: 48px;
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1;
+}
+
+.font-size-btn.font-size-small  { font-size: 14px; }
+.font-size-btn.font-size-medium { font-size: 19px; }
+.font-size-btn.font-size-large  { font-size: 25px; }
+
+.font-size-btn:hover { border-color: #bdbdbd; background: #f5f5f5; }
+
+.font-size-btn.active {
+  border-color: var(--green);
+  background: #e8f5e9;
+  color: var(--green);
+}
+
+/* Live example of how the banner text will look at the selected size. */
+.banner-preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  margin: 12px 0 4px;
+  border-radius: 4px;
+  background: #e65100;
+  color: #fff;
+  font-size: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.banner-preview[data-size="medium"] { font-size: 17px; }
+.banner-preview[data-size="large"]  { font-size: 20px; }
+
+.banner-preview-brand { font-weight: 700; flex-shrink: 0; }
+.banner-preview-text { flex: 1; text-align: center; line-height: 1.4; }
+
+/* TOGGLE SWITCH — flex-shrink 0 keeps its fixed size next to long labels */
+.toggle { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: #ccc;
+  border-radius: 24px;
+  transition: background 0.2s;
+}
+
+.slider::before {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  left: 3px;
+  bottom: 3px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.toggle input:checked + .slider { background: var(--green); }
+.toggle input:checked + .slider::before { transform: translateX(20px); }
+
+/* CLICKFIX PROTECTION */
+.clickfix-subsection { padding: 16px 0; border-bottom: 1px solid var(--border); }
+.clickfix-subsection:last-child { border-bottom: none; }
+.clickfix-subsection > strong { display: block; margin-bottom: 4px; }
+
+/* The override toggles start their protection groups. Their related lists are
+   continuations of the same group, so the separator belongs before the toggle,
+   not between the toggle and its configuration. */
+#clickfix-warn-mode-row,
+#device-code-auth-row {
+  border-top: 1px solid var(--border);
+  border-bottom: none;
+}
+
+/* The preceding manual-sites group ends at the ClickFix group separator. */
+#manual-sites-section { border-bottom: none; }
+
+/* Keep each override visually paired with its associated configuration. */
+#clickfix-exclusions .clickfix-subsection {
+  padding-top: 0;
+  border-bottom: none;
+}
+
+#device-flow-section { padding-top: 0; }
+
+.clickfix-error { color: var(--red); font-size: 12px; margin-top: 6px; }
+
+/* MANUAL TRUSTED/MUTED SITES (issue #93) */
+.manual-site-subsection { margin-top: 14px; }
+.manual-site-subsection > strong { display: block; margin-bottom: 4px; font-size: 13px; }
+
+.btn-modify-logo {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  width: 100%;
+}
+
+.btn-modify-logo:hover {
+  background: #eeeeee;
+  color: var(--text);
+  border-color: #bdbdbd;
+}

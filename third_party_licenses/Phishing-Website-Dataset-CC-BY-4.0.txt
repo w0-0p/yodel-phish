@@ -1,0 +1,16 @@
+Phishing Website Dataset, version 1
+Creator: I Kadek Agus Ariesta Putra
+DOI: 10.5281/zenodo.8041387
+Source: https://doi.org/10.5281/zenodo.8041387
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+License terms: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Yodel Phish used a selected subset of 500 screenshots, added logo bounding-box
+annotations, created a deterministic 400/100 training/validation split, and
+exported a fine-tuned logo detector. The original dataset is not redistributed
+with the Yodel Phish extension or source repository. No endorsement is
+implied.
+
+CC BY 4.0 permits sharing and adaptation with appropriate credit, a link to
+the license, and an indication of changes. It does not grant trademark rights
+or imply endorsement.

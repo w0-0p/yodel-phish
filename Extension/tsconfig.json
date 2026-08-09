@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "@techstark/opencv-js": ["node_modules/@techstark/opencv-js"],
+      "onnxruntime-web": ["node_modules/onnxruntime-web"],
+      "tesseract.js": ["node_modules/tesseract.js"]
+    },
+    "lib": ["ES2022", "DOM", "WebWorker"],
+    "types": [],
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "rootDir": ".."
+  },
+  "include": [
+    "../src/detection/**/*.ts",
+    "../tests/integration/fixtures/**/*.ts"
+  ]
+}
+

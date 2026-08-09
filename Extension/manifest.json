@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "Yodel Phish",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "incognito": "split",
+  "description": "Anti-phishing browser extension — detects login page impersonation.",
+
+  "permissions": [
+    "alarms",
+    "webNavigation",
+    "storage",
+    "unlimitedStorage",
+    "scripting",
+    "offscreen",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+
+  "background": {
+    "service_worker": "dist/service_worker.js"
+  },
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; object-src 'self'"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/login-detector.js", "content/content.js"],
+      "css": ["content/banner.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/login-detector.js", "content/login-frame.js"],
+      "all_frames": true,
+      "match_origin_as_fallback": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/clickfix-page-hook.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_origin_as_fallback": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/clickfix-policy.js", "content/clickfix.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_origin_as_fallback": true
+    }
+  ],
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "action": {
+    "default_title": "Yodel Phish",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "options_page": "settings/settings.html"
+}

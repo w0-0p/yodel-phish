@@ -1,0 +1,38 @@
+{
+  "staticFiles": [
+    "manifest.json",
+    "icons/icon16.png",
+    "icons/icon32.png",
+    "icons/icon48.png",
+    "icons/icon128.png",
+    "content/banner.css",
+    "content/clickfix-page-hook.js",
+    "content/clickfix-policy.js",
+    "content/clickfix.js",
+    "content/content.js",
+    "content/login-detector.js",
+    "content/login-frame.js",
+    "interstitial/interstitial.css",
+    "interstitial/interstitial.html",
+    "interstitial/interstitial.js",
+    "logo-selector/logo-selector.js",
+    "popup/popup.css",
+    "popup/popup.html",
+    "popup/popup.js",
+    "runtime/clipboard.js",
+    "runtime/loader.js",
+    "runtime/offscreen.html",
+    "settings/settings.css",
+    "settings/settings.html",
+    "settings/settings.js"
+  ],
+  "generatedRoots": [
+    "dist",
+    "models",
+    "opencv",
+    "ort-wasm",
+    "tesseract",
+    "third_party_licenses"
+  ]
+}
+

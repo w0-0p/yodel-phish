@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Yodel Phish</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+
+  <h1>Yodel Phish</h1>
+
+  <button id="run-analysis" class="menu-item">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="10.5" cy="10.5" r="6.5" />
+      <line x1="15.5" y1="15.5" x2="20.5" y2="20.5" />
+    </svg>
+    <span>Run manual analysis</span>
+  </button>
+
+  <button id="open-settings" class="menu-item">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+    <span>Open settings</span>
+  </button>
+
+  <button id="report-issue" class="menu-item" aria-expanded="false" aria-controls="report-panel">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="2.5" y="5" width="19" height="14" rx="2" />
+      <path d="M3 6.5l9 6.5 9-6.5" />
+    </svg>
+    <span>Report an issue</span>
+  </button>
+
+  <div id="report-panel" class="report-panel" hidden>
+    <p class="report-label">GitHub issues</p>
+    <a href="https://github.com/w0-0p/yodel-phish/issues" target="_blank" rel="noreferrer">https://github.com/w0-0p/yodel-phish/issues</a>
+  </div>
+
+  <p id="status" class="status" role="status" aria-live="polite" hidden></p>
+
+  <script src="popup.js"></script>
+</body>
+</html>
