@@ -9,12 +9,13 @@ DINOv2.
 
 ## Privacy
 
-The installed extension performs screenshot, OCR, and model inference locally.
-It has no telemetry or runtime upload endpoint. Some protection and
-trusted-site data is stored in Chrome extension storage. Developer Mode can
-also retain up to 25 hostname-only diagnostic records, logo-crop OCR evidence,
-and a compared-logo crop; those records can be exported or cleared from
-Settings.
+The installed extension performs screenshot capture, OCR, and model inference entirely on the local device.
+It does not send screenshots, OCR results, model inputs or outputs, diagnostic data, or other runtime information
+to any external service, and it has no telemetry or runtime upload endpoint. Some protection and trusted-site data
+is stored locally in Chrome extension storage. Advanced settings can also retain up to 25 local hostname-only diagnostic
+records, logo-crop OCR evidence, and a compared-logo crop; these records remain on the device unless the user explicitly
+exports them from Settings, and they can be cleared at any time.
+
 
 See [PRIVACY.md](PRIVACY.md) for the complete data and retention description.
 
