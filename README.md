@@ -5,11 +5,9 @@ impersonation, ClickFix-style clipboard attacks, and suspicious OAuth
 device-code navigation. Detection runs locally with OCR, OpenCV, YOLO, and
 DINOv2.
 
-> **Beta software:** version 0.1.0 is intended for testing. Detection can
-> produce false positives and false negatives. Do not use it as your only
-> phishing defense.
+> **Beta software:** version 0.1.0 is intended for testing.
 
-## Privacy at a glance
+## Privacy
 
 The installed extension performs screenshot, OCR, and model inference locally.
 It has no telemetry or runtime upload endpoint. Some protection and
@@ -39,13 +37,8 @@ npm test
 npm run build
 ```
 
-The build is written to `build/extension/`; generated files are never written
-back into the source tree.
-
-The custom DINOv2 and YOLO assets must first be published under the
-`models-v0.1.0` GitHub release. Until that bootstrap release exists,
-`models:download` will correctly fail for those two URLs. Exact filenames,
-sizes, and hashes are recorded in [Models/models.lock.json](Models/models.lock.json).
+The build is written to `build/extension/`
+Exact filenames, sizes, and hashes are recorded in [Models/models.lock.json](Models/models.lock.json).
 
 ## Test and package
 
@@ -87,19 +80,10 @@ To test the unpacked extension:
 3. Select **Load unpacked**.
 4. Choose `build/extension/`.
 
-Chrome's **Developer mode** for loading unpacked extensions is separate from
-Yodel Phish's own advanced **Developer Mode** setting.
-
 ## Advanced settings
 
-The beta intentionally retains the application's integrated Developer Mode,
-diagnostics history, policy overrides, and custom device-flow endpoints. These
-are supported beta features, not build sidecars.
+Advanced settings let users switch between strict and warn modes for ClickFix and device-flow endpoint controls, and activate diagnostic history.
 
-Developer Mode exposes diagnostics and controls that can weaken default
-protection. Diagnostic exports can contain hostnames, logo-crop OCR evidence,
-and a compared-logo image. Use these controls on a test profile and review
-exported JSON before sharing it.
 
 ## Permissions
 
@@ -113,8 +97,6 @@ exported JSON before sharing it.
 | `clipboardWrite` | Write text after the configured ClickFix policy is applied. |
 | `alarms` | Expire short-lived warning and device-flow state. |
 
-These broad permissions remain subject to review before store submission.
-
 ## Repository layout
 
 ```text
@@ -126,9 +108,6 @@ tests/integration/     browser integration tests and test-only fixture
 third_party_licenses/  license texts for packaged dependencies and models
 build/                 generated locally; ignored by Git
 ```
-
-Validation CLIs, model-training datasets, tuning reports, local environments,
-and generated development output are intentionally excluded.
 
 ## Model integrity and provenance
 
