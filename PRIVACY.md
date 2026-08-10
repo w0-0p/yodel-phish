@@ -21,7 +21,7 @@ detected logo regions and crops, embeddings, comparison scores, copied command
 text and its source URL, and device-code navigation relationships.
 
 OCR, OpenCV and ONNX inference run in the extension's local offscreen
-document. Full screenshots are not retained in persistent storage.
+document. **Full screenshots are not retained in persistent storage.**
 
 ## Persistent local storage
 
@@ -31,9 +31,9 @@ source URLs and visit dates, logo crops, OCR labels or words, model features
 and embeddings, and comparison scores. This information stays in
 browser-managed extension storage unless the user exports or shares it.
 
-## Developer Mode diagnostics
+## Advanced Settings diagnostics
 
-When the application's Developer Mode and analysis history are enabled, the
+When the application's Advanced Settings and analysis history are enabled, the
 extension retains at most the 25 most recent diagnostic records. A record can
 include the analysed page's hostname and a timestamp, extension and policy
 state, verdicts, scores and timing data, matched trusted-reference information,
@@ -41,20 +41,13 @@ the brand words matched or rejected by OCR, logo-crop OCR text, and the
 compared-logo crop image.
 
 A record does not retain the page's own OCR text, nor its address beyond the
-hostname: a full URL can carry session tokens, password-reset codes or personal
-data in its path, query or fragment. A scanned local file is identified by a
-digest of its address rather than by the path itself. Records written by
-earlier versions are discarded when the extension next starts, rather than
-retaining their older, more detailed diagnostic shape.
+hostname. A scanned local file is identified by a digest of its address rather
+than by the path itself.
 
 Settings provides controls to export this history as JSON and to clear it.
 Exports can contain sensitive browsing information and should be reviewed
 before sharing. The extension explicitly does not append analysis-history
 records while operating in incognito mode.
-
-Other settings or trusted-reference records may be shared by Chrome's
-extension-storage implementation between regular and incognito extension
-contexts. Incognito mode should not be treated as a separate storage vault.
 
 ## Temporary session storage
 
@@ -69,8 +62,8 @@ These records use session storage and expire automatically.
 ## Clipboard access
 
 The extension uses an offscreen document to write requested text to the
-clipboard after applying the configured ClickFix policy. It does not
-continuously read the clipboard.
+clipboard after applying the configured ClickFix policy. **It does not
+continuously read the clipboard.**
 
 ## Retention and deletion
 
