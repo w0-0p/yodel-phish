@@ -62,29 +62,10 @@ at the archive root. It also writes
 `build/yodel-phish-0.1.0.zip.SOURCE.txt`, which identifies the corresponding
 source for that exact version and must be distributed beside the ZIP.
 
-## Release distribution
-
-Every GitHub release and browser-store listing that distributes version
-`0.1.0` must place this statement beside its download or install action:
-
-> Source code for Yodel Phish 0.1.0 (AGPL-3.0-only):
-> https://github.com/w0-0p/yodel-phish/tree/v0.1.0
-
-The version in the URL must match the distributed package. Create and publish
-the matching immutable Git tag before making the ZIP or store listing public.
-See [RELEASING.md](RELEASING.md) for the release checklist and reusable text.
-
-To test the unpacked extension:
-
-1. Open `chrome://extensions`.
-2. Enable **Developer mode** in Chrome.
-3. Select **Load unpacked**.
-4. Choose `build/extension/`.
-
 ## Advanced settings
 
-Advanced settings let users switch between strict and warn modes for ClickFix and device-flow endpoint controls, and activate diagnostic history.
-
+Advanced settings let users switch between strict and warn modes for ClickFix and device-flow endpoint controls,
+and activate diagnostic history.
 
 ## Permissions
 
