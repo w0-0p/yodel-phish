@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../Extension/icons/icon128.png" width="96" alt="Yodel Phish icon">
+  <img src="assets/icon128.png" width="96" alt="Yodel Phish icon">
 </p>
 
 <h1 align="center">Yodel Phish</h1>
