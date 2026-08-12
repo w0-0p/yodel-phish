@@ -67,7 +67,7 @@ Yodel Phish performs its analysis inside the browser. When it finds a page that 
 ![Click](assets/media/full_resolution/05_clickfix.gif)
 
 *Device Code Phish*
-![Code](assets/media/full_resolution/06_device_code_auth.gif)
+![Code](assets/media/full_resolution/06_device_code_auth2.gif)
 
 *ClickFix Warn Mode*
 ![Warn](assets/media/full_resolution/07_1_clickfix_warn_combined.gif)
@@ -101,7 +101,7 @@ Yodel Phish is built so protection does not require handing over your browsing d
 - It does not continuously read your clipboard. Clipboard writes are mediated only when its ClickFix policy is applied.
 - Diagnostic history is optional, disabled unless Advanced Settings are enabled, limited to the most recent 25 analyses, and can be exported or cleared by you.
 
-Some local data is necessarily retained to make protection useful: settings, trusted or muted hostnames, trusted-reference data, and temporary warning state. See the full [Privacy Policy](PRIVACY.md) for what is processed, retained, and deleted.
+Some local data is necessarily retained to make protection useful: settings, trusted or muted hostnames, trusted-reference data, and temporary warning state. See the full [Privacy Policy](https://github.com/w0-0p/yodel-phish/blob/main/PRIVACY.md) for what is processed, retained, and deleted.
 
 ## Your controls
 
@@ -130,9 +130,9 @@ npm run build
 ```
 ## Built openly
 
-Yodel Phish is open source under the [GNU Affero General Public License v3.0 only](LICENSE). The project uses established local-analysis components including Tesseract.js, OpenCV, ONNX Runtime, YOLO, and DINOv2. Model provenance and third-party notices are documented in the repository.
+Yodel Phish is open source under the [GNU Affero General Public License v3.0 only](https://github.com/w0-0p/yodel-phish/blob/main/LICENSE). The project uses established local-analysis components including Tesseract.js, OpenCV, ONNX Runtime, YOLO, and DINOv2. Model provenance and third-party notices are documented in the repository.
 
-If you find a bug, false positive, or false negative, please [open an issue](https://github.com/w0-0p/yodel-phish/issues). For security-sensitive reports, follow the project's [security policy](SECURITY.md).
+If you find a bug, false positive, or false negative, please [open an issue](https://github.com/w0-0p/yodel-phish/issues). For security-sensitive reports, follow the project's [security policy](https://github.com/w0-0p/yodel-phish/blob/main/SECURITY.md).
 
 ## Disclaimer
 
