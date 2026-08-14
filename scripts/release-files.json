@@ -5,7 +5,6 @@
     "icons/icon32.png",
     "icons/icon48.png",
     "icons/icon128.png",
-    "content/banner.css",
     "content/clickfix-page-hook.js",
     "content/clickfix-policy.js",
     "content/clickfix.js",

@@ -4,6 +4,11 @@
 
 let alreadyAnalysing = false;
 let dismissed = false;
+// The banner's anonymous light-DOM host and, inside its closed Shadow Root,
+// the banner element itself (issue #9). Only the host ever touches the page's
+// DOM; everything the banner renders and styles stays behind the shadow
+// boundary, out of reach of host-page CSS.
+let bannerHostEl = null;
 let bannerEl = null;
 // State needed to update one banner in place and coordinate delayed progress
 // with screenshot capture.
@@ -100,10 +105,7 @@ function offerReanalysis() {
   if (verdict !== "unknown" && verdict !== "suspicious") return;
 
   const reanalyseBtn = bannerEl.querySelector(".yp-btn-reanalyse");
-  if (reanalyseBtn?.hidden) {
-    reanalyseBtn.hidden = false;
-    markExtensionMutation(bannerEl);
-  }
+  if (reanalyseBtn?.hidden) reanalyseBtn.hidden = false;
 }
 
 // Observe both visual state and detector metadata. Both sets live in
@@ -297,10 +299,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!isCurrentJobMessage(message)) return false;
     bannerHiddenForCapture = false;
     capturePending = false;
-    if (bannerEl) {
-      bannerEl.style.removeProperty("visibility");
-      markExtensionMutation(bannerEl);
-    }
+    if (bannerEl) bannerEl.style.removeProperty("visibility");
     if (alreadyAnalysing) {
       // The capture is what releases a held-back banner. A trusted refresh has
       // its verdict already ("trusted_drift" is only ever entered for it); every
@@ -491,10 +490,7 @@ async function preparePageForCapture(jobId) {
     // The job can be cancelled while the stability wait is in progress. Its
     // late continuation must not hide a newer job's banner in the same SPA.
     if (jobId !== currentJobId) throw new Error("Capture job is no longer current");
-    if (bannerEl) {
-      bannerEl.style.visibility = "hidden";
-      markExtensionMutation(bannerEl);
-    }
+    if (bannerEl) bannerEl.style.visibility = "hidden";
     await waitForAnimationFrames(2);
   }
 }
@@ -597,6 +593,219 @@ function refreshBannerFontSize() {
       if (bannerEl) bannerEl.dataset.fontSize = size;
     })
     .catch(() => {});
+}
+
+// All banner styling lives inside the banner's closed Shadow Root (issue #9),
+// the same isolation the logo selector uses: host-page CSS cannot reach the
+// banner's internals through ordinary selectors, and none of these rules can
+// leak onto matching host-page elements.
+//
+// The :host declarations are all !important because, for the host element,
+// important declarations from the inner (shadow) context outrank the host
+// document's — even a page's own `div { display: none !important }` cannot
+// collapse or reposition the banner. `all: initial` cuts ordinary inheritance
+// at the boundary; direction and bidi isolation (which `all` deliberately does
+// not reset) are fixed explicitly below. The palette custom properties and the
+// spinner keyframes are scoped to the shadow tree, so page-defined `--yp-*`
+// values or a page `yp-spin` animation cannot alter the banner either.
+const BANNER_CSS = `
+  :host {
+    all: initial !important;
+    display: block !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    z-index: 2147483647 !important;
+    direction: ltr !important;
+    unicode-bidi: isolate !important;
+    /* The fixed host keeps the banner dimensions while its inner element is
+       hidden for capture. Never let that transparent box intercept the page;
+       the visible banner opts back into hit testing below. */
+    pointer-events: none !important;
+  }
+
+  #yp-banner {
+    --yp-green:  #2e7d32;
+    --yp-orange: #e65100;
+    --yp-red:    #b71c1c;
+    --yp-grey:   #424242;
+    --yp-blue:   #8fbcf2;
+    --yp-white:  #f5f5f5;
+    --yp-text-light: #ffffff;
+    --yp-text-dark:  #212121;
+    --yp-font:   system-ui, -apple-system, sans-serif;
+
+    background-color: var(--yp-bg, #424242);
+    color: var(--yp-text-light);
+    font: 400 14px/normal var(--yp-font);
+    /* "small" is the original size; the user can pick a larger one in settings
+       (issue #3). Buttons and icon use em units so they scale along. */
+    letter-spacing: normal;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    pointer-events: auto;
+  }
+
+  #yp-banner[data-font-size="medium"] { font-size: 17px; }
+  #yp-banner[data-font-size="large"]  { font-size: 20px; }
+
+  /* The only light-background verdict needs dark text; the progress verdicts
+     are blue with light text (issue #68). */
+  #yp-banner[data-verdict="unknown"] {
+    color: var(--yp-text-dark);
+  }
+
+  .yp-inner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    max-width: 100%;
+    flex-wrap: wrap;
+    box-sizing: border-box;
+  }
+
+  .yp-brand {
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    flex-shrink: 0;
+  }
+
+  .yp-icon {
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+
+  .yp-icon svg {
+    display: block;
+    width: 1.5em;
+    height: 1.5em;
+  }
+
+  .yp-icon .yp-spin {
+    animation: yp-spin 900ms linear infinite;
+  }
+
+  @keyframes yp-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .yp-icon .yp-spin { animation: none; }
+  }
+
+  /* The message is centered in the banner; the brand label sits on the left
+     (issue #3). */
+  .yp-message {
+    flex: 1;
+    line-height: 1.4;
+    text-align: center;
+  }
+
+  .yp-progress-note {
+    display: block;
+    font-size: 0.85em;
+    opacity: 0.85;
+  }
+
+  .yp-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  /* Only user-agent defaults exist inside the shadow root, so every control
+     is styled from scratch here — no variant may depend on what a site's
+     stylesheet happens to do to buttons (issue #9). The base is the neutral
+     solid button; variants override it. */
+  .yp-btn {
+    appearance: none;
+    margin: 0;
+    padding: 6px 14px;
+    border: none;
+    border-radius: 4px;
+    background-color: #757575;
+    color: #ffffff;
+    font: 500 0.93em/normal var(--yp-font);
+    letter-spacing: normal;
+    text-transform: none;
+    text-shadow: none;
+    text-decoration: none;
+    box-shadow: none;
+    cursor: pointer;
+  }
+
+  /* Close is an icon-only button; the SVG cross is drawn with a thick stroke so
+     it reads as a clear, standard close control (issue #3). */
+  .yp-btn-close-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px;
+    background: transparent;
+    color: currentColor;
+    opacity: 0.85;
+  }
+
+  .yp-btn-close-x:hover { opacity: 1; }
+
+  .yp-btn-close-x svg {
+    display: block;
+    width: 1.35em;
+    height: 1.35em;
+  }
+
+  .yp-btn-add {
+    background-color: #2e7d32;
+  }
+
+  .yp-btn-add:hover {
+    background-color: #1b5e20;
+  }
+
+  .yp-btn-mute {
+    background-color: #757575;
+  }
+
+  .yp-btn-mute:hover {
+    background-color: #616161;
+  }
+
+  .yp-btn-close,
+  .yp-btn-reanalyse {
+    background-color: transparent;
+    color: currentColor;
+    border: 1px solid currentColor;
+    opacity: 0.65;
+  }
+
+  .yp-btn-close:hover,
+  .yp-btn-reanalyse:hover {
+    opacity: 1;
+  }
+
+  .yp-btn-retry {
+    background-color: #2e7d32;
+  }
+
+  .yp-btn-retry:hover {
+    background-color: #1b5e20;
+  }
+`;
+
+// A constructed stylesheet is preferred over a <style> element: an inline
+// <style> inside the shadow tree is still part of the host document and can be
+// blocked by the page's own style-src CSP, while an adopted sheet cannot.
+function applyBannerStylesheet(shadow) {
+  try {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(BANNER_CSS);
+    shadow.adoptedStyleSheets = [sheet];
+  } catch {
+    const style = document.createElement("style");
+    style.textContent = BANNER_CSS;
+    shadow.appendChild(style);
+  }
 }
 
 // Verdict icons drawn as inline SVG rather than text symbols like "ⓘ"/"✗",
@@ -818,10 +1027,24 @@ function renderBanner(verdict, config, data, message, state) {
   bannerState = state;
 
   if (bannerEl === null) {
+    // The host carries no stable id or class, avoiding ordinary selector
+    // collisions. It is still part of the shared document and page JavaScript
+    // can observe or remove it; the closed root protects only its internals.
+    // It also keeps the banner controls out of the login detector shadow walk.
+    // The banner id below is scoped to the shadow tree and invisible to
+    // document selectors. Positioning lives in the :host block of BANNER_CSS
+    // because shadow-context !important outranks page CSS on the host.
+    bannerHostEl = document.createElement("div");
+    const shadow = bannerHostEl.attachShadow({ mode: "closed" });
+    applyBannerStylesheet(shadow);
     bannerEl = document.createElement("div");
     bannerEl.id = "yp-banner";
     bannerEl.setAttribute("role", "status");
-    document.body.prepend(bannerEl);
+    bannerEl.setAttribute("lang", "en");
+    bannerEl.setAttribute("dir", "ltr");
+    shadow.appendChild(bannerEl);
+    document.body.prepend(bannerHostEl);
+    markExtensionMutation(bannerHostEl);
   }
 
   // A state rendered during capture must not appear in the screenshot.
@@ -887,8 +1110,6 @@ function renderBanner(verdict, config, data, message, state) {
   } else {
     stopProgressNote();
   }
-
-  markExtensionMutation(bannerEl);
 }
 
 // Long analyses (e.g. when no logo is detected quickly) look stalled behind a
@@ -923,7 +1144,6 @@ function updateProgressNote() {
     note = document.createElement("span");
     note.className = "yp-progress-note";
     messageEl.appendChild(note);
-    markExtensionMutation(bannerEl);
   }
   const seconds = Math.round(elapsedMs / 1000);
   if (elapsedMs < PROGRESS_NOTE_STILL_AFTER_MS) {
@@ -939,9 +1159,10 @@ function removeBanner() {
   clearProgressTimer();
   capturePending = false;
   stopProgressNote();
-  const removedBanner = bannerEl;
-  removedBanner?.remove();
-  if (removedBanner) markExtensionMutation(removedBanner);
+  const removedHost = bannerHostEl;
+  removedHost?.remove();
+  if (removedHost) markExtensionMutation(removedHost);
+  bannerHostEl = null;
   bannerEl = null;
   bannerState = null;
 }
