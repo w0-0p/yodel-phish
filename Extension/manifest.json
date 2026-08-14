@@ -31,7 +31,6 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content/login-detector.js", "content/content.js"],
-      "css": ["content/banner.css"],
       "run_at": "document_idle"
     },
     {

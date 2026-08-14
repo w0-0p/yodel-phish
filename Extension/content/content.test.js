@@ -106,6 +106,20 @@ function createFakeElement(tagName) {
       this._removed = true;
     },
     prepend() {},
+    // The banner mounts inside a closed Shadow Root on an anonymous host
+    // (issue #9). The fake root records what was appended so tests can reach
+    // the banner element and its stylesheet behind the boundary.
+    attachShadow(options) {
+      this._shadow = {
+        mode: options?.mode,
+        children: [],
+        appendChild(node) {
+          this.children.push(node);
+          return node;
+        },
+      };
+      return this._shadow;
+    },
     set innerHTML(value) {
       this._renders += 1;
       this._html = value;
@@ -135,6 +149,12 @@ function loadContentScript({
   const sentMessages = [];
   let onMessageListener = null;
   const loginState = { isLoginPage: false };
+
+  // What body.prepend receives is the anonymous shadow host (issue #9); the
+  // banner element itself lives inside its fake shadow root, recognizable as
+  // the child carrying role="status".
+  const bannerRoot = (host) =>
+    host?._shadow?.children.find((node) => node.getAttribute?.("role") === "status") ?? null;
 
   const submitListeners = new Set();
   const documentListenerTypes = [];
@@ -285,8 +305,11 @@ function loadContentScript({
     lastMessageOfType(type) {
       return [...sentMessages].reverse().find((m) => m.type === type);
     },
+    get bannerHost() {
+      return lastPrepended;
+    },
     get bannerMessage() {
-      return lastPrepended?._messageNode.textContent ?? "";
+      return bannerRoot(lastPrepended)?._messageNode.textContent ?? "";
     },
     get bannerCount() {
       return prependCount;
@@ -295,22 +318,22 @@ function loadContentScript({
       return lastPrepended?._removed ?? false;
     },
     get bannerVerdict() {
-      return lastPrepended?.dataset.verdict;
+      return bannerRoot(lastPrepended)?.dataset.verdict;
     },
     get bannerHtml() {
-      return lastPrepended?._html ?? "";
+      return bannerRoot(lastPrepended)?._html ?? "";
     },
     get bannerRenders() {
-      return lastPrepended?._renders ?? 0;
+      return bannerRoot(lastPrepended)?._renders ?? 0;
     },
     get bannerHistory() {
-      return lastPrepended?._messageNode.history ?? [];
+      return bannerRoot(lastPrepended)?._messageNode.history ?? [];
     },
     get bannerRole() {
-      return lastPrepended?.getAttribute("role");
+      return bannerRoot(lastPrepended)?.getAttribute("role");
     },
     bannerButton(selector) {
-      return lastPrepended?.querySelector(selector) ?? null;
+      return bannerRoot(lastPrepended)?.querySelector(selector) ?? null;
     },
     get submissionBlocked() {
       return submitListeners.size > 0;
@@ -861,6 +884,41 @@ test("a replaced state leaves none of the previous state's buttons behind", () =
 
   page.bannerButton(".yp-btn-close-x").click();
   assert.equal(page.bannerRemoved, true, "the replacement button has its own live handler");
+});
+
+// Issue #9: the banner renders inside a closed Shadow Root so host-page CSS
+// cannot restyle its controls and its own rules cannot leak out. The visible
+// host has no stable id or class, while the stylesheet and controls stay
+// inside the root.
+test("the banner mounts behind a closed shadow root on an anonymous host", () => {
+  const page = loadContentScript();
+  page.dispatch({ type: "show_banner", verdict: "unknown", data: { fqdn: "site.test" } });
+
+  const host = page.bannerHost;
+  assert.equal(host._shadow.mode, "closed");
+  assert.equal(host.id, undefined, "the host must not expose a public id");
+  assert.equal(host._attributes.class, undefined, "the host must not expose a public class");
+
+  const stylesheet = host._shadow.children.find((node) => node.tagName === "style");
+  assert.ok(stylesheet, "the stylesheet must live inside the shadow root");
+  assert.match(stylesheet.textContent, /direction: ltr !important;/);
+  assert.match(stylesheet.textContent, /unicode-bidi: isolate !important;/);
+  assert.match(stylesheet.textContent, /pointer-events: none !important;/);
+  assert.match(stylesheet.textContent, /pointer-events: auto;/);
+  assert.match(stylesheet.textContent, /:host \{\s*all: initial !important;/);
+  assert.match(stylesheet.textContent, /\.yp-btn-mute \{/, "every rendered control is styled explicitly");
+  assert.match(stylesheet.textContent, /\.yp-btn-close,\s*\.yp-btn-reanalyse \{/);
+  assert.match(stylesheet.textContent, /\.yp-btn-retry \{/);
+  assert.doesNotMatch(stylesheet.textContent, /yp-btn-dismiss/, "the unused dismiss rule is gone");
+
+  const banner = host._shadow.children.find((node) => node.getAttribute("role") === "status");
+  assert.equal(banner.id, "yp-banner", "the banner id is scoped to the shadow tree");
+  assert.equal(banner.getAttribute("lang"), "en");
+  assert.equal(banner.getAttribute("dir"), "ltr");
+  assert.equal(page.bannerVerdict, "unknown");
+
+  page.bannerButton(".yp-btn-close").click();
+  assert.equal(page.bannerRemoved, true, "closing removes the host, not just the shadow content");
 });
 
 function analyseOnPageChange(page, context) {
