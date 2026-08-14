@@ -1809,7 +1809,7 @@ test("navigation notifications describing the active job's own state never inter
   // this keeps only the worker-to-module wiring pinned here.
   assert.match(
     serviceWorker,
-    /import \{ jobMatchesAddress, jobMatchesSameDocumentState \} from "\.\/navigationState\.mjs";/
+    /import \{[\s\S]*?cancellationPresentation,[\s\S]*?jobMatchesAddress,[\s\S]*?jobMatchesSameDocumentState,[\s\S]*?\} from "\.\/navigationState\.mjs";/
   );
   assert.match(
     serviceWorker,
@@ -1830,7 +1830,7 @@ test("navigation notifications describing the active job's own state never inter
   assert.ok(tabsCaptureGuard > tabsUpdated);
   assert.match(
     serviceWorker,
-    /function interruptForNavigation\(tabId, url\) \{[\s\S]*?if \(job\.url === url\) return;[\s\S]*?cancelJob\(tabId, job, "address_changed"\);/
+    /function interruptForNavigation\(tabId, url\) \{[\s\S]*?if \(job\.url === url\) return;[\s\S]*?cancelJobForNavigation\(tabId, job, "address_changed", url\);/
   );
 
   // History API / fragment events additionally require the same document.
@@ -1849,7 +1849,7 @@ test("navigation notifications describing the active job's own state never inter
   );
   assert.match(
     serviceWorker,
-    /function interruptForSameDocumentNavigation\(details\) \{[\s\S]*?if \(isActiveJobSameDocumentState\(details\)\) return;\s*cancelJob\(details\.tabId, job, "address_changed"\);/
+    /function interruptForSameDocumentNavigation\(details\) \{[\s\S]*?if \(isActiveJobSameDocumentState\(details\)\) return;\s*cancelJobForNavigation\(details\.tabId, job, "address_changed", details\.url\);/
   );
 
   // onCommitted stays the authoritative guard for a replacement document at
@@ -1861,7 +1861,45 @@ test("navigation notifications describing the active job's own state never inter
   assert.ok(committedCapture > committed && committedInvalidate > committedCapture);
   assert.match(
     serviceWorker,
-    /function interruptForCommittedDocument\(details\) \{[\s\S]*?if \(job\.documentId !== details\.documentId\) cancelJob\(/
+    /function interruptForCommittedDocument\(details\) \{[\s\S]*?if \(job\.documentId !== details\.documentId\) \{\s*cancelJobForNavigation\(details\.tabId, job, "address_changed", details\.url\);/
+  );
+});
+
+// Issue #2: an ordinary top-level navigation or document replacement cancels
+// the in-flight job silently -- no interrupted banner, no interruption tab --
+// while a surviving same-document script gets a scoped non-warning reset. The
+// presentation matrix and content lifecycle are behavior-tested in
+// navigationState.test.mjs and content.test.js; this test pins worker wiring.
+test("the worker routes navigation cancellation and late verdict delivery through the silent policy", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+
+  // The navigation helper opts into both parts of the silent contract.
+  assert.match(
+    serviceWorker,
+    /function cancelJobForNavigation\(tabId, job, reasonHint, reanalyseUrl\) \{\s*return cancelJob\(tabId, job, reasonHint, \{\s*interruptionMode: "silent",\s*resetContent: true,\s*reanalyseUrl,/
+  );
+
+  // Content reset and warning/interstitial delivery are mutually exclusive.
+  assert.match(
+    serviceWorker,
+    /if \(presentation\.resetContent\) \{[\s\S]*?type: "analysis_cancelled_silently",[\s\S]*?if \(presentation\.notifyInterrupted\) \{[\s\S]*?type: "analysis_interrupted",/
+  );
+
+  // Every commit-time invalidation goes through the same helper.
+  const validate = serviceWorker.indexOf("async function validateJobForCommit");
+  const validateEnd = serviceWorker.indexOf("\nfunction finishJob", validate);
+  const validateBody = serviceWorker.slice(validate, validateEnd);
+  assert.equal(validateBody.match(/cancelJobForNavigation\(/g)?.length, 3);
+
+  // Final delivery is document-scoped, and a rejected delivery cannot promote
+  // the cancellation to a warning in the validation-to-send race window.
+  assert.match(
+    serviceWorker,
+    /async function sendValidatedBanner[\s\S]*?sendJobDocumentMessage\(tabId, job,[\s\S]*?response\?\.accepted !== true[\s\S]*?interruptionMode: "silent",\s*resetContent: true,/
+  );
+  assert.match(
+    serviceWorker,
+    /if \(commit === "document_replaced"\) \{[\s\S]*?cancelJobForNavigation\(tabId, job, "document_replaced", job\.url\);/
   );
 });
 

@@ -22,7 +22,11 @@ import {
   readPngDimensionsFromDataUrl,
   uiCoverCapturesMatch,
 } from "./uiCoverBoxes.mjs";
-import { jobMatchesAddress, jobMatchesSameDocumentState } from "./navigationState.mjs";
+import {
+  cancellationPresentation,
+  jobMatchesAddress,
+  jobMatchesSameDocumentState,
+} from "./navigationState.mjs";
 import { createCaptureTracker, createSelectorSessionStore, selectorSessionStatus } from "./selectorSessions.mjs";
 import { createInterruptionTabs } from "./interruptionTabs.mjs";
 import { createClickfixWarningStore } from "./clickfixWarnings.mjs";
@@ -299,7 +303,9 @@ function interruptForNavigation(tabId, url) {
   if (job === null) return;
   if (job.expectedNavigationUrl === url) return;
   if (job.url === url) return; // see isActiveJobAddress
-  cancelJob(tabId, job, "address_changed");
+  // Ordinary top-level navigation: the arriving document runs its own login
+  // detection, so cancel silently rather than warning the user (issue #2).
+  cancelJobForNavigation(tabId, job, "address_changed", url);
 }
 
 function interruptForSameDocumentNavigation(details) {
@@ -307,7 +313,7 @@ function interruptForSameDocumentNavigation(details) {
   if (job === null) return;
   if (job.expectedNavigationUrl === details.url) return;
   if (isActiveJobSameDocumentState(details)) return;
-  cancelJob(details.tabId, job, "address_changed");
+  cancelJobForNavigation(details.tabId, job, "address_changed", details.url);
 }
 
 function interruptForCommittedDocument(details) {
@@ -315,7 +321,12 @@ function interruptForCommittedDocument(details) {
   if (job === null) return;
   if (job.expectedNavigationUrl === details.url) return;
   if (job.documentId === null || typeof details.documentId !== "string") return;
-  if (job.documentId !== details.documentId) cancelJob(details.tabId, job, "address_changed");
+  // A replacement document at the same address (e.g. a reload with a new
+  // documentId) silently invalidates the old job; the fresh document analyses
+  // itself independently.
+  if (job.documentId !== details.documentId) {
+    cancelJobForNavigation(details.tabId, job, "address_changed", details.url);
+  }
 }
 
 chrome.tabs.onUpdated.addListener(async (updatedTabId, changeInfo) => {
@@ -1680,17 +1691,15 @@ async function sendToOffscreen(type, payload, tabId, ticketId = crypto.randomUUI
   return response.result;
 }
 
-async function capturePageAnalysis(tabId, job = null, { coordinateBanner = true } = {}) {
+async function capturePageAnalysis(tabId, job, { coordinateBanner = true } = {}) {
   try {
     if (coordinateBanner) {
-      const prepared = await sendCaptureMessage(tabId, "prepare_capture");
+      const prepared = await sendJobDocumentMessage(tabId, job, { type: "prepare_capture" });
       if (prepared?.ok !== true) {
-        throw new Error(prepared?.error ?? "Page could not be prepared for capture");
+        throw new Error(prepared?.error ?? prepared?.reason ?? "Page could not be prepared for capture");
       }
     }
-    if (job !== null) {
-      job.phase = "capturing";
-    }
+    job.phase = "capturing";
     const uiCoverCaptureBefore = await collectUiCoveredBoxes(tabId);
     const screenshot = await screenshotSource.captureVisibleTab(tabId);
     const uiCoverCaptureAfter = await collectUiCoveredBoxes(tabId);
@@ -1703,7 +1712,7 @@ async function capturePageAnalysis(tabId, job = null, { coordinateBanner = true 
     return { screenshot, uiCoveredBoxes };
   } finally {
     if (coordinateBanner) {
-      await sendCaptureMessage(tabId, "capture_complete");
+      await sendJobDocumentMessage(tabId, job, { type: "capture_complete" });
     }
   }
 }
@@ -1741,9 +1750,14 @@ async function screenshotDimensions(screenshot) {
   }
 }
 
-async function sendCaptureMessage(tabId, type) {
+async function sendJobDocumentMessage(tabId, job, message) {
+  if (tabId === undefined || typeof job?.jobId !== "string") return undefined;
+  const scopedMessage = { ...message, jobId: job.jobId };
   try {
-    return await chrome.tabs.sendMessage(tabId, { type });
+    if (typeof job.documentId === "string" && job.documentId !== "") {
+      return await chrome.tabs.sendMessage(tabId, scopedMessage, { documentId: job.documentId });
+    }
+    return await chrome.tabs.sendMessage(tabId, scopedMessage);
   } catch {
     return undefined;
   }
@@ -2194,6 +2208,13 @@ function startJob(tabId, jobId, url, kind = "detection", documentId = null) {
     terminalState: null,
     reasonHint: null,
     origin: null,
+    // How a cancellation of this job is presented. "decision_required" opens
+    // the interruption tab and warns the arriving document; "silent" (set by
+    // an ordinary top-level navigation or document replacement) invalidates
+    // and cancels without either. Every cancellation-finalization path reads
+    // this so a silent job can never schedule an interruption during later
+    // cleanup (issue #2).
+    interruptionMode: "decision_required",
     interruptionPromise: undefined,
     expectedNavigationUrl: undefined,
     cancellationRecorded: false,
@@ -2230,12 +2251,35 @@ function markJobTerminalIfCurrent(tabId, job, terminalState, reasonHint) {
   return true;
 }
 
-function cancelJob(tabId, job, reasonHint = "unclassified", { notifyInterruption = true } = {}) {
+function cancelJob(
+  tabId,
+  job,
+  reasonHint = "unclassified",
+  { interruptionMode = "decision_required", resetContent = false, reanalyseUrl } = {}
+) {
   if (!markJobTerminalIfCurrent(tabId, job, "cancelled", reasonHint)) return false;
+  // The first cancellation wins the presentation policy; a later silent
+  // navigation cancel cannot demote an interruption already scheduled, and a
+  // later decision cannot promote one an ordinary navigation already silenced.
+  job.interruptionMode = interruptionMode;
+  const presentation = cancellationPresentation(interruptionMode, { resetContent });
   cancelOffscreenWork(tabId, job.jobId, reasonHint).catch((error) => {
     console.warn("[YodelPhish] Could not cancel offscreen work:", error);
   });
-  if (notifyInterruption) {
+  // Silent cancellation still interrupts capture and cancels offscreen work
+  // above; it only withholds the arriving document's interrupted banner and
+  // the interruption tab. A same-document navigation still needs a non-warning
+  // terminal message so the surviving content script releases the old job and
+  // lets the new route run normal login detection. Both messages are scoped to
+  // the initiating document and job, so neither can disturb the destination's
+  // new content script or a newer analysis.
+  if (presentation.resetContent) {
+    void sendJobDocumentMessage(tabId, job, {
+      type: "analysis_cancelled_silently",
+      ...(typeof reanalyseUrl === "string" ? { reanalyseUrl } : {}),
+    });
+  }
+  if (presentation.notifyInterrupted) {
     chrome.tabs.sendMessage(tabId, {
       type: "analysis_interrupted",
       jobId: job.jobId,
@@ -2243,6 +2287,14 @@ function cancelJob(tabId, job, reasonHint = "unclassified", { notifyInterruption
     scheduleInterruption(tabId, job);
   }
   return true;
+}
+
+function cancelJobForNavigation(tabId, job, reasonHint, reanalyseUrl) {
+  return cancelJob(tabId, job, reasonHint, {
+    interruptionMode: "silent",
+    resetContent: true,
+    reanalyseUrl,
+  });
 }
 
 function recordJobFailure(job, error) {
@@ -2295,16 +2347,18 @@ async function validateJobForCommit(tabId, job) {
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    cancelJob(tabId, job, "address_changed");
+    cancelJobForNavigation(tabId, job, "address_changed");
     return false;
   }
   if (isJobStale(tabId, job)) return false;
   if (tab.url !== job.url) {
-    cancelJob(tabId, job, "address_changed");
+    // The destination is evaluated independently by its own document; a late
+    // result from this job must never commit across the navigation (issue #2).
+    cancelJobForNavigation(tabId, job, "address_changed", tab.url);
     return false;
   }
   if (!(await isInitiatingDocumentCurrent(tabId, job.documentId))) {
-    cancelJob(tabId, job, "address_changed");
+    cancelJobForNavigation(tabId, job, "address_changed", tab.url);
     return false;
   }
   return !isJobStale(tabId, job);
@@ -2321,14 +2375,19 @@ function finishJob(tabId, job) {
 
 async function sendValidatedBanner(tabId, job, verdict, data) {
   if (!(await validateJobForCommit(tabId, job))) return false;
-  const response = await sendToTab(tabId, {
+  const response = await sendJobDocumentMessage(tabId, job, {
     type: "show_banner",
     verdict,
     data,
-    jobId: job.jobId,
   });
   if (response?.accepted !== true) {
-    cancelJob(tabId, job, "unclassified");
+    // The initiating document can disappear after validation but before
+    // delivery. A rejected/undeliverable old verdict is therefore a silent
+    // invalidation, never a reason to open the navigation warning UI.
+    cancelJob(tabId, job, "unclassified", {
+      interruptionMode: "silent",
+      resetContent: true,
+    });
     return false;
   }
   return finishJob(tabId, job);
@@ -2354,11 +2413,20 @@ async function recordCancelledDiagnostics(job) {
 
 async function finalizeCancelledJob(tabId, job) {
   if (job.terminalState !== "cancelled") return;
-  await Promise.all([scheduleInterruption(tabId, job), recordCancelledDiagnostics(job)]);
+  // Diagnostics still record the cancellation (including a navigation-silenced
+  // one); only the interruption tab is withheld for a silent job. Suppressing
+  // the initial analysis_interrupted message alone is not enough -- this later
+  // cleanup path must never schedule an interruption for a silent job.
+  const tasks = [recordCancelledDiagnostics(job)];
+  if (cancellationPresentation(job.interruptionMode).scheduleInterruption) {
+    tasks.push(scheduleInterruption(tabId, job));
+  }
+  await Promise.all(tasks);
 }
 
 function scheduleInterruption(tabId, job) {
   if (job.terminalState !== "cancelled") return undefined;
+  if (!cancellationPresentation(job.interruptionMode).scheduleInterruption) return undefined;
   if (job.interruptionPromise !== undefined) return job.interruptionPromise;
   job.interruptionPromise = (async () => {
     await new Promise((resolve) => setTimeout(resolve, INTERRUPTION_DELAY_MS));
@@ -2501,7 +2569,7 @@ async function handleMessage(message, tabId, senderUrl, sender) {
             jobId: job.jobId,
           });
           if (response?.accepted === true) finishJob(tabId, job);
-          else cancelJob(tabId, job, "unclassified", { notifyInterruption: false });
+          else cancelJob(tabId, job, "unclassified", { interruptionMode: "silent" });
         } catch (error) {
           if (!(await settleJobException(tabId, job, error))) throw error;
         }
@@ -2517,7 +2585,7 @@ async function handleMessage(message, tabId, senderUrl, sender) {
             jobId: job.jobId,
           });
           if (response?.accepted === true) finishJob(tabId, job);
-          else cancelJob(tabId, job, "unclassified", { notifyInterruption: false });
+          else cancelJob(tabId, job, "unclassified", { interruptionMode: "silent" });
           return;
         }
 
@@ -2545,7 +2613,7 @@ async function handleMessage(message, tabId, senderUrl, sender) {
               jobId: job.jobId,
             });
             if (response?.accepted === true) finishJob(tabId, job);
-            else cancelJob(tabId, job, "unclassified", { notifyInterruption: false });
+            else cancelJob(tabId, job, "unclassified", { interruptionMode: "silent" });
             return;
           }
         }
@@ -3757,7 +3825,9 @@ async function refreshTrustedEntry(fqdn, result, tabId, job) {
   });
 
   if (commit === "document_replaced") {
-    cancelJob(tabId, job, "document_replaced");
+    // A trusted page's background reference refresh abandoned by navigation:
+    // cancel silently, without warning the user (issue #2).
+    cancelJobForNavigation(tabId, job, "document_replaced", job.url);
     return false;
   }
   if (commit === null) return true;

@@ -283,13 +283,18 @@ function handleManualTrigger() {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "prepare_capture") {
-    preparePageForCapture()
+    if (!isCurrentJobMessage(message)) {
+      sendResponse({ ok: false, reason: "stale_job" });
+      return false;
+    }
+    preparePageForCapture(message.jobId)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }
 
   if (message.type === "capture_complete") {
+    if (!isCurrentJobMessage(message)) return false;
     bannerHiddenForCapture = false;
     capturePending = false;
     if (bannerEl) {
@@ -301,6 +306,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // its verdict already ("trusted_drift" is only ever entered for it); every
       // other mode is still working and shows progress.
       showBanner(analysisMode === "trusted_drift" ? "trusted" : analysisProgressVerdict(), {});
+    }
+    return false;
+  }
+
+  if (message.type === "analysis_cancelled_silently") {
+    if (!isCurrentJobMessage(message)) return false;
+    clearAnalysisDeadline();
+    alreadyAnalysing = false;
+    dismissed = false;
+    analysisMode = null;
+    interruptionPending = false;
+    currentJobId = null;
+    analysisAttempted = false;
+    bannerHiddenForCapture = false;
+    unblockFormSubmission();
+    removeBanner();
+    setIconState("active");
+
+    // A tabs.onUpdated URL event may precede either a History API event or a
+    // full document commit. Reanalyse only if this surviving document already
+    // owns that URL; a document that is merely waiting to unload must not start
+    // another job. When delivery itself failed without a known destination,
+    // the current document gets the same recovery pass.
+    if (typeof message.reanalyseUrl !== "string" || window.location.href === message.reanalyseUrl) {
+      scheduleEvaluation();
     }
     return false;
   }
@@ -446,7 +476,7 @@ function enterFailedState(jobId, code) {
 
 const PAGE_STABILITY_TIMEOUT_MS = 1000;
 
-async function preparePageForCapture() {
+async function preparePageForCapture(jobId) {
   // Two different things happen here, and they are deliberately not at the same
   // moment. The flag is raised now so that anything rendered during the wait is
   // born hidden -- a banner that appeared mid-wait and was then hidden for the
@@ -458,6 +488,9 @@ async function preparePageForCapture() {
   try {
     await waitForPageStability(PAGE_STABILITY_TIMEOUT_MS);
   } finally {
+    // The job can be cancelled while the stability wait is in progress. Its
+    // late continuation must not hide a newer job's banner in the same SPA.
+    if (jobId !== currentJobId) throw new Error("Capture job is no longer current");
     if (bannerEl) {
       bannerEl.style.visibility = "hidden";
       markExtensionMutation(bannerEl);

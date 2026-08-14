@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { jobMatchesAddress, jobMatchesSameDocumentState } from "./navigationState.mjs";
+import {
+  cancellationPresentation,
+  jobMatchesAddress,
+  jobMatchesSameDocumentState,
+} from "./navigationState.mjs";
 
 const job = {
   url: "https://example.test/app#signin",
@@ -37,4 +41,20 @@ test("a job without a stable document identity never matches a same-document eve
     url: job.url,
     documentId: "",
   }), false);
+});
+
+test("ordinary-navigation cancellation resets surviving content without warning", () => {
+  assert.deepEqual(cancellationPresentation("silent", { resetContent: true }), {
+    notifyInterrupted: false,
+    resetContent: true,
+    scheduleInterruption: false,
+  });
+});
+
+test("decision-required cancellation still warns and opens the interruption flow", () => {
+  assert.deepEqual(cancellationPresentation("decision_required", { resetContent: true }), {
+    notifyInterrupted: true,
+    resetContent: false,
+    scheduleInterruption: true,
+  });
 });

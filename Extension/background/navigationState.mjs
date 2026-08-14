@@ -12,3 +12,16 @@ export function jobMatchesSameDocumentState(job, { url, documentId } = {}) {
     job.documentId !== "" &&
     job.documentId === documentId;
 }
+
+// Cancellation has two independent effects: invalidating the computation and
+// presenting that invalidation to the user. Keeping the presentation decision
+// pure makes it impossible for a later cleanup path to accidentally turn an
+// ordinary-navigation cancellation back into a warning.
+export function cancellationPresentation(interruptionMode, { resetContent = false } = {}) {
+  const silent = interruptionMode === "silent";
+  return {
+    notifyInterrupted: !silent,
+    resetContent: silent && resetContent,
+    scheduleInterruption: !silent,
+  };
+}
