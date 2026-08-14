@@ -62,7 +62,7 @@ jobs:
         with:
           name: yodel-phish-${{ github.sha }}
           path: |
-            build/yodel-phish-0.1.0.zip
-            build/yodel-phish-0.1.0.zip.SOURCE.txt
+            build/yodel-phish-*.zip
+            build/yodel-phish-*.zip.SOURCE.txt
           if-no-files-found: error
           retention-days: 14

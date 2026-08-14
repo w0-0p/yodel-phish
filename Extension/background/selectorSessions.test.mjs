@@ -426,13 +426,16 @@ test("every visible-tab capture uses the shared sticky guard", async () => {
   assert.match(serviceWorker, /captureError\?\.code === "capture_interrupted"/);
 });
 
-test("document identity guards verdict commits and capture-derived trusted writes", async () => {
+test("document identity scopes verdict delivery and guards capture-derived trusted writes", async () => {
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   const validateStart = serviceWorker.indexOf("async function validateJobForCommit");
   const validateEnd = serviceWorker.indexOf("function finishJob", validateStart);
   const validate = serviceWorker.slice(validateStart, validateEnd);
   assert.match(validate, /isInitiatingDocumentCurrent\(tabId, job\.documentId\)/);
-  assert.doesNotMatch(serviceWorker, /sendMessage\([^\n]+\{ documentId:/);
+  assert.match(
+    serviceWorker,
+    /chrome\.tabs\.sendMessage\(tabId, scopedMessage, \{ documentId: job\.documentId \}\)/
+  );
 
   assert.equal(
     (serviceWorker.match(/await isInitiatingDocumentCurrent\(tabId,/g) ?? []).length,

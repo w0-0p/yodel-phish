@@ -368,7 +368,7 @@ test("a manual trigger bypasses a negative login heuristic and uses neutral prog
   assert.equal(response.status, "started");
   assert.equal(response.jobId, page.lastMessageOfType("run_pipeline")?.jobId);
 
-  page.dispatch({ type: "capture_complete" });
+  page.dispatch({ type: "capture_complete", jobId: response.jobId });
   context.mock.timers.tick(300);
   assert.equal(page.bannerVerdict, "analysing_manual");
   assert.match(page.bannerMessage, /Manual analysis in progress/);
@@ -386,6 +386,74 @@ test("a manual trigger while a job is in flight reports analysing and leaves it 
   assert.equal(responded, true);
   assert.deepEqual(response, { ok: true, status: "analysing", jobId });
   assert.equal(page.sentMessages.length, beforeCount, "the running job must not be restarted or re-rendered");
+});
+
+test("silent same-document cancellation releases the old job and analyses the new state", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const url = "https://example.test/login#password";
+  const page = loadContentScript({ url });
+  const oldJobId = page.startJobViaManualTrigger();
+  page.loginState.isLoginPage = true;
+
+  assert.equal(page.submissionBlocked, true);
+  page.dispatch({
+    type: "analysis_cancelled_silently",
+    jobId: oldJobId,
+    reanalyseUrl: url,
+  });
+
+  assert.equal(page.submissionBlocked, false, "the cancelled job must release the form immediately");
+  assert.equal(page.bannerCount, 0, "silent cancellation must not render a warning banner");
+  assert.equal(page.lastMessageOfType("set_icon_state")?.state, "active");
+
+  context.mock.timers.tick(250);
+  const runs = page.sentMessages.filter((message) => message.type === "run_pipeline");
+  assert.equal(runs.length, 2, "the surviving route must run ordinary login detection again");
+  assert.notEqual(runs[1].jobId, oldJobId);
+  assert.equal(page.submissionBlocked, true, "the replacement analysis owns a fresh form guard");
+});
+
+test("silent cancellation for an older job cannot reset a newer analysis", () => {
+  const page = loadContentScript();
+  const oldJobId = page.startJobViaManualTrigger();
+  page.dispatch({ type: "show_banner", jobId: oldJobId, verdict: "trusted", data: {} });
+  const newJobId = page.startJobViaManualTrigger();
+  const beforeCount = page.sentMessages.length;
+
+  page.dispatch({
+    type: "analysis_cancelled_silently",
+    jobId: oldJobId,
+    reanalyseUrl: "https://example.test/other-state",
+  });
+
+  assert.equal(page.submissionBlocked, true);
+  assert.equal(page.sentMessages.length, beforeCount, "a stale reset must have no UI or icon side effects");
+  assert.deepEqual(page.dispatch({ type: "manual_trigger" }).response, {
+    ok: true,
+    status: "analysing",
+    jobId: newJobId,
+  });
+});
+
+test("capture lifecycle messages are accepted only for the current job", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  const stalePreparation = page.dispatch({
+    type: "prepare_capture",
+    jobId: "some-older-job-id",
+  });
+  assert.equal(stalePreparation.responded, true);
+  assert.deepEqual(stalePreparation.response, { ok: false, reason: "stale_job" });
+
+  page.dispatch({ type: "capture_complete", jobId: "some-older-job-id" });
+  context.mock.timers.tick(300);
+  assert.equal(page.bannerCount, 0, "an old capture must not release the current job's hidden progress");
+
+  page.dispatch({ type: "capture_complete", jobId });
+  context.mock.timers.tick(300);
+  assert.equal(page.bannerVerdict, "analysing_manual");
 });
 
 test("a show_banner for an older job is rejected as stale and does not touch icon/UI state", () => {
@@ -817,7 +885,8 @@ test("automatic analysis retains login-detected progress wording", (context) => 
   const page = loadContentScript();
 
   analyseOnPageChange(page, context);
-  page.dispatch({ type: "capture_complete" });
+  const jobId = page.lastMessageOfType("run_pipeline")?.jobId;
+  page.dispatch({ type: "capture_complete", jobId });
   context.mock.timers.tick(300);
 
   assert.equal(page.bannerVerdict, "analysing");
