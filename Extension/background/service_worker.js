@@ -72,13 +72,10 @@ const INTERSTITIAL_PAGE = "interstitial/interstitial.html";
 const PHISHING_STATE_KEY = "phishing_warning_state";
 const ANALYSIS_HISTORY_KEY = "analysis_history";
 const MAX_ANALYSIS_HISTORY = 25;
-// 2: the analysed address is reduced to its hostname (see compactOrigin),
-// non-winning candidates are stored as comparison-table rows only, the
-// full-page OCR transcription is no longer persisted, and error records carry
-// their context and failure code instead of empty completed-analysis fields.
-// Records written under earlier schemas can contain the very diagnostics this
-// schema removed, so they are discarded during startup repair rather than
-// exported or rendered indefinitely.
+// 2: newly written records reduce the analysed address to its hostname (see
+// compactOrigin), store non-winning candidates as comparison-table rows only,
+// omit the full-page OCR transcription, and carry context and failure code on
+// error records. Records created by older versions are retained unchanged.
 const ANALYSIS_HISTORY_SCHEMA = 2;
 const DRIFT_THRESHOLD = 1.5;
 
@@ -1214,20 +1211,18 @@ function normalizeClickfixDomains(value) {
   return normalized;
 }
 
-// Re-validated and canonicalized on every read. Legacy regex_exclusions are
-// intentionally omitted, causing the next settings write to migrate them out.
+// Re-validated and canonicalized on every read. Unknown legacy fields remain
+// stored but are not used by the current ClickFix policy.
 function normalizeClickfixSettings(raw) {
   const source = raw !== null && typeof raw === "object" ? raw : {};
   const mode = CLICKFIX_MODES.has(source.mode) ? source.mode : "strict";
   const excluded_domains = normalizeClickfixDomains(source.excluded_domains);
-  return { mode, excluded_domains };
+  return { ...source, mode, excluded_domains };
 }
 
 function clickfixSettingsNeedRepair(raw, normalized) {
   if (raw === undefined) return false;
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return true;
-  if (Object.hasOwn(raw, "regex_exclusions")) return true;
-  if (Object.hasOwn(raw, "revision")) return true;
   if (raw.mode !== normalized.mode) return true;
   if (!Array.isArray(raw.excluded_domains) || raw.excluded_domains.length !== normalized.excluded_domains.length) {
     return true;
@@ -1262,10 +1257,6 @@ function normalizeDeviceFlowUserEndpoints(raw) {
 }
 
 function deviceFlowEndpointsNeedRepair(rawSettings, normalized) {
-  // The earlier issue #39 shape seeded the built-in registry into storage.
-  if (rawSettings !== null && typeof rawSettings === "object" && Object.hasOwn(rawSettings, "device_flow_registry")) {
-    return true;
-  }
   const raw = rawSettings?.device_flow_user_endpoints;
   if (raw === undefined) return normalized.length !== 0;
   if (!Array.isArray(raw) || raw.length !== normalized.length) return true;
@@ -1293,20 +1284,14 @@ function normalizeSettings(raw) {
   const clickfix = normalizeClickfixSettings(source.clickfix);
   const device_flow_user_endpoints = normalizeDeviceFlowUserEndpoints(source.device_flow_user_endpoints);
   const banner_font_size = BANNER_FONT_SIZES.has(source.banner_font_size) ? source.banner_font_size : "small";
-  const settings = { ...source, developer_mode, device_code_auth, clickfix, device_flow_user_endpoints, banner_font_size };
-  delete settings.device_flow_registry; // legacy seeded shape; built-ins live in code now
-  // The phishing-warning bypass was removed by issue #93: a stored value is
-  // migrated out and must never have an effect again.
-  delete settings.allow_phishing_bypass;
-  return settings;
+  return { ...source, developer_mode, device_code_auth, clickfix, device_flow_user_endpoints, banner_font_size };
 }
 
 // Shared by the settings and diagnostics domains: whether a raw settings read
-// carries something normalizeSettings had to repair or migrate away, which
-// must then be persisted through the owning queue.
+// carries a current setting that normalization had to repair, which must then
+// be persisted through the owning queue. Unknown legacy fields are retained.
 function settingsNeedRepair(raw, normalized) {
-  return (raw !== null && typeof raw === "object" && Object.hasOwn(raw, "allow_phishing_bypass")) ||
-    normalized.developer_mode !== (raw?.developer_mode === true) ||
+  return normalized.developer_mode !== (raw?.developer_mode === true) ||
     clickfixSettingsNeedRepair(raw?.clickfix, normalized.clickfix) ||
     deviceFlowEndpointsNeedRepair(raw, normalized.device_flow_user_endpoints);
 }
@@ -1348,54 +1333,18 @@ const withDiagnosticsState = createStorageDomain({
   keys: ["settings", ANALYSIS_HISTORY_KEY],
   load(data) {
     const settings = normalizeSettings(data.settings);
-    const stored = Array.isArray(data[ANALYSIS_HISTORY_KEY]) ? data[ANALYSIS_HISTORY_KEY] : [];
-    const history = sanitizeAnalysisHistory(stored);
     return {
-      state: { settings, history },
-      // A legacy record can carry a full page transcription and full candidate
-      // diagnostics. Drop it rather than leaving sensitive data in storage
-      // until newer analyses happen to evict it.
-      dirty: settingsNeedRepair(data.settings, settings) || history !== stored,
+      state: {
+        settings,
+        history: Array.isArray(data[ANALYSIS_HISTORY_KEY]) ? data[ANALYSIS_HISTORY_KEY] : [],
+      },
+      dirty: settingsNeedRepair(data.settings, settings),
     };
   },
   persist: (state) => ({
     settings: state.settings,
     [ANALYSIS_HISTORY_KEY]: state.history,
   }),
-});
-
-// A v2 record only needs its current schema and no full address. Earlier
-// records had a larger, sensitive shape; keeping only selected fragments would
-// create an untested pseudo-schema, so the safe migration discards them.
-// Returns the original array when no repair is needed.
-function sanitizeAnalysisHistory(history) {
-  let changed = false;
-  const sanitized = [];
-  for (const record of history) {
-    if (record === null || typeof record !== "object" || record.schema_version !== ANALYSIS_HISTORY_SCHEMA) {
-      changed = true;
-      continue;
-    }
-    if ("url" in record) {
-      const { url, ...withoutUrl } = record;
-      sanitized.push(withoutUrl);
-      changed = true;
-      continue;
-    }
-    sanitized.push(record);
-  }
-  return changed ? sanitized : history;
-}
-
-// Repair diagnostic history even when developer mode is off and nothing new is
-// ever appended. The incognito worker never writes diagnostics (see
-// appendAnalysisHistory) and shares storage.local with the regular one, so it
-// leaves the sweep to that process rather than racing it.
-void (chrome.extension.inIncognitoContext === true
-  ? Promise.resolve(null)
-  : withDiagnosticsState(() => ({ value: null, changed: false }))
-).catch((error) => {
-  console.error("[YodelPhish] Failed to strip stored diagnostic addresses:", error);
 });
 
 async function getStorage() {

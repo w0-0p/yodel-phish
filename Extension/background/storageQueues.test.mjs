@@ -843,8 +843,7 @@ test("service-worker storage protocol is trusted, bounded, and returns targeted 
   assert.match(serviceWorker, /word\.length <= MAX_USER_WORD_LENGTH/);
   assert.match(serviceWorker, /ALLOWED_MUTED_UNTIL\.has\(value\)/);
   assert.match(serviceWorker, /if \(listType === "trusted"\) touchTrustedEntry\(entry\)/);
-  assert.match(serviceWorker, /Object\.hasOwn\(raw, "regex_exclusions"\)/);
-  assert.match(serviceWorker, /return \{ mode, excluded_domains \}/);
+  assert.match(serviceWorker, /return { ...source, mode, excluded_domains }/);
   assert.doesNotMatch(settingsPage, /regex_exclusions|regex exclusion/i);
   const warningOpenStart = serviceWorker.indexOf("async function openClickfixWarning");
   const warningCreate = serviceWorker.indexOf("clickfixWarnings.createWarning", warningOpenStart);
@@ -957,10 +956,10 @@ test("the winning trusted variant identity is propagated into diagnostics", asyn
 });
 
 // A page's address can carry a session token, a password-reset code or a
-// single-use login link. None of it explains a verdict, so no record holds
-// more of the address than its hostname -- and the larger records earlier
-// versions wrote are discarded rather than left to be exported or evicted.
-test("analysis history stores the analysed host and discards legacy records", async () => {
+// single-use login link. None of it explains a verdict, so newly written
+// records retain no more of the address than its hostname. Earlier records are
+// preserved as historical data until they roll off or the user clears them.
+test("analysis history stores the analysed host without rewriting historical records", async () => {
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   const settingsPage = await readFile(new URL("../settings/settings.js", import.meta.url), "utf8");
 
@@ -976,11 +975,10 @@ test("analysis history stores the analysed host and discards legacy records", as
   // parseOrigin keeps the hostname and protocol and drops the rest.
   assert.match(serviceWorker, /function webOriginOf\(url\) \{\n\s+const parsed = parseOrigin\(url\);/);
 
-  // Stored records written before this are discarded on load; a v2 record
-  // receives only the URL-field repair needed during the transition.
-  assert.match(serviceWorker, /const history = sanitizeAnalysisHistory\(stored\)/);
-  assert.match(serviceWorker, /record\.schema_version !== ANALYSIS_HISTORY_SCHEMA/);
-  assert.match(serviceWorker, /const \{ url, \.\.\.withoutUrl \} = record/);
+  // Historical records are preserved as they were written. New records keep
+  // the hostname-only form above, but startup must not rewrite older schemas.
+  assert.doesNotMatch(serviceWorker, /sanitizeAnalysisHistory/);
+  assert.doesNotMatch(serviceWorker, /withDiagnosticsState(() => ({ value: null, changed: false }))/);
   assert.doesNotMatch(settingsPage, /record\.url/);
 });
 
@@ -1488,16 +1486,15 @@ test("turning developer mode off resets every dev-gated setting", async () => {
 
 // Issue #93 -- the phishing-warning bypass is gone. Neither the setting, the
 // one-time per-tab authorization, nor either interstitial's proceed handler
-// may survive anywhere in the worker; a stored allow_phishing_bypass value is
-// migrated out on the first settings read.
+// may survive anywhere in the worker. Legacy storage is retained as opaque
+// data and cannot reactivate the removed bypass.
 test("the service worker carries no phishing or device-code bypass path", async () => {
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
 
   assert.doesNotMatch(serviceWorker, /set_phishing_bypass|phishing_proceed|device_flow_continue/);
   assert.doesNotMatch(serviceWorker, /\.bypass_by_tab|bypassAuthorized|allow_bypass|acknowledgeRelationship/);
   assert.doesNotMatch(serviceWorker, /phishing_bypassed/);
-  assert.match(serviceWorker, /delete settings\.allow_phishing_bypass/);
-  assert.match(serviceWorker, /Object\.hasOwn\(raw, "allow_phishing_bypass"\)/);
+  assert.doesNotMatch(serviceWorker, /allow_phishing_bypass/);
 });
 
 // Issue #93 §8 -- trusted/muted status affects only the phishing pipeline.
