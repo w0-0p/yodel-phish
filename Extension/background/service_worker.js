@@ -28,6 +28,7 @@ import {
   jobMatchesSameDocumentState,
 } from "./navigationState.mjs";
 import { createCaptureTracker, createSelectorSessionStore, selectorSessionStatus } from "./selectorSessions.mjs";
+import { createTrustedAddIntentStore } from "./trustedAddIntents.mjs";
 import { createInterruptionTabs } from "./interruptionTabs.mjs";
 import { createClickfixWarningStore } from "./clickfixWarnings.mjs";
 import clickfixPolicy from "../content/clickfix-policy.js";
@@ -177,6 +178,12 @@ const offscreenFailureListeners = new Set();
 // boxes, issue #90) lives in chrome.storage.session rather than in worker
 // memory.
 const selectorSessions = createSelectorSessionStore(chrome.storage.session);
+// Issue #8: a Settings "Move to trusted" opens the site in a new tab for the
+// same interactive logo confirmation as "Add to trusted". That the tab is such
+// a confirmation flow is recorded here, keyed by tab id, and must outlive a
+// worker restart between opening the tab and the content script asking, so it
+// lives in chrome.storage.session too.
+const trustedAddIntents = createTrustedAddIntentStore(chrome.storage.session);
 const captureTracker = createCaptureTracker();
 const screenshotSource = new ChromeScreenshotSource(captureTracker);
 let phishingStateQueue = Promise.resolve();
@@ -466,6 +473,9 @@ chrome.webNavigation.onErrorOccurred.addListener((details) => {
     .catch((error) => {
       console.warn("[YodelPhish] Failed to discard aborted same-tab device-flow source:", error);
     });
+  void abortTrustedAddIntent(details.tabId).catch((error) => {
+    console.warn("[YodelPhish] Failed to abort trusted-add intent after navigation error:", error);
+  });
 });
 
 async function prepareSameTabDeviceFlowSource(details) {
@@ -683,6 +693,9 @@ chrome.tabs.onRemoved.addListener((removedTabId) => {
   });
   void selectorSessions.discardTab(removedTabId).catch((error) => {
     console.warn("[YodelPhish] Failed to discard logo selector session state:", error);
+  });
+  void trustedAddIntents.discardTab(removedTabId).catch((error) => {
+    console.warn("[YodelPhish] Failed to discard trusted-add intent state:", error);
   });
   const feedbackTimer = actionFeedbackTimers.get(removedTabId);
   if (feedbackTimer !== undefined) clearTimeout(feedbackTimer);
@@ -2837,6 +2850,14 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       if (parsedOrigin === null) {
         return sendToTab(tabId, { type: "show_banner", verdict: "unknown", data: {} });
       }
+      // Issue #8: when this tab was opened by a Settings "Move to trusted", the
+      // same confirmation flow runs, but on completion the tab is closed and
+      // Settings is refocused rather than a banner shown in place. The intent is
+      // fqdn-scoped so it survives the reloads and same-site redirects a login
+      // page makes before confirmation, yet never turns an unrelated site the
+      // tab later navigates to into a move. The selector session consumes it.
+      const moveIntent = await trustedAddIntents.get(tabId);
+      const isMoveToTrusted = moveIntent !== null && moveIntent.fqdn === parsedOrigin.fqdn;
       const origin = { valid: true, ...parsedOrigin };
       const job = startJob(tabId, message.jobId, currentUrl, "add_to_trusted", sender?.documentId);
       job.origin = origin;
@@ -2865,10 +2886,22 @@ async function handleMessage(message, tabId, senderUrl, sender) {
         // session storage.
         await selectorSessions.start(tabId, {
           fqdn: parsedOrigin.fqdn,
-          add: { origin: parsedOrigin, scores: scoreSnapshot(result) },
+          add: {
+            origin: parsedOrigin,
+            scores: scoreSnapshot(result),
+            ...(isMoveToTrusted ? { moveFromMuted: true } : {}),
+          },
           candidates,
-          closeTabOnComplete: false,
+          // A move-to-trusted (issue #8) confirms in a tab we opened, so it
+          // closes on completion and hands focus back to Settings; an ordinary
+          // add confirms in the page the user is already on and keeps it.
+          closeTabOnComplete: isMoveToTrusted,
+          ...(isMoveToTrusted && moveIntent.settingsTabId !== undefined ? { settingsTabId: moveIntent.settingsTabId } : {}),
         });
+        // From here the durable selector session owns reload/cancel handling.
+        // Consuming the bootstrap intent prevents a failed tab close after save
+        // from ever starting a second add flow in the same tab.
+        if (isMoveToTrusted) await trustedAddIntents.discardTab(tabId);
         await injectLogoSelector(tabId);
         if (!finishJob(tabId, job)) {
           await finalizeCancelledJob(tabId, job);
@@ -2883,9 +2916,29 @@ async function handleMessage(message, tabId, senderUrl, sender) {
         });
         return;
       } catch (error) {
-        if (!(await settleJobException(tabId, job, error))) throw error;
+        const settled = await settleJobException(tabId, job, error);
+        if (isMoveToTrusted) {
+          await abortTrustedAddIntent(tabId).catch((cleanupError) => {
+            console.warn("[YodelPhish] Failed to abort trusted-add intent after analysis failure:", cleanupError);
+          });
+        }
+        if (!settled) throw error;
         return;
       }
+    }
+
+    // Issue #8: a tab opened by "Move to trusted" asks, before it would start
+    // ordinary phishing analysis, whether it should instead run the trusted-add
+    // confirmation. Answered true only while the tab is still on the fqdn the
+    // move was started for, so a same-site reload keeps confirming while a
+    // navigation elsewhere falls back to ordinary analysis. This check is
+    // read-only; selector startup or navigation/tab cleanup consumes it.
+    case "get_trusted_add_intent": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: true, active: false };
+      const intent = await trustedAddIntents.get(tabId);
+      if (intent === null) return { ok: true, active: false };
+      const origin = await parseListOrigin(senderUrl);
+      return { ok: true, active: origin !== null && origin.fqdn === intent.fqdn };
     }
 
     case "add_to_muted": {
@@ -3085,31 +3138,43 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       return { ok: true, removed, listType, fqdn, variantId };
     }
 
+    // Issue #8: moving a muted site to the trusted list no longer happens
+    // silently with an unvalidated logo captured on a later visit. It opens the
+    // site in a new tab and runs the same interactive confirmation as "Add to
+    // trusted": the tab's content script starts the add-to-trusted flow (see
+    // get_trusted_add_intent), the user confirms which logo YOLO found — or
+    // free-draws one — and only that confirmation removes the entry from the
+    // muted list and adds it to trusted (applyManualLogoSelection). Cancelling
+    // or closing the tab changes nothing, so the site stays muted.
     case "move_muted_to_trusted": {
       const { fqdn } = message;
-      if (!isValidFqdnTarget(fqdn)) return invalidSettingsRequest();
-      const moved = await withTrustedMuted((state) => {
-        const entry = findByFqdn(state.muted_list, fqdn);
-        if (entry === null) return { value: null, changed: false };
-        const variantId = crypto.randomUUID();
-        state.muted_list = state.muted_list.filter((item) => item.fqdn !== fqdn);
-        state.trusted_list = enforceTrustedVariantCap([
-          ...state.trusted_list,
-          {
-            ...entry,
-            muted_until: undefined,
-            variant_id: variantId,
-            storage_revision: newStorageRevision(),
-            updated_at: new Date().toISOString(),
-            // A muted entry has no visual reference. Force one capture on a
-            // later analysed visit instead of relying on the drift threshold.
-            needs_reference_capture: true,
-          },
-        ]);
-        return { value: { variantId }, changed: true };
-      });
-      if (moved === null) return invalidSettingsRequest("not_found");
-      return { ok: true, moved: true, fqdn, variantId: moved.variantId };
+      if (tabId === undefined || !isValidFqdnTarget(fqdn)) return invalidSettingsRequest();
+      const { muted_list } = await getStorage();
+      const entry = findByFqdn(muted_list, fqdn);
+      if (entry === null) return invalidSettingsRequest("not_found");
+
+      // Reuse the URL derivation open_logo_selector uses, so a file-protocol
+      // entry reopens its own file and everything else its https origin.
+      const url = entry.protocol === "file" && isFileUrl(entry.source_url)
+        ? entry.source_url
+        : `${entry.protocol ?? "https"}://${fqdn}`;
+
+      // Arm the tab before the destination can load. Creating it directly at
+      // the destination races a cached/file page's content script: it can ask
+      // for the intent before storage.session contains it and run normal analysis.
+      const newTab = await chrome.tabs.create({ url: "about:blank", active: true });
+      if (newTab.id === undefined) return invalidSettingsRequest("tab_unavailable");
+      try {
+        await trustedAddIntents.set(newTab.id, { fqdn, settingsTabId: tabId });
+        await chrome.tabs.update(newTab.id, { url });
+      } catch (error) {
+        await trustedAddIntents.discardTab(newTab.id).catch(() => {});
+        await chrome.tabs.remove(newTab.id).catch(() => {});
+        await focusOrOpenSettings(tabId).catch(() => {});
+        console.warn("[YodelPhish] Failed to start trusted-add confirmation tab:", error);
+        return invalidSettingsRequest("tab_unavailable");
+      }
+      return { ok: true, pending: true, fqdn, tabId: newTab.id };
     }
 
     // =========================================================================
@@ -3513,6 +3578,7 @@ async function handleMessage(message, tabId, senderUrl, sender) {
               variantId: crypto.randomUUID(),
               scores: [{ datetime: timestamp, ...session.add.scores }],
               lastVisited: todayString(),
+              ...(session.add.moveFromMuted === true ? { moveFromMuted: true } : {}),
             };
           const result = applyManualLogoSelection(state, {
             fqdn: session.fqdn,
@@ -3894,6 +3960,14 @@ async function injectLogoSelector(tabId) {
     }
     throw error;
   }
+}
+
+async function abortTrustedAddIntent(tabId) {
+  const intent = await trustedAddIntents.discardTab(tabId);
+  if (intent === null) return false;
+  await chrome.tabs.remove(tabId).catch(() => {});
+  await focusOrOpenSettings(intent.settingsTabId);
+  return true;
 }
 
 async function cancelLogoSelectorSession(tabId, sessionId = undefined) {

@@ -584,9 +584,15 @@ async function removeEntry(fqdn, type, variantId) {
   if (response?.ok !== true || response.removed !== true) await loadAndRender();
 }
 
+// Issue #8: this no longer moves the entry itself. It opens the site in a new
+// tab and hands off to the same interactive logo confirmation as "Add to
+// trusted"; the entry stays muted until the user confirms there, at which point
+// storage.onChanged re-renders both lists. Nothing to do here on success — the
+// new tab has taken focus. If the request could not even start, re-render so a
+// stale card cannot look mid-move.
 async function moveToTrusted(fqdn) {
   const response = await chrome.runtime.sendMessage({ type: "move_muted_to_trusted", fqdn });
-  if (response?.ok !== true || response.moved !== true) await loadAndRender();
+  if (response?.ok !== true) await loadAndRender();
 }
 
 // =============================================================================
