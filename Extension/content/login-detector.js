@@ -39,6 +39,15 @@
 //      laid out. The walk is
 //      bounded and stops at <body>, so a newsletter field still cannot borrow
 //      a header button elsewhere in a shared application shell.
+//   4. A separate, constrained deep fallback (issue #5) reaches past that few-
+//      level limit for form-less multi-step flows whose identity step, forward
+//      action and still-hidden password step sit in deeply nested, separate
+//      wrapper trees (Google's first sign-in step is one). It is entered only
+//      by an active, form-less, dialog-less field with the standardized
+//      username token, and only associates through the smallest shared ancestor
+//      that holds a compatible forward action and a coherent password step. A
+//      <main>/application landmark may bound the search but is never that
+//      ancestor: sharing only a broad <main> or <body> is never an association.
 // Modal or application containers are never inferred from class names or ids.
 //
 // The candidate walk covers open Shadow roots as well as the light DOM (issue
@@ -97,6 +106,13 @@
   // Identifies an identity-like field from its own metadata. These attributes
   // must never also satisfy the separate authentication-cue requirement.
   const IDENTITY_HINT_RE = /user|e[\s-]?mail|account|log[\s-]?in|login|sign[\s-]?in|phone|mobile|member/;
+  // Explicit search semantics outrank otherwise ambiguous identity words such
+  // as "account". Profile/settings cues are used only by the deep fallback:
+  // shallow form and dialog association remains authoritative for real
+  // reauthentication controls embedded in settings pages.
+  const SEARCH_HINT_RE = /\bsearch\b|(?:^|_)search(?:_|$)/;
+  const NON_CREDENTIAL_ACCOUNT_CONTEXT_RE =
+    /\b(?:profile|settings|preferences)\b|(?:^|_)(?:profile|settings|preferences)(?:_|$)/;
 
   const KNOWN_INPUT_TYPES = new Set([
     "button", "checkbox", "color", "date", "datetime-local", "email", "file",
@@ -453,6 +469,132 @@
     );
   }
 
+  // A <main> or an application landmark may frame a credential flow, so the deep
+  // fallback below may search up to one. A landmark is page structure, not
+  // authentication evidence, so it only ever bounds the walk: sharing nothing
+  // but a broad <main> (or <body>) must never associate unrelated controls.
+  function isApplicationLandmark(el) {
+    if (tagOf(el) === "main") return true;
+    const roles = tokensOf(el, "role");
+    return roles.includes("main") || roles.includes("application");
+  }
+
+  // A password input is a coherent later step of a form-less multi-step flow
+  // when it is standardized as the current-password field, or when
+  // password-stage evidence sits in its own locality — an auth cue or
+  // auth-named control within a few ancestors of the input, not merely
+  // somewhere in the broad flow container. The input may be hidden (its step is
+  // not shown yet) but must be otherwise usable, and must not sit behind a form
+  // or dialog boundary the identity field is not part of.
+  function isCoherentPasswordStep(pw, actionCandidates, cueCandidates, ctx) {
+    if (!isPotentialPasswordStep(pw)) return false;
+    if (formOwner(pw) !== null || dialogAncestor(pw) !== null) return false;
+    if (tokensOf(pw, "autocomplete").includes("current-password")) return true;
+    let local = pw.parentElement;
+    for (let depth = 0; depth < LOCAL_ASSOCIATION_MAX_DEPTH; depth += 1) {
+      if (
+        local === null ||
+        local === ctx.doc.body ||
+        local === ctx.doc.documentElement ||
+        isApplicationLandmark(local)
+      ) return false;
+      const authNamedAction = actionCandidates.some(
+        (el) =>
+          isWithin(el, local) &&
+          actionKind(el) !== null &&
+          AUTH_CUE_RE.test(normalize(accessibleName(el, ctx)))
+      );
+      if (authNamedAction || containerHasAuthCue(local, cueCandidates, ctx)) return true;
+      local = local.parentElement;
+    }
+    return false;
+  }
+
+  // The deep fallback must not reinterpret a profile/settings control as an
+  // identifier step merely because distant account controls share a wrapper.
+  // This veto is intentionally local and deep-only: normal form/dialog/shallow
+  // login association has already had priority before the fallback is reached.
+  function hasLocalNonCredentialAccountContext(field, cueCandidates, ctx) {
+    if (NON_CREDENTIAL_ACCOUNT_CONTEXT_RE.test(fieldMetadata(field, ctx))) return true;
+    let local = field.parentElement;
+    for (let depth = 0; depth < LOCAL_ASSOCIATION_MAX_DEPTH; depth += 1) {
+      if (
+        local === null ||
+        local === ctx.doc.body ||
+        local === ctx.doc.documentElement ||
+        isApplicationLandmark(local)
+      ) return false;
+      const hasContextCue = cueCandidates.some(
+        (el) =>
+          isWithin(el, local) &&
+          isRendered(el, ctx) &&
+          NON_CREDENTIAL_ACCOUNT_CONTEXT_RE.test(normalize(cueText(el, ctx)))
+      );
+      if (hasContextCue) return true;
+      local = local.parentElement;
+    }
+    return false;
+  }
+
+  // If the active action and password already form their own small subtree,
+  // that subtree is an unrelated widget rather than evidence connecting the
+  // distant identity field. Valid deep flows keep the visible identifier
+  // action and the hidden password step in separate wrapper trees.
+  function controlsShareLocalSubtree(action, password, outer) {
+    let local = action.parentElement;
+    for (let depth = 0; depth < LOCAL_ASSOCIATION_MAX_DEPTH; depth += 1) {
+      if (local === null || local === outer) return false;
+      if (isWithin(password, local)) return true;
+      local = local.parentElement;
+    }
+    return false;
+  }
+
+  // Separate, constrained fallback for deeply nested, form-less, multi-step
+  // credential pages (issue #5). Their identity step is shown while the forward
+  // action and a still-hidden password step live in separate wrapper trees, so
+  // the nearest ancestor shared by all three is far beyond the shallow local
+  // reach. This never widens the shallow rule: it is only reached for an
+  // active, form-less, dialog-less field carrying the standardized username
+  // token, and it still demands a compatible forward action and a coherent
+  // password step, so a lone distant username field followed by a stray button
+  // never qualifies. The smallest such shared ancestor is the flow container; a
+  // bounding landmark, <body> or <html> is never it.
+  function deepCredentialFlowMatches(field, forwardActions, inputs, actionCandidates, cueCandidates, ctx) {
+    if (hasLocalNonCredentialAccountContext(field, cueCandidates, ctx)) return false;
+    for (
+      let container = field.parentElement;
+      container !== null &&
+      container !== undefined &&
+      container !== ctx.doc.body &&
+      container !== ctx.doc.documentElement &&
+      !isApplicationLandmark(container);
+      container = container.parentElement
+    ) {
+      // Active and forward-named already; here they must also not be fenced off
+      // by a native form or dialog the form-less, dialog-less field is not in.
+      const compatibleActions = forwardActions.filter(
+        (el) => isWithin(el, container) && formOwner(el) === null && dialogAncestor(el) === null
+      );
+      if (compatibleActions.length === 0) continue;
+      const passwordSteps = inputs.filter(
+        (pw) => isWithin(pw, container) && isCoherentPasswordStep(pw, actionCandidates, cueCandidates, ctx)
+      );
+      if (passwordSteps.length === 0) continue;
+
+      // A complete flow distributes its visible action and later password step
+      // across the candidate. If those two already make up a smaller local
+      // widget, that widget cannot be borrowed by the distant identity field.
+      const hasDistributedCredentialPattern = compatibleActions.some(
+        (action) => passwordSteps.some(
+          (pw) => !controlsShareLocalSubtree(action, pw, container)
+        )
+      );
+      if (hasDistributedCredentialPattern) return true;
+    }
+    return false;
+  }
+
   function identityPatternMatches(field, forwardActions, actionCandidates, cueCandidates, inputs, ctx) {
     // autocomplete="username" is strong standardized evidence and replaces the
     // textual cue, so localized pages need no English text. An associated
@@ -496,7 +638,7 @@
         container === null ||
         container === ctx.doc.body ||
         container === ctx.doc.documentElement
-      ) return false;
+      ) break;
       const hasPasswordStep = containerHasPasswordStep(container, inputs, actionCandidates, ctx);
       if (depth === 0 || hasPasswordStep) {
         const associated = forwardActions.filter((action) => isWithin(action, container));
@@ -508,6 +650,13 @@
       }
       container = container.parentElement;
     }
+
+    // Deeply nested, form-less, multi-step credential pages (issue #5) reach
+    // past that shallow limit, but only with the standardized username token to
+    // enter and a coherent hidden password step to anchor the association.
+    if (usernameAutocomplete) {
+      return deepCredentialFlowMatches(field, forwardActions, inputs, actionCandidates, cueCandidates, ctx);
+    }
     return false;
   }
 
@@ -515,20 +664,33 @@
   // Identity fields.
   // ---------------------------------------------------------------------------
 
+  function fieldMetadata(el, ctx) {
+    return normalize(
+      [getAttr(el, "name"), getAttr(el, "id"), getAttr(el, "placeholder"), accessibleName(el, ctx)]
+        .filter((value) => value !== null)
+        .join(" ")
+    );
+  }
+
+  function hasSearchSemantics(el, ctx) {
+    if (inputType(el) === "search" || tokensOf(el, "role").includes("searchbox")) return true;
+    if (SEARCH_HINT_RE.test(fieldMetadata(el, ctx))) return true;
+    for (let cur = el.parentElement; cur !== null && cur !== undefined; cur = cur.parentElement) {
+      if (tagOf(cur) === "search" || tokensOf(cur, "role").includes("search")) return true;
+    }
+    return false;
+  }
+
   function isIdentityField(el, ctx) {
     if (!IDENTITY_INPUT_TYPES.has(inputType(el))) return false;
+    if (hasSearchSemantics(el, ctx)) return false;
     const autocomplete = tokensOf(el, "autocomplete");
     if (autocomplete.includes("username")) return true;
     // type=email / autocomplete=email are weak (newsletters use both): they
     // identify the field but the pattern still demands the separate cue.
     if (inputType(el) === "email" || inputType(el) === "tel") return true;
     if (autocomplete.includes("email") || autocomplete.includes("tel")) return true;
-    const metadata = normalize(
-      [getAttr(el, "name"), getAttr(el, "id"), getAttr(el, "placeholder"), accessibleName(el, ctx)]
-        .filter((value) => value !== null)
-        .join(" ")
-    );
-    return IDENTITY_HINT_RE.test(metadata);
+    return IDENTITY_HINT_RE.test(fieldMetadata(el, ctx));
   }
 
   // ---------------------------------------------------------------------------

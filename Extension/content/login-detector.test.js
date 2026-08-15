@@ -195,6 +195,17 @@ function detect(...children) {
   return detectLoginPage(document, window);
 }
 
+// Wraps children in `levels` plain, meaning-free <div> wrappers — the kind of
+// deeply nested container tree that separates the steps of a form-less
+// multi-step credential page (issue #5). Reaching past LOCAL_ASSOCIATION_MAX_DEPTH
+// is the whole point, so each fixture states its depth explicitly rather than
+// relying on an exact number.
+function nest(levels, ...children) {
+  let node = el("div", {}, ...children);
+  for (let i = 1; i < levels; i += 1) node = el("div", {}, node);
+  return node;
+}
+
 test("open Shadow-root discovery includes nested roots and skips closed roots", () => {
   const nestedHost = el("section", { shadow: [el("input", { type: "password" })] });
   const openHost = el("div", { shadow: [nestedHost] });
@@ -600,6 +611,17 @@ test("a search box next to a header sign-in button is not a login page", () => {
   assert.equal(result.isLogin, false, "an identity-like field is required, not just any text input");
 });
 
+test("an account-related text search cannot borrow a header Sign in action", () => {
+  const result = detect(
+    el("header", {},
+      el("input", { type: "text", "aria-label": "Search accounts" }),
+      el("button", { type: "button", text: "Sign in" })
+    )
+  );
+
+  assert.equal(result.isLogin, false, "search semantics must win over the account identity hint");
+});
+
 test("a newsletter field and header sign-in button do not associate across an application shell", () => {
   const result = detect(
     el("div", { id: "app" },
@@ -666,6 +688,244 @@ test("a form-less multi-step credential page allows separate email-step wrappers
 
   assert.equal(result.isLogin, true);
   assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+// -----------------------------------------------------------------------------
+// Issue #5 — deeply nested, form-less, identifier-first multi-step flows.
+//
+// The identity step is shown while the forward action and the still-hidden
+// password step sit in separate, deeply nested wrapper trees whose nearest
+// shared ancestor is far beyond LOCAL_ASSOCIATION_MAX_DEPTH. Google's first
+// sign-in step is one such page. The fixtures use no host, id, class-name or
+// exact-depth checks and no <form>/dialog container.
+// -----------------------------------------------------------------------------
+
+test("a deeply nested form-less identifier-first credential page is detected", () => {
+  // The three steps are ~7 ancestors above the identity field, well past the
+  // shallow four-level reach. The password step is present but hidden, exactly
+  // as a first sign-in step keeps its later password view in the DOM.
+  const flow = el("div", {},
+    nest(6,
+      el("label", { for: "identifier", text: "Email or phone" }),
+      el("input", {
+        id: "identifier",
+        type: "text",
+        name: "identifier",
+        autocomplete: "username webauthn",
+      })
+    ),
+    nest(6, el("button", { type: "button", text: "Next" })),
+    nest(6, el("div", { style: { display: "none" } },
+      el("input", {
+        type: "password",
+        autocomplete: "current-password",
+        rect: { width: 0, height: 0 },
+      })
+    ))
+  );
+  const result = detect(el("main", {}, flow));
+
+  assert.equal(result.isLogin, true, "the identifier stage of a form-less multi-step flow must match");
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("extra neutral wrappers do not change the deep form-less positive result", () => {
+  // Same page, only more meaningless nesting between the steps and the shared
+  // container. Depth is not a signal, so the result must not move.
+  const flow = el("div", {},
+    nest(11,
+      el("input", {
+        type: "text",
+        name: "identifier",
+        autocomplete: "username webauthn",
+        "aria-label": "Email or phone",
+      })
+    ),
+    nest(9, el("button", { type: "button", text: "Next" })),
+    nest(13, el("div", { style: { display: "none" } },
+      el("input", { type: "password", autocomplete: "current-password", rect: { width: 0, height: 0 } })
+    ))
+  );
+  const result = detect(el("main", {}, el("div", {}, el("div", {}, flow))));
+
+  assert.equal(result.isLogin, true);
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("a non-current-password step is coherent only through evidence local to it", () => {
+  // No autocomplete=current-password: the later step qualifies only because a
+  // "Sign in" control sits right beside the password input, not merely
+  // somewhere in the broad flow container.
+  const flow = el("div", {},
+    nest(6, el("input", { type: "text", name: "identifier", autocomplete: "username" })),
+    nest(6, el("button", { type: "button", text: "Next" })),
+    nest(6, el("div", { style: { display: "none" } },
+      el("input", { type: "password", name: "pass", rect: { width: 0, height: 0 } }),
+      el("button", { type: "button", text: "Sign in", rect: { width: 0, height: 0 } })
+    ))
+  );
+  const result = detect(el("main", {}, flow));
+
+  assert.equal(result.isLogin, true);
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("a distant auth cue does not make a non-current-password step coherent", () => {
+  // The password input carries no current-password token and no auth evidence
+  // in its own locality; the only "Sign in" text is a heading in a separate
+  // subtree, merely somewhere in the broad flow container. That is not enough.
+  const flow = el("div", {},
+    nest(6, el("input", { type: "text", name: "identifier", autocomplete: "username" })),
+    nest(6, el("button", { type: "button", text: "Next" })),
+    nest(6, el("div", { style: { display: "none" } },
+      el("input", { type: "password", name: "pass", rect: { width: 0, height: 0 } })
+    )),
+    nest(6, el("h1", { text: "Sign in" }))
+  );
+  const result = detect(el("main", {}, flow));
+
+  assert.equal(result.isLogin, false);
+});
+
+test("a lone deeply nested username field and Next action without a password step do not match", () => {
+  // The deep fallback is for multi-step credential flows, not for any form-less
+  // username field that happens to be followed by a distant forward button.
+  const flow = el("div", {},
+    nest(6, el("input", { type: "text", name: "identifier", autocomplete: "username" })),
+    nest(6, el("button", { type: "button", text: "Next" }))
+  );
+  const result = detect(el("main", {}, flow));
+
+  assert.equal(result.isLogin, false, "no coherent password step means no deep association");
+});
+
+test("merely sharing a broad <main> does not associate otherwise unrelated controls", () => {
+  // Structurally comparable to the positive fixture, but with no flow container
+  // below <main>: identity field, Next action and password step are three
+  // separate subtrees whose only shared ancestor is the landmark itself.
+  const result = detect(
+    el("main", {},
+      nest(6, el("input", { type: "text", name: "identifier", autocomplete: "username webauthn" })),
+      nest(6, el("button", { type: "button", text: "Next" })),
+      nest(6, el("div", { style: { display: "none" } },
+        el("input", { type: "password", autocomplete: "current-password", rect: { width: 0, height: 0 } })
+      ))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a landmark bounds the search but is never itself the association");
+});
+
+test("an autocomplete=username profile field borrows no unrelated action or password in the same <main>", () => {
+  // A settings screen: the username field and an unrelated widget carrying a
+  // Continue button and a current-password input live in different branches of
+  // one <main>. They must never combine into a credential flow.
+  const result = detect(
+    el("main", {},
+      nest(6, el("input", { type: "text", name: "username", autocomplete: "username" })),
+      nest(4,
+        el("button", { type: "button", text: "Continue" }),
+        el("input", { type: "password", autocomplete: "current-password", rect: { width: 0, height: 0 } })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false);
+});
+
+test("neutral wrappers do not let profile controls bypass the <main> association boundary", () => {
+  const result = detect(
+    el("main", {},
+      el("div", {},
+        nest(6,
+          el("input", {
+            type: "text",
+            autocomplete: "username",
+            "aria-label": "Profile username",
+          })
+        ),
+        nest(6, el("button", { type: "button", text: "Continue" })),
+        nest(6,
+          el("input", {
+            type: "password",
+            autocomplete: "current-password",
+            rect: { width: 0, height: 0 },
+          })
+        )
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a broad wrapper is not credential-flow evidence");
+});
+
+test("a wrapped unrelated Continue/password widget cannot be adopted by a profile username", () => {
+  const result = detect(
+    el("main", {},
+      el("div", {},
+        nest(6, el("input", { type: "text", name: "username", autocomplete: "username" })),
+        nest(4,
+          el("button", { type: "button", text: "Continue" }),
+          el("input", {
+            type: "password",
+            autocomplete: "current-password",
+            rect: { width: 0, height: 0 },
+          })
+        )
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a separate local widget is not the username field's credential flow");
+});
+
+test("the deep fallback refuses a forward action owned by a different native form", () => {
+  const result = detect(
+    el("main", {},
+      el("div", {},
+        nest(6, el("input", { type: "text", name: "identifier", autocomplete: "username" })),
+        nest(6, el("div", { style: { display: "none" } },
+          el("input", { type: "password", autocomplete: "current-password", rect: { width: 0, height: 0 } })
+        )),
+        nest(4, el("form", {}, el("button", { text: "Next" })))
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a form-less field cannot borrow an action owned by another form");
+});
+
+test("the deep fallback refuses a forward action inside a separate dialog region", () => {
+  const result = detect(
+    el("main", {},
+      el("div", {},
+        nest(6, el("input", { type: "text", name: "identifier", autocomplete: "username" })),
+        nest(6, el("div", { style: { display: "none" } },
+          el("input", { type: "password", autocomplete: "current-password", rect: { width: 0, height: 0 } })
+        )),
+        nest(4, el("div", { role: "dialog" }, el("button", { type: "button", text: "Next" })))
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "controls in separate dialog-like regions cannot associate");
+});
+
+test("a deeply nested newsletter email field borrows no distant action or honeypot password", () => {
+  // No autocomplete=username token anywhere, so the deep fallback is never even
+  // entered: a plain email field plus a distant Next and a hidden password
+  // honeypot is not a credential flow.
+  const result = detect(
+    el("main", {},
+      nest(6, el("input", { type: "email", placeholder: "Email address" })),
+      nest(6, el("button", { type: "button", text: "Next" })),
+      nest(6, el("div", { style: { display: "none" } },
+        el("input", { type: "password", name: "hp", rect: { width: 0, height: 0 } })
+      ))
+    )
+  );
+
+  assert.equal(result.isLogin, false);
 });
 
 test("a newsletter form with a hidden password honeypot is not a login page", () => {
