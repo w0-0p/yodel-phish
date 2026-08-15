@@ -1050,6 +1050,38 @@ test("dynamically inserted credential fields trigger exactly one pipeline run", 
   assert.equal(runs.length, 1, "churn around one insertion must not start a second job");
 });
 
+// Issue #5: a form-less multi-step credential page (e.g. Google's first sign-in
+// step) is a login on first load, so init() must start exactly one analysis,
+// and the DOM churn such single-page apps produce afterwards must not start a
+// second. Detector confidence for that page shape is proven in the detector
+// suite; this asserts the one-analysis lifecycle around it.
+test("initial detection starts one analysis and later mutation churn starts no second", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.loginState.isLoginPage = true; // a login page already present at load
+  await settleInit();
+
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "run_pipeline").length,
+    1,
+    "initial detection starts exactly one analysis"
+  );
+
+  // The app keeps mutating while the analysis is in flight: framework churn,
+  // ads, its own step transitions. None of it may start a second analysis.
+  page.emitMutations([{ type: "childList", target: elementNode(), addedNodes: [elementNode("DIV")], removedNodes: [] }]);
+  context.mock.timers.tick(250);
+  page.emitMutations([{ type: "attributes", target: elementNode(), attributeName: "class" }]);
+  page.emitMutations([{ type: "childList", target: elementNode(), addedNodes: [elementNode("INPUT")], removedNodes: [] }]);
+  context.mock.timers.tick(250);
+
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "run_pipeline").length,
+    1,
+    "mutation churn after the same detection starts no second analysis"
+  );
+});
+
 test("automatic mutation handling remains gated when the page is not a detected login", (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const page = loadContentScript();
