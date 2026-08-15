@@ -1290,6 +1290,23 @@ async function checkDeviceFlowStatus() {
   return true;
 }
 
+// Issue #8: this tab may have been opened by a Settings "Move to trusted" to
+// confirm the site's logo. If so, run the same add-to-trusted flow the banner's
+// "Add to trusted" button uses instead of ordinary phishing analysis; the
+// background supplies the close-tab and settings-focus context. Checked after
+// the device-flow advisory, which always takes priority.
+async function checkTrustedAddIntent() {
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({ type: "get_trusted_add_intent" });
+  } catch {
+    return false; // background unreachable -- fail open, run the normal pipeline
+  }
+  if (response?.active !== true) return false;
+  triggerTrustedAdd();
+  return true;
+}
+
 // =============================================================================
 // INITIAL CHECK ON PAGE LOAD
 // =============================================================================
@@ -1310,6 +1327,7 @@ window.addEventListener("pageshow", async (event) => {
   removeBanner();
 
   if (await checkDeviceFlowStatus()) return;
+  if (await checkTrustedAddIntent()) return;
 
   const result = detectLoginPage();
   if (result.isLogin) {
@@ -1323,6 +1341,7 @@ window.addEventListener("pageshow", async (event) => {
 
 (async function init() {
   if (await checkDeviceFlowStatus()) return;
+  if (await checkTrustedAddIntent()) return;
   const result = detectLoginPage();
   if (result.isLogin) {
     triggerPipeline();

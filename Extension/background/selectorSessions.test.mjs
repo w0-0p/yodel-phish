@@ -483,7 +483,7 @@ test("an explicit add defers every trusted write to the selector confirmation", 
   // case itself never preprocesses a crop, writes the trusted list, or shows a
   // verdict banner — the selector session takes over from here.
   assert.match(addCase, /proposeTrustedAddCandidates\(result\.screenshot, tabId, job\.jobId\)/);
-  assert.match(addCase, /selectorSessions\.start\(tabId, \{\s*fqdn: parsedOrigin\.fqdn,\s*add: \{ origin: parsedOrigin, scores: scoreSnapshot\(result\) \},\s*candidates,/);
+  assert.match(addCase, /selectorSessions\.start\(tabId, \{\s*fqdn: parsedOrigin\.fqdn,\s*add: \{\s*origin: parsedOrigin,\s*scores: scoreSnapshot\(result\),\s*\.\.\.\(isMoveToTrusted \? \{ moveFromMuted: true \} : \{\}\),\s*\},\s*candidates,/);
   assert.match(addCase, /await injectLogoSelector\(tabId\)/);
   assert.doesNotMatch(addCase, /preprocessTrustedReference|withTrustedMuted|sendValidatedBanner/);
 

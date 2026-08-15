@@ -1300,6 +1300,56 @@ test("an unreachable background for the device-flow check fails open to normal d
 });
 
 // =============================================================================
+// Issue #8 — a tab opened by Settings "Move to trusted" runs the interactive
+// add-to-trusted confirmation instead of ordinary phishing analysis. The
+// background tells the page through get_trusted_add_intent; here we verify the
+// page acts on that answer at init, and in the right priority order.
+// =============================================================================
+
+test("a move-to-trusted tab starts the add-to-trusted confirmation, not ordinary analysis", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  // Even a page the heuristic would flag as a login must defer to the move.
+  page.loginState.isLoginPage = true;
+  page.setSendMessageBehavior("get_trusted_add_intent", () => Promise.resolve({ ok: true, active: true }));
+  await settleInit();
+
+  assert.ok(page.lastMessageOfType("add_to_trusted"), "the move tab must start the add-to-trusted confirmation");
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "run_pipeline").length,
+    0,
+    "ordinary phishing analysis must not run on a confirmation tab"
+  );
+});
+
+test("an ordinary tab with no move intent still runs normal detection", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.loginState.isLoginPage = true;
+  // The default stub answers get_trusted_add_intent with no `active` flag.
+  await settleInit();
+
+  assert.ok(page.lastMessageOfType("get_trusted_add_intent"), "init must ask whether this is a move tab");
+  assert.ok(page.lastMessageOfType("run_pipeline"), "without an intent, ordinary analysis runs");
+  assert.equal(page.lastMessageOfType("add_to_trusted"), undefined);
+});
+
+test("the device-flow advisory takes priority over a move-to-trusted intent", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript({ deviceFlow: { active: true, provider: "example" } });
+  page.setSendMessageBehavior("get_trusted_add_intent", () => Promise.resolve({ ok: true, active: true }));
+  await settleInit();
+
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "get_trusted_add_intent").length,
+    0,
+    "device-flow wins first, so the trusted-add intent is never even consulted"
+  );
+  assert.equal(page.lastMessageOfType("add_to_trusted"), undefined);
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+});
+
+// =============================================================================
 // Issue #88 — Shadow DOM observation and child-frame login reports.
 // =============================================================================
 

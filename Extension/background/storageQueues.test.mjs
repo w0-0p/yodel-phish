@@ -923,10 +923,12 @@ test("every trusted/muted write site keeps the two lists mutually exclusive and 
       `an append in ${label} that bypasses enforceTrustedVariantCap could leave a third variant stored`
     );
   }
-  // Automatic refresh and move-muted-to-trusted; the explicit add's append
-  // moved into applyManualLogoSelection with issue #90, and issue #93 added
-  // the manual Advanced Settings add in applyManualSiteMutation.
-  assert.equal((serviceWorker.match(/enforceTrustedVariantCap\(\[/g) ?? []).length, 2);
+  // Automatic refresh is the service worker's only remaining direct append:
+  // the explicit add's append moved into applyManualLogoSelection with issue
+  // #90, and move-muted-to-trusted stopped appending eagerly with issue #8 —
+  // it now confirms through that same add path. storageQueues keeps two: the
+  // add/confirm append and the manual Advanced Settings add (issue #93).
+  assert.equal((serviceWorker.match(/enforceTrustedVariantCap\(\[/g) ?? []).length, 1);
   assert.equal((storageQueues.match(/enforceTrustedVariantCap\(\[/g) ?? []).length, 2);
 });
 
@@ -1146,6 +1148,73 @@ test("manual logo: an add flow appends the variant and unmutes the fqdn", () => 
   assert.deepEqual(state.muted_list.map((entry) => entry.fqdn), ["keep.example"]);
 });
 
+test("manual logo: a move preserves muted metadata and strips mute-only state", () => {
+  const muted = {
+    fqdn: "site.example",
+    etld1: "site.example",
+    protocol: "https",
+    source_url: "https://site.example/login",
+    manual_entry: true,
+    user_words: ["account", "secure"],
+    muted_until: "forever",
+    needs_reference_capture: true,
+    custom_note: "keep me",
+  };
+  const state = {
+    trusted_list: [],
+    muted_list: [muted, { fqdn: "keep.example", muted_until: "forever" }],
+  };
+  const addition = { ...additionFor("site.example", "variant-new"), moveFromMuted: true };
+
+  const result = applyManualLogoSelection(state, manualSelectionInput({
+    targetVariantId: undefined,
+    addition,
+  }));
+
+  assert.equal(result.status, "saved");
+  assert.deepEqual(result.commit.mutedBefore, muted);
+  assert.deepEqual(state.muted_list, [{ fqdn: "keep.example", muted_until: "forever" }]);
+  assert.equal(state.trusted_list.length, 1);
+  const [saved] = state.trusted_list;
+  assert.equal(saved.manual_entry, true, "manual-entry provenance survives the move");
+  assert.deepEqual(saved.user_words, ["account", "secure"]);
+  assert.equal(saved.custom_note, "keep me");
+  assert.equal(saved.logo_source, "manual");
+  assert.equal(saved.logo_image, manualLogo.logo_image);
+  assert.equal(saved.muted_until, undefined);
+  assert.equal(saved.needs_reference_capture, undefined);
+});
+
+test("manual logo: a stale move cannot create trusted state after its muted source vanished", () => {
+  const state = { trusted_list: [], muted_list: [] };
+  const before = structuredClone(state);
+
+  const result = applyManualLogoSelection(state, manualSelectionInput({
+    targetVariantId: undefined,
+    addition: { ...additionFor("site.example", "variant-new"), moveFromMuted: true },
+  }));
+
+  assert.deepEqual(result, { status: "entry_missing", changed: false });
+  assert.deepEqual(state, before);
+});
+
+test("manual logo: a duplicate move cannot overwrite an existing trusted variant", () => {
+  const existing = trustedVariant("site.example", "variant-existing", { logo_image: "original" });
+  const state = {
+    trusted_list: [existing],
+    muted_list: [{ fqdn: "site.example", muted_until: "forever", manual_entry: true }],
+  };
+  const before = structuredClone(state);
+
+  const result = applyManualLogoSelection(state, manualSelectionInput({
+    targetVariantId: undefined,
+    addition: { ...additionFor("site.example", "variant-new"), moveFromMuted: true },
+  }));
+
+  assert.deepEqual(result, { status: "entry_missing", changed: false });
+  assert.deepEqual(state, before);
+});
+
 test("manual logo: an add flow refreshes an fqdn that is already trusted", () => {
   const existing = trustedVariant("site.example", "variant-1");
   const before = { ...existing };
@@ -1296,18 +1365,71 @@ test("manual logo: the selector flow only completes on a saved outcome", async (
   assert.doesNotMatch(serviceWorker, /logo_selector_error|sendErrorToSelector/);
 });
 
-test("move to trusted forces one in-place reference capture regardless of score", async () => {
+test("moving a muted site to trusted launches the interactive confirmation, not a silent capture", async () => {
+  // Issue #8: move-muted-to-trusted no longer writes the lists or defers an
+  // unvalidated logo capture to a later visit. It opens the site in a new tab
+  // and records that the tab is a confirmation flow; the entry stays muted
+  // until the user confirms a logo there.
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   const moveCase = serviceWorker.slice(
     serviceWorker.indexOf('case "move_muted_to_trusted"'),
-    serviceWorker.indexOf('case "set_developer_mode"')
+    serviceWorker.indexOf('case "add_manual_site"')
   );
+
+  assert.doesNotMatch(moveCase, /needs_reference_capture/, "no deferred silent capture");
+  assert.doesNotMatch(moveCase, /state\.trusted_list =/, "no eager trusted write");
+  assert.doesNotMatch(moveCase, /state\.muted_list =/, "the entry stays muted until confirmation");
+
+  // Opens a blank tab, persists its intent, and only then navigates it. This
+  // ordering prevents a fast cached/file page from asking before it is armed.
+  assert.match(moveCase, /chrome\.tabs\.create\(\{ url: "about:blank", active: true \}\)/);
+  assert.match(moveCase, /entry\.protocol === "file" && isFileUrl\(entry\.source_url\)/);
+  assert.match(moveCase, /trustedAddIntents\.set\(newTab\.id, \{ fqdn, settingsTabId: tabId \}\)/);
+  assert.match(moveCase, /chrome\.tabs\.update\(newTab\.id, \{ url \}\)/);
+  assert.ok(
+    moveCase.indexOf("trustedAddIntents.set(newTab.id") < moveCase.indexOf("chrome.tabs.update(newTab.id"),
+    "the durable intent must be written before destination navigation"
+  );
+  assert.match(moveCase, /trustedAddIntents\.discardTab\(newTab\.id\)/, "failed startup clears the intent");
+  assert.match(moveCase, /chrome\.tabs\.remove\(newTab\.id\)/, "failed startup closes the unusable tab");
+
+  // The add-to-trusted flow the tab then runs reads that intent, scoped to the
+  // tab's current fqdn, and for a move closes the tab and refocuses Settings.
+  const addCase = serviceWorker.slice(
+    serviceWorker.indexOf('case "add_to_trusted"'),
+    serviceWorker.indexOf('case "get_trusted_add_intent"')
+  );
+  assert.match(addCase, /trustedAddIntents\.get\(tabId\)/);
+  assert.match(addCase, /moveIntent !== null && moveIntent\.fqdn === parsedOrigin\.fqdn/);
+  assert.match(addCase, /closeTabOnComplete: isMoveToTrusted/);
+  assert.match(addCase, /settingsTabId: moveIntent\.settingsTabId/);
+  assert.match(addCase, /moveFromMuted: true/, "the atomic commit knows this is a real move");
+  assert.ok(
+    addCase.indexOf("abortTrustedAddIntent(tabId)") < addCase.indexOf("if (!settled) throw error"),
+    "capture and detection failures must abort before they are rethrown"
+  );
+
+  const navigationErrorHandler = serviceWorker.slice(
+    serviceWorker.indexOf("chrome.webNavigation.onErrorOccurred.addListener"),
+    serviceWorker.indexOf("async function prepareSameTabDeviceFlowSource")
+  );
+  assert.match(navigationErrorHandler, /if \(details\.frameId !== 0\) return/);
+  assert.match(navigationErrorHandler, /abortTrustedAddIntent\(details\.tabId\)/);
+});
+
+test("a forced initial reference capture bypasses the drift threshold", async () => {
+  // The needs_reference_capture marker now originates only from the manual
+  // Advanced Settings add (issue #93), which has no screenshot at add time.
+  // refreshTrustedEntry still honours it: it captures once on the next visit
+  // regardless of drift, and never clears the marker without a usable logo.
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+  const storageQueues = await readFile(new URL("./storageQueues.mjs", import.meta.url), "utf8");
   const refresh = serviceWorker.slice(
     serviceWorker.indexOf("async function refreshTrustedEntry"),
     serviceWorker.indexOf("async function checkSelectorSession")
   );
 
-  assert.match(moveCase, /needs_reference_capture: true/);
+  assert.match(storageQueues, /needs_reference_capture: true/);
   assert.ok(
     refresh.indexOf("entry.needs_reference_capture === true") < refresh.indexOf("if (!drifted)"),
     "the marker must bypass the normal drift threshold"

@@ -354,8 +354,21 @@ export function applyManualLogoSelection(state, {
   storageRevision,
   addition = null,
 }) {
+  const moveFromMuted = addition?.moveFromMuted === true;
+  const additionFqdn = addition?.origin?.fqdn;
+  const mutedIndex = additionFqdn === undefined
+    ? -1
+    : state.muted_list.findIndex((item) => item.fqdn === additionFqdn);
+  const mutedBefore = mutedIndex === -1 ? null : { ...state.muted_list[mutedIndex] };
+  if (moveFromMuted && mutedBefore === null) {
+    // A settings move is conditional on its source still being muted. This
+    // prevents a stale second tab or a flow whose source was removed from
+    // recreating/overwriting a trusted entry after the move ceased to exist.
+    return { status: "entry_missing", changed: false };
+  }
   const entry = findTrustedVariant(state.trusted_list, fqdn, targetVariantId);
   if (entry !== null) {
+    if (moveFromMuted) return { status: "entry_missing", changed: false };
     const before = { ...entry };
     Object.assign(entry, manualLogoFields(logo), {
       updated_at: timestamp,
@@ -385,12 +398,16 @@ export function applyManualLogoSelection(state, {
 
   if (addition === null) return { status: "entry_missing", changed: false };
 
-  const mutedIndex = state.muted_list.findIndex((item) => item.fqdn === addition.origin.fqdn);
-  const mutedBefore = mutedIndex === -1 ? null : { ...state.muted_list[mutedIndex] };
+  const movedBase = moveFromMuted ? { ...mutedBefore } : {};
+  delete movedBase.muted_until;
+  delete movedBase.needs_reference_capture;
   const previousVariants = state.trusted_list.filter((item) => item.fqdn === addition.origin.fqdn);
   const trustedList = enforceTrustedVariantCap([
     ...state.trusted_list,
     {
+      // A real move retains user-managed metadata and provenance from Muted;
+      // analysis-derived identity, scores and the confirmed logo are refreshed.
+      ...movedBase,
       fqdn: addition.origin.fqdn,
       storage_revision: storageRevision,
       etld1: addition.origin.etld1,
@@ -399,7 +416,7 @@ export function applyManualLogoSelection(state, {
       variant_id: addition.variantId,
       ocr_domain: addition.origin.ocrDomain,
       ...manualLogoFields(logo),
-      user_words: [],
+      user_words: Array.isArray(movedBase.user_words) ? [...movedBase.user_words] : [],
       scores: addition.scores,
       last_visited: addition.lastVisited,
       updated_at: timestamp,
