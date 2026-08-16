@@ -69,7 +69,21 @@ function createFakeElement(tagName) {
     _attributes: {},
     _buttons: new Map(),
     tagName,
-    style: { setProperty() {}, removeProperty() {} },
+    style: {
+      _properties: new Map(),
+      setProperty(property, value, priority = "") {
+        this._properties.set(property, { value: String(value), priority: String(priority) });
+      },
+      getPropertyValue(property) {
+        return this._properties.get(property)?.value ?? "";
+      },
+      getPropertyPriority(property) {
+        return this._properties.get(property)?.priority ?? "";
+      },
+      removeProperty(property) {
+        this._properties.delete(property);
+      },
+    },
     dataset: {},
     disabled: false,
     hidden: false,
@@ -167,6 +181,14 @@ function loadContentScript({
   fakeBody.prepend = (node) => {
     lastPrepended = node;
     prependCount += 1;
+  };
+  // The busy overlay is the only thing appended (not prepended) to the body, so
+  // spying appendChild is enough to observe it; removeBusyOverlay() marks it
+  // ._removed via the node's own remove().
+  let busyOverlay = null;
+  fakeBody.appendChild = (node) => {
+    busyOverlay = node;
+    return node;
   };
   // The Shadow-root walk reads `children`/`shadowRoot`, so the body needs a
   // real (if tiny) tree to walk. `bodyChildren` is what tests populate.
@@ -316,6 +338,17 @@ function loadContentScript({
     },
     get bannerRemoved() {
       return lastPrepended?._removed ?? false;
+    },
+    // The busy overlay is present once it has been appended and not yet removed
+    // (removeBusyOverlay calls the node's own remove(), flipping ._removed).
+    get busyOverlayPresent() {
+      return busyOverlay !== null && busyOverlay._removed !== true;
+    },
+    busyOverlayStyle(property) {
+      return busyOverlay?.style.getPropertyValue(property) ?? "";
+    },
+    busyOverlayStylePriority(property) {
+      return busyOverlay?.style.getPropertyPriority(property) ?? "";
     },
     get bannerVerdict() {
       return bannerRoot(lastPrepended)?.dataset.verdict;
@@ -503,6 +536,7 @@ test("a show_banner for the current job is accepted and updates icon state", () 
 
   assert.deepEqual(response, { accepted: true });
   assert.equal(page.lastMessageOfType("set_icon_state")?.state, "safe");
+  assert.equal(page.busyOverlayPresent, false, "the final trusted verdict ends the analysis");
 });
 
 test("an analysis_failed for an older job is ignored", () => {
@@ -800,6 +834,7 @@ test("a provisional trusted verdict waits for the screenshot but releases the pa
 
   assert.equal(page.bannerCount, 1, "the capture is what paints the verdict");
   assert.deepEqual(page.bannerHistory, ["Safe."]);
+  assert.equal(page.busyOverlayPresent, true, "the trusted-drift check is still running behind the provisional verdict");
 
   // The drift check is still running: its progress must not take the verdict's
   // place, and the verdict must not be repainted as a second banner.
@@ -866,6 +901,7 @@ test("a provisional verdict followed by the same final verdict repaints nothing"
   assert.equal(page.bannerRenders, rendersAfterProvisional, "identical content must be a no-op");
   assert.deepEqual(page.bannerHistory, ["Safe."]);
   assert.equal(page.lastMessageOfType("set_icon_state")?.state, "safe");
+  assert.equal(page.busyOverlayPresent, false, "the final trusted verdict ends the trusted-drift check");
 });
 
 test("a replaced state leaves none of the previous state's buttons behind", () => {
@@ -1186,6 +1222,79 @@ test("an unavailable interruption retries the original add-to-trusted action", (
   const trustedAdds = page.sentMessages.filter((message) => message.type === "add_to_trusted");
   assert.equal(trustedAdds.length, 2);
   assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+});
+
+// =============================================================================
+// Busy overlay — a transparent, click-blocking, cursor: progress shield is up
+// only while an analysis is genuinely in flight. It is created when analysis
+// starts and torn down at every terminal result, through the same showBanner /
+// removeBanner choke points, so no path can strand a pointer-blocking layer.
+// =============================================================================
+
+test("an analysis start raises the busy overlay, whichever trigger began it", () => {
+  const viaDetection = loadContentScript();
+  viaDetection.startJobViaManualTrigger();
+  assert.equal(viaDetection.busyOverlayPresent, true, "triggerPipeline must raise the shield");
+  assert.equal(viaDetection.busyOverlayStyle("all"), "initial", "page CSS cannot hide the shield");
+  assert.equal(viaDetection.busyOverlayStyle("cursor"), "progress");
+  assert.equal(viaDetection.busyOverlayStyle("pointer-events"), "auto");
+  assert.equal(viaDetection.busyOverlayStyle("z-index"), "2147483646");
+  assert.equal(viaDetection.busyOverlayStylePriority("all"), "important");
+
+  const viaTrustedAdd = loadContentScript();
+  viaTrustedAdd.startJobViaTrustedAdd();
+  assert.equal(viaTrustedAdd.busyOverlayPresent, true, "triggerTrustedAdd must raise the shield too");
+});
+
+test("every terminal result for the current job takes the busy overlay down", (context) => {
+  // Mock timers so the silent-cancellation route's follow-up re-evaluation
+  // timer is registered rather than left dangling; none of these need ticking.
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const removals = {
+    "a verdict": (page, jobId) => page.dispatch({ type: "show_banner", jobId, verdict: "unknown", data: {} }),
+    "a failure": (page, jobId) => page.dispatch({ type: "analysis_failed", jobId, code: "request_timeout" }),
+    "silent cancellation": (page, jobId) => page.dispatch({ type: "analysis_cancelled_silently", jobId }),
+    "an interruption": (page, jobId) => page.dispatch({ type: "analysis_interrupted", jobId }),
+    "a continuation": (page, jobId) => {
+      page.dispatch({ type: "analysis_interrupted", jobId });
+      page.dispatch({ type: "continue_without_analysis", jobId });
+    },
+    // Issue #8: cancel_analysis clears the banner just before the logo selector
+    // mounts, so the shield must come down or the selector would be unclickable.
+    "cancel_analysis handing off to the logo selector": (page) => page.dispatch({ type: "cancel_analysis" }),
+  };
+
+  for (const [label, terminate] of Object.entries(removals)) {
+    const page = loadContentScript();
+    const jobId = page.startJobViaManualTrigger();
+    assert.equal(page.busyOverlayPresent, true, `${label}: the shield must be up first`);
+
+    terminate(page, jobId);
+
+    assert.equal(page.busyOverlayPresent, false, `${label} must take the shield down`);
+  }
+});
+
+test("the content-side deadline takes the busy overlay down on its own", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.startJobViaManualTrigger();
+  assert.equal(page.busyOverlayPresent, true);
+
+  context.mock.timers.tick(290_000);
+
+  assert.equal(page.busyOverlayPresent, false, "a job nobody answered must not shield the page forever");
+});
+
+test("a terminal message for another job cannot take down the current job's busy overlay", () => {
+  const page = loadContentScript();
+  page.startJobViaManualTrigger();
+
+  page.dispatch({ type: "analysis_failed", jobId: "some-older-job-id", code: "request_timeout" });
+  page.dispatch({ type: "analysis_interrupted", jobId: "some-older-job-id" });
+  page.dispatch({ type: "show_banner", jobId: "some-older-job-id", verdict: "unknown", data: {} });
+
+  assert.equal(page.busyOverlayPresent, true, "a stale job's result must not strip the current one's shield");
 });
 
 // =============================================================================

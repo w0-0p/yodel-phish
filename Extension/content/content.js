@@ -21,6 +21,13 @@ let bannerHiddenForCapture = false;
 // trusted verdict.
 let capturePending = false;
 const transientExtensionRoots = new WeakSet();
+// A transparent, full-viewport shield shown while an analysis is in flight so
+// the native "progress" cursor (the same busy clock the logo selector uses)
+// appears over the page. Because a cursor only renders on an element that takes
+// pointer events, the shield necessarily also swallows clicks — which matches
+// the banner's "Do not interact with the website" guidance. It is NOT a scroll
+// container, so wheel/touch scrolling still reaches the page.
+let busyOverlayEl = null;
 let submissionBlocker = null;
 let analysisMode = null;
 let interruptionPending = false;
@@ -218,6 +225,7 @@ function triggerPipeline({ userInitiated = false } = {}) {
   capturePending = true;
   armAnalysisDeadline(jobId);
   blockFormSubmission();
+  showBusyOverlay();
   setIconState("analysing", bannerMessageFor(analysisProgressVerdict(), {}));
   showBanner(analysisProgressVerdict(), {});
   chrome.runtime.sendMessage({ type: "run_pipeline", jobId })
@@ -239,6 +247,7 @@ function triggerTrustedAdd() {
   capturePending = true;
   armAnalysisDeadline(jobId);
   blockFormSubmission();
+  showBusyOverlay();
   setIconState("analysing", bannerMessageFor("adding_to_trusted", {}));
   showBanner("adding_to_trusted", {});
   chrome.runtime.sendMessage({ type: "add_to_trusted", jobId })
@@ -396,6 +405,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     interruptionPending = false;
     currentJobId = null;
     unblockFormSubmission();
+    removeBusyOverlay();
     setIconState(iconStateForVerdict(message.verdict), bannerMessageFor(message.verdict, message.data ?? {}));
     showBanner(message.verdict, message.data ?? {});
     sendResponse({ accepted: true });
@@ -429,6 +439,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     currentJobId = null;
     analysisMode = null;
     unblockFormSubmission();
+    removeBusyOverlay();
     setIconState("unverified", bannerMessageFor("continued_unverified", {}));
     showBanner("continued_unverified", {});
     sendResponse({ ok: true });
@@ -443,6 +454,7 @@ function enterInterruptedState(jobId) {
   if (jobId !== undefined) currentJobId = jobId;
   interruptionPending = true;
   blockFormSubmission();
+  removeBusyOverlay();
   setIconState("interrupted", bannerMessageFor("interrupted", {}));
   showBanner("interrupted", {});
   return true;
@@ -464,6 +476,7 @@ function enterFailedState(jobId, code) {
   interruptionPending = false;
   currentJobId = null;
   unblockFormSubmission();
+  removeBusyOverlay();
   setIconState("failed", bannerMessageFor("analysis_failed", { code }));
   showBanner("analysis_failed", { code, retryMode });
   return true;
@@ -1000,8 +1013,12 @@ function showBanner(verdict, data) {
 
   clearProgressTimer();
   // Any other state ends the capture window: those paths either already
-  // captured or never will, and must never be held back.
-  if (!PROGRESS_VERDICTS.has(verdict)) capturePending = false;
+  // captured or never will, and must never be held back. This renderer does
+  // not own the busy shield's lifecycle: a provisional "trusted" verdict is
+  // non-progress UI while its trusted-drift analysis is still running.
+  if (!PROGRESS_VERDICTS.has(verdict)) {
+    capturePending = false;
+  }
   if (bannerEl !== null && state === bannerState) return;
 
   if (PROGRESS_VERDICTS.has(verdict)) {
@@ -1147,17 +1164,23 @@ function updateProgressNote() {
   }
   const seconds = Math.round(elapsedMs / 1000);
   if (elapsedMs < PROGRESS_NOTE_STILL_AFTER_MS) {
-    note.textContent = `Working… (${seconds}s)`;
+    note.textContent = `Analysis in progress… (${seconds}s) — Do not interact with the website until the analysis finishes.`;
   } else if (elapsedMs < PROGRESS_NOTE_LONG_AFTER_MS) {
-    note.textContent = `Still analysing… (${seconds}s)`;
+    note.textContent = `Still analysing… (${seconds}s) — Do not interact with the website until the analysis finishes.`;
   } else {
-    note.textContent = `Still analysing… (${seconds}s) — some checks, like finding the page's logo, take longer on certain pages.`;
+    note.textContent = `Hold on… (${seconds}s) — Visual analysis can take longer on certain pages.`;
   }
 }
 
 function removeBanner() {
   clearProgressTimer();
   capturePending = false;
+  // Removing the banner is the other terminal path. It covers the routes that
+  // clear the banner without a replacement verdict — silent same-document
+  // cancellation, a bfcache restore, and cancel_analysis, which drops the
+  // banner just before the logo selector mounts: leaving a pointer-blocking
+  // shield up would make that selector unclickable (issue #8).
+  removeBusyOverlay();
   stopProgressNote();
   const removedHost = bannerHostEl;
   removedHost?.remove();
@@ -1165,6 +1188,52 @@ function removeBanner() {
   bannerHostEl = null;
   bannerEl = null;
   bannerState = null;
+}
+
+// =============================================================================
+// BUSY OVERLAY (during in-page analysis)
+//
+// One transparent, fixed, full-viewport element carrying cursor: progress. It
+// is extension-owned (so the mutation observer never treats its own add/remove
+// as a page change) and, being transparent, never appears in the screenshot —
+// so unlike the banner it needs no capture-hiding (issue #77). `all: initial`
+// first neutralizes page CSS that could hide or reposition an anonymous div;
+// the explicit important properties then define the shield. It sits one
+// z-index below the banner so the banner and its controls always stay on top.
+// =============================================================================
+
+const BUSY_OVERLAY_STYLE = Object.freeze({
+  all: "initial",
+  display: "block",
+  position: "fixed",
+  top: "0",
+  left: "0",
+  right: "0",
+  bottom: "0",
+  margin: "0",
+  "z-index": "2147483646",
+  background: "transparent",
+  cursor: "progress",
+  "pointer-events": "auto",
+});
+
+function showBusyOverlay() {
+  if (busyOverlayEl !== null) return;
+  const overlay = document.createElement("div");
+  for (const [property, value] of Object.entries(BUSY_OVERLAY_STYLE)) {
+    overlay.style.setProperty(property, value, "important");
+  }
+  document.body.appendChild(overlay);
+  markExtensionMutation(overlay);
+  busyOverlayEl = overlay;
+}
+
+function removeBusyOverlay() {
+  if (busyOverlayEl === null) return;
+  const removed = busyOverlayEl;
+  busyOverlayEl = null;
+  removed.remove();
+  markExtensionMutation(removed);
 }
 
 // =============================================================================
@@ -1264,6 +1333,7 @@ function activateDeviceFlowAdvisory(provider) {
   interruptionPending = false;
   currentJobId = null;
   unblockFormSubmission();
+  removeBusyOverlay();
   deviceFlowActive = true;
   deviceFlowProvider = typeof provider === "string" && provider !== "" ? provider : "this provider";
   setIconState("device_flow", bannerMessageFor("high_risk_login", { provider: deviceFlowProvider }));

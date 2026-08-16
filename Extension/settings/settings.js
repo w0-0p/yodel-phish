@@ -394,7 +394,10 @@ function buildAnalysisCard(record) {
   const completed = record.status !== "error" && record.status !== "cancelled";
   const details = element("details", `analysis-card verdict-${record.displayed_verdict ?? record.status}`);
   const summary = element("summary", "analysis-summary");
-  const title = element("span", "analysis-summary-title", record.matched_fqdn || record.origin?.fqdn || "Local file");
+  // Always the analysed page, never record.matched_fqdn: for an unknown result
+  // the latter is only the pipeline's closest candidate, so titling the card
+  // with it would name an unrelated brand instead of the page that was scanned.
+  const title = element("span", "analysis-summary-title", record.origin?.fqdn || "Local file");
   const verdict = element("span", "analysis-verdict", completed
     ? String(record.displayed_verdict ?? "unknown").toUpperCase()
     : String(record.status).toUpperCase());
@@ -424,15 +427,25 @@ function buildIncompleteBody(record) {
 
 function buildCompletedBody(record) {
   const body = element("div", "analysis-body");
-  // The displayed verdict and matched reference are already in the card
-  // header; the pipeline verdict stays because it can legitimately differ
-  // from it (phishing presented as suspicious). Records carry the analysed
-  // page's hostname and nothing more of its address -- see compactOrigin.
+  // Matched domain and variant name the reference the pipeline actually matched,
+  // so they belong here only for a confirmed match. For an unknown result the
+  // pipeline merely had a closest candidate; naming it as "matched" would
+  // misrepresent it -- it survives as a diagnostic in the winner/reference
+  // sections below instead. The pipeline verdict stays for every completed
+  // record because it can legitimately differ from the displayed verdict
+  // (phishing presented as suspicious). Records carry the analysed page's
+  // hostname and nothing more of its address -- see compactOrigin.
+  const confirmedMatch = record.pipeline_verdict === "phishing" &&
+    typeof record.matched_fqdn === "string" &&
+    record.matched_fqdn !== "";
   appendMetrics(body, [
     ["Origin", record.origin?.fqdn],
     ["Context", record.context],
     ["Pipeline verdict", record.pipeline_verdict],
-    ["Matched variant", record.matched_variant_id],
+    ...(confirmedMatch ? [
+      ["Matched domain", record.matched_fqdn],
+      ["Matched variant", record.matched_variant_id],
+    ] : []),
     ["Extension version", record.extension_version],
     ["Protocol", record.origin?.protocol],
     ["Origin mismatch", yesNo(record.origin?.origin_mismatch)],
