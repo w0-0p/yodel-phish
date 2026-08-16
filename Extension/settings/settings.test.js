@@ -709,8 +709,10 @@ test("a completed card drops absent fields while keeping false and zero", async 
   assert.match(overview, /Origin\|bank\.test/);
   assert.match(overview, /Pipeline verdict\|phishing/);
   assert.match(overview, /Origin mismatch\|no\|Trusted page\|no/, "false is a value and stays");
-  // Both are already in the card header, and the empty variant id says nothing.
-  assert.doesNotMatch(overview, /Displayed verdict|Matched reference|Matched variant/);
+  // A confirmed phishing match names its matched domain here; the empty variant
+  // id still says nothing, and the displayed verdict stays in the header badge.
+  assert.match(overview, /Matched domain\|bank\.test/);
+  assert.doesNotMatch(overview, /Displayed verdict|Matched variant/);
   // The address of the analysed page is never rendered, not even from a
   // record written before it stopped being stored.
   assert.doesNotMatch(overview, /URL|\/login/);
@@ -743,6 +745,126 @@ function dashCount(card) {
     .filter((text) => text === "—")
     .length;
 }
+
+// The card title names the analysed page, never the pipeline's closest
+// candidate: for an unknown result that candidate is not a confirmed match, so
+// titling with it would name an unrelated brand. Matched domain/variant appear
+// as details only for a confirmed phishing match; the winner/reference
+// diagnostics stay for every completed record, unknown ones included.
+test("an unknown analysis is titled by its origin and never names the closest candidate as a match", async () => {
+  const page = await loadSettings({
+    stored: {
+      settings: { developer_mode: true },
+      analysis_history: [{
+        status: "completed",
+        datetime: "2026-08-09T12:00:00.000Z",
+        extension_version: "0.1.0",
+        origin: { valid: true, fqdn: "accounts.zalando.com", protocol: "https", in_trusted_list: false, origin_mismatch: false },
+        context: "detection",
+        displayed_verdict: "unknown",
+        pipeline_verdict: "unknown",
+        global_score: 0.31,
+        matched_fqdn: "login.microsoftonline.com",
+        matched_variant_id: "variant-ms",
+        winner: { logo: { reason: "compared" }, ocr: { matched_tokens: ["microsoft"] } },
+        reference: {
+          fqdn: "login.microsoftonline.com",
+          variant_id: "variant-ms",
+          logo_source: "automatic",
+          ocr_domain: "microsoft",
+          ocr_words: ["microsoft"],
+          user_words: [],
+        },
+        candidates: [],
+      }],
+    },
+  });
+
+  const card = page.document.getElementById("analysis-history-list").querySelectorAll(".analysis-card")[0];
+  assert.equal(
+    card.querySelector(".analysis-summary-title").textContent,
+    "accounts.zalando.com",
+    "the analysed origin titles the card, not the closest candidate"
+  );
+
+  const blockByTitle = (title) =>
+    card.querySelectorAll(".analysis-block").find((block) => block.children[0]?.textContent === title) ?? null;
+  const gridText = (grid) => grid.children.map((node) => node.textContent).join("|");
+
+  const overview = gridText(card.querySelector(".metric-grid"));
+  assert.doesNotMatch(overview, /Matched domain/, "an unknown result has no confirmed match to name");
+  assert.doesNotMatch(overview, /Matched variant/);
+  assert.doesNotMatch(overview, /login\.microsoftonline\.com/, "the closest candidate is never a match row");
+
+  // The winner and saved-reference diagnostics remain useful and stay put, and
+  // that is where the closest candidate legitimately appears -- as a diagnostic.
+  assert.notEqual(blockByTitle("Logo comparison"), null, "winner diagnostics stay for unknown results");
+  const reference = blockByTitle("Saved reference");
+  assert.notEqual(reference, null, "the saved-reference section stays for unknown results");
+  assert.match(gridText(reference.children[1]), /FQDN\|login\.microsoftonline\.com/);
+});
+
+test("a confirmed phishing match is titled by its origin and shows matched domain and variant", async () => {
+  const page = await loadSettings({
+    stored: {
+      settings: { developer_mode: true },
+      analysis_history: [{
+        status: "completed",
+        datetime: "2026-08-09T12:00:00.000Z",
+        extension_version: "0.1.0",
+        origin: { valid: true, fqdn: "paypa1-login.test", protocol: "https", in_trusted_list: false, origin_mismatch: false },
+        context: "detection",
+        // Phishing without an origin mismatch is displayed as suspicious.
+        displayed_verdict: "suspicious",
+        pipeline_verdict: "phishing",
+        global_score: 0.71,
+        matched_fqdn: "paypal.com",
+        matched_variant_id: "variant-7",
+        winner: null,
+        reference: null,
+        candidates: [],
+      }],
+    },
+  });
+
+  const card = page.document.getElementById("analysis-history-list").querySelectorAll(".analysis-card")[0];
+  assert.equal(
+    card.querySelector(".analysis-summary-title").textContent,
+    "paypa1-login.test",
+    "even a confirmed match is titled by the analysed origin, not the matched brand"
+  );
+
+  const overview = card.querySelector(".metric-grid").children.map((node) => node.textContent).join("|");
+  assert.match(overview, /Matched domain\|paypal\.com/, "a confirmed match names its matched domain");
+  assert.match(overview, /Matched variant\|variant-7/);
+});
+
+test("a phishing record without a matched domain exposes no partial match fields", async () => {
+  const page = await loadSettings({
+    stored: {
+      settings: { developer_mode: true },
+      analysis_history: [{
+        status: "completed",
+        datetime: "2026-08-09T12:00:00.000Z",
+        extension_version: "0.1.0",
+        origin: { valid: true, fqdn: "malformed.example", protocol: "https", in_trusted_list: false, origin_mismatch: true },
+        context: "detection",
+        displayed_verdict: "phishing",
+        pipeline_verdict: "phishing",
+        global_score: 0.71,
+        matched_fqdn: "",
+        matched_variant_id: "orphaned-variant",
+        winner: null,
+        reference: null,
+        candidates: [],
+      }],
+    },
+  });
+
+  const card = page.document.getElementById("analysis-history-list").querySelectorAll(".analysis-card")[0];
+  const overview = card.querySelector(".metric-grid").children.map((node) => node.textContent).join("|");
+  assert.doesNotMatch(overview, /Matched domain|Matched variant/);
+});
 
 // A failed analysis has no verdict, no scores and no candidates. It used to
 // render the completed-analysis grid anyway, one dash per missing field.
