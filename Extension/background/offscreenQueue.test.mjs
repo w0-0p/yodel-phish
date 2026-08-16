@@ -291,6 +291,66 @@ test("cancel() on a running ticket rejects the caller but the real run still own
   assert.equal(queue.runningCount, 0);
 });
 
+test("a cancellable running ticket terminates its real work and promptly releases the slot", async () => {
+  const queue = new OffscreenQueue({ concurrency: 1, maxQueueLength: 8 });
+  let rejectRealRun;
+  let nextStarted = false;
+  const realRun = new Promise((_resolve, reject) => {
+    rejectRealRun = reject;
+  });
+  const running = queue.schedule("tab1", () => realRun, {
+    ticketId: "automatic",
+    cancelRun: (reason) => {
+      rejectRealRun(new Error(reason));
+      return true;
+    },
+  });
+  const next = queue.schedule("tab2", async () => {
+    nextStarted = true;
+    return "manual-preprocessing";
+  });
+
+  assert.deepEqual(
+    queue.cancel("tab1", "manual_logo_selection", { ticketId: "automatic" }),
+    { queued: false, running: true }
+  );
+  await assert.rejects(running, (error) => error instanceof SchedulerError && error.code === "cancelled");
+  assert.equal(await next, "manual-preprocessing");
+  assert.equal(nextStarted, true);
+  assert.equal(queue.runningCount, 0);
+});
+
+test("a cancellable request timeout terminates its Worker without recycling the coordinator", async () => {
+  let rejectRealRun;
+  let cancelCalls = 0;
+  let recycleCalls = 0;
+  const queue = new OffscreenQueue({
+    concurrency: 1,
+    maxQueueLength: 8,
+    onTimeout: () => {
+      recycleCalls += 1;
+    },
+  });
+  const realRun = new Promise((_resolve, reject) => {
+    rejectRealRun = reject;
+  });
+  const timedOut = queue.schedule("tab1", () => realRun, {
+    ticketId: "automatic",
+    requestTimeoutMs: 10,
+    cancelRun: (reason) => {
+      cancelCalls += 1;
+      rejectRealRun(new Error(reason));
+      return true;
+    },
+  });
+
+  await assert.rejects(timedOut, (error) => error instanceof SchedulerError && error.code === "request_timeout");
+  await delay(5);
+  assert.equal(cancelCalls, 1);
+  assert.equal(recycleCalls, 0, "a targeted Worker termination must preserve the coordinator and its queue");
+  assert.equal(queue.runningCount, 0);
+});
+
 test("cancel() on an unknown key is a no-op", () => {
   const queue = new OffscreenQueue({ concurrency: 1, maxQueueLength: 8 });
   assert.deepEqual(queue.cancel("ghost"), { queued: false, running: false });
@@ -409,12 +469,13 @@ test("offscreen control messages are restricted and terminal UI payloads expose 
 
 test("the extension runtime and storage contract use DINOv2 exclusively", () => {
   const offscreenSource = readFileSync(new URL("../runtime/offscreen.js", import.meta.url), "utf8");
+  const inferenceWorkerSource = readFileSync(new URL("../runtime/inference-worker.js", import.meta.url), "utf8");
   const workerSource = readFileSync(new URL("./service_worker.js", import.meta.url), "utf8");
   const webpackSource = readFileSync(new URL("../webpack.config.js", import.meta.url), "utf8");
-  const combined = offscreenSource + workerSource + webpackSource;
+  const combined = offscreenSource + inferenceWorkerSource + workerSource + webpackSource;
 
-  assert.ok(offscreenSource.includes("DinoV2EmbeddingEngine"));
-  assert.ok(offscreenSource.includes("models/dinov2_vits14.onnx"));
+  assert.ok(inferenceWorkerSource.includes("DinoV2EmbeddingEngine"));
+  assert.ok(inferenceWorkerSource.includes("models/dinov2_vits14.onnx"));
   assert.ok(workerSource.includes("dinoV2LogoSimilarity"));
   assert.ok(workerSource.includes("dinov2_embedding"));
   assert.ok(webpackSource.includes('path.join(modelCacheRoot, "dinov2_vits14.onnx")'));

@@ -459,10 +459,17 @@ test("the selector overlay is injected with its session id and answers with it",
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   const selector = await readFile(new URL("../logo-selector/logo-selector.js", import.meta.url), "utf8");
 
-  assert.match(serviceWorker, /args: \[session\.fqdn, session\.sessionId, session\.candidates \?\? \[\]\]/);
-  assert.match(serviceWorker, /window\.__YP_SELECTOR_CONFIG__ = \{ fqdn: fqdnVal, sessionId: sessionIdVal, candidates: candidatesVal \}/);
+  assert.match(serviceWorker, /args: \[session\.fqdn, session\.sessionId, session\.candidates \?\? \[\], session\.notice \?\? null\]/);
+  assert.match(serviceWorker, /window\.__YP_SELECTOR_CONFIG__ = \{\s*fqdn: fqdnVal,\s*sessionId: sessionIdVal,\s*candidates: candidatesVal,\s*notice: noticeVal,\s*\}/);
   assert.match(selector, /const sessionId = config\.sessionId \?\? ""/);
   assert.match(serviceWorker, /cancelLogoSelectorSession\(tabId, message\.sessionId\)/);
+
+  // Issue #14: the overlay's notice is a code, mapped to fixed wording by the
+  // overlay itself, exactly like a failure code -- the background never sends
+  // display text into the page.
+  assert.match(selector, /const NOTICE_MESSAGES = Object\.freeze\(\{/);
+  assert.match(selector, /logo_search_timeout: "The logo detection took too long, please select the logo manually"/);
+  assert.match(selector, /NOTICE_MESSAGES\[config\.notice\] \?\? ""/);
 });
 
 // =============================================================================
@@ -483,9 +490,20 @@ test("an explicit add defers every trusted write to the selector confirmation", 
   // case itself never preprocesses a crop, writes the trusted list, or shows a
   // verdict banner — the selector session takes over from here.
   assert.match(addCase, /proposeTrustedAddCandidates\(result\.screenshot, tabId, job\.jobId\)/);
-  assert.match(addCase, /selectorSessions\.start\(tabId, \{\s*fqdn: parsedOrigin\.fqdn,\s*add: \{\s*origin: parsedOrigin,\s*scores: scoreSnapshot\(result\),\s*\.\.\.\(isMoveToTrusted \? \{ moveFromMuted: true \} : \{\}\),\s*\},\s*candidates,/);
-  assert.match(addCase, /await injectLogoSelector\(tabId\)/);
+  assert.match(addCase, /openTrustedAddSelector\(tabId, job, \{ scores: scoreSnapshot\(result\), candidates \}\)/);
   assert.doesNotMatch(addCase, /preprocessTrustedReference|withTrustedMuted|sendValidatedBanner/);
+
+  // Issue #14 moved session creation and overlay injection into the one
+  // function all three routes into the selector share (automatic completion,
+  // "Select logo manually", the logo-search deadline), so the session shape is
+  // asserted there. A bypassed search contributes no scores.
+  const openStart = serviceWorker.indexOf("async function openTrustedAddSelector");
+  const openEnd = serviceWorker.indexOf("function armLogoSearchDeadline", openStart);
+  assert.ok(openStart >= 0 && openEnd > openStart);
+  const openSelector = serviceWorker.slice(openStart, openEnd);
+  assert.match(openSelector, /selectorSessions\.start\(tabId, \{\s*fqdn: trustedAdd\.origin\.fqdn,\s*add: \{\s*origin: trustedAdd\.origin,\s*\.\.\.\(scores === undefined \? \{\} : \{ scores \}\),/);
+  assert.match(openSelector, /await injectLogoSelector\(tabId\)/);
+  assert.doesNotMatch(openSelector, /preprocessTrustedReference|withTrustedMuted|sendValidatedBanner/);
 
   // The pending-add bridge is gone: the session itself carries the payload.
   assert.doesNotMatch(serviceWorker, /PendingAdd|pending_adds_by_tab|select_logo_for_trusted_add|add_logo_not_found/);
@@ -497,4 +515,134 @@ test("an explicit add defers every trusted write to the selector confirmation", 
   assert.ok(cancelStart >= 0 && cancelEnd > cancelStart);
   const cancel = serviceWorker.slice(cancelStart, cancelEnd);
   assert.match(cancel, /verdict: "unknown"/);
+});
+
+// =============================================================================
+// Issue #14 — the trusted-site flow's controls and its fallback to manual
+// selection. The service worker is bundled with chrome.* dependencies, so its
+// wiring is asserted against the source, the way the rest of this file asserts
+// the selector's; the observable behaviour on the page side is covered in
+// content.test.js.
+// =============================================================================
+
+test("the logo-search deadline is a UX fallback, not another fault limit", async () => {
+  const limits = await readFile(new URL("./inferenceLimits.mjs", import.meta.url), "utf8");
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+
+  // Measured from the click, so it also covers runtime startup and screenshot
+  // preparation -- the 30s placement, not the 20s logo-search-only one.
+  assert.match(limits, /export const TRUSTED_ADD_LOGO_SEARCH_TIMEOUT_MS = 30_000;/);
+  // The fault-containment limits are untouched by it.
+  assert.match(limits, /export const OFFSCREEN_REQUEST_TIMEOUT_MS = 60_000;/);
+  assert.match(limits, /export const JOB_TOTAL_TIMEOUT_MS = 280_000;/);
+
+  const armStart = serviceWorker.indexOf("function armLogoSearchDeadline");
+  const armEnd = serviceWorker.indexOf("async function injectLogoSelector", armStart);
+  assert.ok(armStart >= 0 && armEnd > armStart);
+  const arm = serviceWorker.slice(armStart, armEnd);
+
+  assert.match(arm, /setTimeout\([\s\S]*?TRUSTED_ADD_LOGO_SEARCH_TIMEOUT_MS\)/);
+  assert.match(
+    arm,
+    /if \(job\.selectorOpened \|\| isJobTerminal\(job\) \|\| activeJobs\.get\(tabId\) !== job\) return;/,
+    "a job that already opened its selector, ended, or was replaced is left alone"
+  );
+  assert.match(arm, /cancelJobForUser\(tabId, job, "logo_search_timeout"\)/);
+  assert.match(arm, /openTrustedAddSelector\(tabId, job, \{ notice: "logo_search_timeout" \}\)/);
+  assert.doesNotMatch(arm, /failJob|analysis_failed|recycleOffscreenDocument/, "a slow search is not a failure");
+});
+
+test("every route into the selector excludes the others, and every terminal path clears the deadline", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+
+  // One synchronous claim, taken before the first await, is what keeps the
+  // automatic search, "Select logo manually" and the deadline from opening two
+  // selectors (or writing two sessions) for one job.
+  const openSelector = serviceWorker.slice(
+    serviceWorker.indexOf("async function openTrustedAddSelector"),
+    serviceWorker.indexOf("function armLogoSearchDeadline")
+  );
+  assert.match(openSelector, /if \(job\.selectorOpened\) return false;\s*job\.selectorOpened = true;/);
+  assert.ok(
+    openSelector.indexOf("job.selectorOpened = true") < openSelector.indexOf("await"),
+    "the claim must be taken before anything can interleave"
+  );
+
+  // Timers belong to the job, and every terminal transition goes through
+  // clearJobTimeout -- completion, failure, cancellation, supersession and tab
+  // closure alike.
+  const clearTimeouts = serviceWorker.slice(
+    serviceWorker.indexOf("function clearJobTimeout"),
+    serviceWorker.indexOf("function recordLogoSearchDuration")
+  );
+  assert.match(clearTimeouts, /clearLogoSearchDeadline\(job\)/);
+  assert.match(serviceWorker, /function markJobTerminalIfCurrent[\s\S]*?clearJobTimeout\(job\)/);
+  assert.match(serviceWorker, /function finishJob[\s\S]*?clearJobTimeout\(job\)/);
+});
+
+test("the progress-banner controls end exactly their own job and open no warning UI", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+
+  const cancelCase = serviceWorker.slice(
+    serviceWorker.indexOf('case "cancel_current_analysis"'),
+    serviceWorker.indexOf('case "select_logo_manually"')
+  );
+  const manualCase = serviceWorker.slice(
+    serviceWorker.indexOf('case "select_logo_manually"'),
+    serviceWorker.indexOf('case "add_to_muted"')
+  );
+
+  for (const [name, source] of [["cancel", cancelCase], ["manual selection", manualCase]]) {
+    assert.match(source, /!isTopFrameSender\(sender\)/, `${name} is top-frame only`);
+    assert.match(source, /job\.jobId !== message\.jobId/, `${name} acts on one exact job`);
+    assert.match(source, /cancelJobForUser\(tabId, job, "/, `${name} ends the job it names`);
+    assert.doesNotMatch(source, /scheduleInterruption|analysis_interrupted|analysis_failed/,
+      `${name} is not a page change and not a failure`);
+  }
+
+  // A user cancel is silent: no interruption tab, and no reset that would make
+  // the surviving document start the analysis again by itself.
+  const userCancel = serviceWorker.slice(
+    serviceWorker.indexOf("function cancelJobForUser"),
+    serviceWorker.indexOf("function recordJobFailure")
+  );
+  assert.match(userCancel, /interruptionMode: "silent"/);
+  assert.doesNotMatch(userCancel, /resetContent/);
+  assert.match(userCancel, /recordLogoSearchDuration\(job\)/);
+
+  // A cancelled Settings move gives back the tab it opened, and only that tab:
+  // an ordinary add cancelled in a tab the user was already on keeps it.
+  assert.match(cancelCase, /const wasMoveToTrusted = job\.trustedAdd\?\.moveIntent != null;/);
+  assert.match(cancelCase, /if \(wasMoveToTrusted\) \{\s*await abortTrustedAddIntent\(tabId\)/);
+  // The bypass never writes anything on its own -- it hands over to the
+  // selector, whose confirmation is still the only thing that writes a list.
+  assert.doesNotMatch(manualCase, /withTrustedMuted|applyManualLogoSelection/);
+});
+
+test("a Settings move handed to the selector is never aborted by the cancelled automatic request", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+  const addStart = serviceWorker.indexOf('case "add_to_trusted"');
+  const addEnd = serviceWorker.indexOf('case "get_trusted_add_intent"', addStart);
+  const addCase = serviceWorker.slice(addStart, addEnd);
+
+  assert.match(
+    addCase,
+    /if \(isMoveToTrusted && !job\.selectorOpened\) \{\s*await abortTrustedAddIntent\(tabId\)/,
+    "the original request may clean up a genuine failure, but not a manual/timeout selector handoff"
+  );
+});
+
+test("logo-search durations are recorded for later tuning", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+
+  // Measured from the click for every add-to-trusted job, recorded once, and
+  // carried into the diagnostics record whichever way the search ended.
+  assert.match(serviceWorker, /function recordLogoSearchDuration\(job\) \{\s*if \(job\.kind !== "add_to_trusted" \|\| job\.logoSearchMs !== undefined\) return;\s*job\.logoSearchMs = Date\.now\(\) - job\.startedAt;/);
+  assert.match(serviceWorker, /logoSearchMs: job\.logoSearchMs/, "a completed search reports its duration");
+  assert.match(
+    serviceWorker,
+    /function recordCancelledDiagnostics[\s\S]*?job\.logoSearchMs === undefined \? \{\} : \{ logo_search_ms: job\.logoSearchMs \}/,
+    "an abandoned search reports its duration too"
+  );
+  assert.match(serviceWorker, /logoSearchMs === undefined \? \{\} : \{ logo_search_ms: logoSearchMs \}/);
 });

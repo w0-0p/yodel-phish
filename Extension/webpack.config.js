@@ -114,5 +114,16 @@ module.exports = [
     resolve: { ...shared.resolve, alias: { "onnxruntime-web": dependencyPath("onnxruntime-web/dist/ort.wasm.bundle.min.mjs") } },
     externals: { "@techstark/opencv-js": "cv" },
     plugins: [new CopyRuntimeAssetsPlugin()]
+  },
+  {
+    ...shared,
+    name: "inference-worker",
+    entry: { inference_worker: "./runtime/inference-worker.js" },
+    target: "webworker",
+    // The runtime sets env.wasm.wasmPaths to the packaged /ort-wasm directory;
+    // use the external-WASM entrypoint so Webpack does not emit a second 12 MB
+    // copy beside the Worker bundle.
+    resolve: { ...shared.resolve, alias: { "onnxruntime-web": dependencyPath("onnxruntime-web/dist/ort.wasm.min.mjs") } },
+    externals: { "@techstark/opencv-js": "cv" }
   }
 ];

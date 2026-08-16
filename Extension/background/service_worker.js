@@ -16,6 +16,7 @@ import {
   OFFSCREEN_PING_ATTEMPT_TIMEOUT_MS,
   OFFSCREEN_ROUND_TRIP_TIMEOUT_MS,
   OFFSCREEN_STARTUP_TIMEOUT_MS,
+  TRUSTED_ADD_LOGO_SEARCH_TIMEOUT_MS,
 } from "./inferenceLimits.mjs";
 import {
   convertUiCoverBoxesToImageSpace,
@@ -706,15 +707,9 @@ chrome.tabs.onRemoved.addListener((removedTabId) => {
   // No user-facing terminal message is needed for tab closure (there is no
   // longer a tab to show one in) -- just release whatever this tab held in
   // the shared offscreen queue. A still-queued ticket is removed for free;
-  // a still-running one gets its caller rejected, and since nobody benefits
-  // from a closed tab's abandoned analysis continuing to occupy the one
-  // shared concurrency slot, proactively recycle the runtime to reclaim it
-  // for other tabs' pending work.
+  // a still-running one terminates the dedicated inference Worker and releases
+  // the real slot without destroying the coordinator or other tabs' queue.
   cancelOffscreenWork(removedTabId, undefined, "tab_closed")
-    .then((status) => {
-      if (status.running) return recycleOffscreenDocument("tab_closed");
-      return undefined;
-    })
     .catch((error) => {
       console.error("[YodelPhish] Failed to cancel offscreen work after tab closure:", error);
     });
@@ -1872,7 +1867,14 @@ async function recordAnalysisError(input) {
   }
 }
 
-async function buildAnalysisRecord({ origin, result, displayedVerdict, context = "detection", preprocessing = null }) {
+async function buildAnalysisRecord({
+  origin,
+  result,
+  displayedVerdict,
+  context = "detection",
+  preprocessing = null,
+  logoSearchMs = undefined,
+}) {
   const pipeline = result.pipeline_result;
   const { trusted_list } = await getStorage();
   const matchedReference = findByVariant(
@@ -1907,6 +1909,11 @@ async function buildAnalysisRecord({ origin, result, displayedVerdict, context =
     // or an unexpected compared-logo crop without forensics on the timings.
     query_stats: pipeline?.queryStats ?? null,
     preprocessing,
+    // Issue #14: how long the automatic logo search behind "Add to trusted"
+    // took, measured from the click. Present only on that flow's records, and
+    // the sample TRUSTED_ADD_LOGO_SEARCH_TIMEOUT_MS is meant to be retuned
+    // against.
+    ...(logoSearchMs === undefined ? {} : { logo_search_ms: logoSearchMs }),
     compared_logo_image: pipeline?.winnerLogoImage ?? null,
   };
 }
@@ -2112,9 +2119,9 @@ function computeVerdict(result, origin) {
 // path (hard errors, any timeout) that is deliberately distinct from
 // cancelJob (page-change interruption): a failure needs a plain retryable
 // banner in place, not the re-analyse/continue/leave interstitial. Physical
-// offscreen cancellation is still best effort for in-flight work — see
-// offscreenQueue.mjs and recycleOffscreenDocument for how a hung or superseded
-// request is bounded without letting it commit a stale result.
+// in-flight inference is isolated in a dedicated Worker. Cancelling its exact
+// ticket terminates that Worker, while job/document guards still prevent any
+// stale result from reaching UI or storage.
 // =============================================================================
 
 const REASON_MESSAGES = {
@@ -2183,6 +2190,18 @@ function startJob(tabId, jobId, url, kind = "detection", documentId = null) {
     failureRecorded: false,
     failureCode: null,
     totalTimeoutHandle: undefined,
+    // Issue #14 — the trusted-site flow's UX fallback to manual logo selection.
+    // startedAt is when the user clicked, which is where the logo-search
+    // deadline is measured from and what logoSearchMs reports against.
+    // selectorOpened is the exclusion between the three routes into the
+    // selector (automatic completion, "Select logo manually", the deadline):
+    // it is set synchronously by whichever gets there first, so one job can
+    // never mount two selectors or write two sessions.
+    startedAt: Date.now(),
+    logoSearchTimeoutHandle: undefined,
+    logoSearchMs: undefined,
+    selectorOpened: false,
+    trustedAdd: null,
   };
   activeJobs.set(tabId, job);
   job.totalTimeoutHandle = setTimeout(() => {
@@ -2197,11 +2216,31 @@ function isJobStale(tabId, job) {
   return false;
 }
 
+// Every timer a job owns dies here, and every terminal transition passes
+// through here -- completion, failure, cancellation (including the silent
+// navigation one), supersession and tab closure -- so no job can leave a timer
+// behind to fire against a page that has moved on (issue #14).
 function clearJobTimeout(job) {
   if (job.totalTimeoutHandle !== undefined) {
     clearTimeout(job.totalTimeoutHandle);
     job.totalTimeoutHandle = undefined;
   }
+  clearLogoSearchDeadline(job);
+}
+
+function clearLogoSearchDeadline(job) {
+  if (job.logoSearchTimeoutHandle !== undefined) {
+    clearTimeout(job.logoSearchTimeoutHandle);
+    job.logoSearchTimeoutHandle = undefined;
+  }
+}
+
+// How long the automatic logo search ran before it stopped, whichever way it
+// stopped. Recorded once per job and carried into that job's diagnostics
+// record, so the deadline above can later be tuned against real runtimes.
+function recordLogoSearchDuration(job) {
+  if (job.kind !== "add_to_trusted" || job.logoSearchMs !== undefined) return;
+  job.logoSearchMs = Date.now() - job.startedAt;
 }
 
 function markJobTerminalIfCurrent(tabId, job, terminalState, reasonHint) {
@@ -2259,6 +2298,17 @@ function cancelJobForNavigation(tabId, job, reasonHint, reanalyseUrl) {
   });
 }
 
+// Issue #14: the user ended this job, or its logo search ran past the point
+// where waiting still beat picking the logo by hand. Terminal and silent in
+// both cases -- there is no page change to warn about, so no interruption tab
+// and no navigation warning -- and resetContent stays off because the content
+// script tore its own UI down before asking (a user cancel) or is about to
+// have it replaced by the selector (the logo-search fallback).
+function cancelJobForUser(tabId, job, reasonHint) {
+  recordLogoSearchDuration(job);
+  return cancelJob(tabId, job, reasonHint, { interruptionMode: "silent" });
+}
+
 function recordJobFailure(job, error) {
   if (job.failureRecorded) return;
   job.failureRecorded = true;
@@ -2280,16 +2330,9 @@ function failJob(tabId, job, errorOrCode, internalError = errorOrCode) {
     code,
   }).catch(() => {});
   recordJobFailure(job, internalError);
-  cancelOffscreenWork(tabId, job.jobId, code)
-    .then((status) => {
-      if (status.running && code.includes("timeout")) {
-        return recycleOffscreenDocument(code);
-      }
-      return undefined;
-    })
-    .catch((error) => {
-      console.warn("[YodelPhish] Could not stop failed offscreen work:", error);
-    });
+  cancelOffscreenWork(tabId, job.jobId, code).catch((error) => {
+    console.warn("[YodelPhish] Could not stop failed offscreen work:", error);
+  });
   return true;
 }
 
@@ -2367,6 +2410,9 @@ async function recordCancelledDiagnostics(job) {
       status: "cancelled",
       context: job.kind,
       reason: job.reasonHint ?? "unclassified",
+      // A logo search that was abandoned is exactly the sample the deadline
+      // needs to be tuned against, so it is recorded here too (issue #14).
+      ...(job.logoSearchMs === undefined ? {} : { logo_search_ms: job.logoSearchMs }),
     });
   } catch (error) {
     console.warn("[YodelPhish] Could not store cancellation diagnostics:", error);
@@ -2810,6 +2856,11 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       const origin = { valid: true, ...parsedOrigin };
       const job = startJob(tabId, message.jobId, currentUrl, "add_to_trusted", sender?.documentId);
       job.origin = origin;
+      // What the two routes that bypass the automatic search ("Select logo
+      // manually" and the logo-search deadline) need to open the same selector
+      // this handler would have opened (issue #14).
+      job.trustedAdd = { origin: parsedOrigin, moveIntent: isMoveToTrusted ? moveIntent : null };
+      armLogoSearchDeadline(tabId, job);
 
       try {
         const result = await runJobDetection(tabId, job);
@@ -2829,29 +2880,16 @@ async function handleMessage(message, tabId, senderUrl, sender) {
           await finalizeCancelledJob(tabId, job);
           return;
         }
+        // The search is over: stop its deadline before anything is awaited, so
+        // the fallback can never fire against a selector this path is already
+        // opening.
+        clearLogoSearchDeadline(job);
+        recordLogoSearchDuration(job);
 
-        // The session carries only what the confirmed selection will rebuild
-        // the entry from — the analysis result itself is far too large for
-        // session storage.
-        await selectorSessions.start(tabId, {
-          fqdn: parsedOrigin.fqdn,
-          add: {
-            origin: parsedOrigin,
-            scores: scoreSnapshot(result),
-            ...(isMoveToTrusted ? { moveFromMuted: true } : {}),
-          },
-          candidates,
-          // A move-to-trusted (issue #8) confirms in a tab we opened, so it
-          // closes on completion and hands focus back to Settings; an ordinary
-          // add confirms in the page the user is already on and keeps it.
-          closeTabOnComplete: isMoveToTrusted,
-          ...(isMoveToTrusted && moveIntent.settingsTabId !== undefined ? { settingsTabId: moveIntent.settingsTabId } : {}),
-        });
-        // From here the durable selector session owns reload/cancel handling.
-        // Consuming the bootstrap intent prevents a failed tab close after save
-        // from ever starting a second add flow in the same tab.
-        if (isMoveToTrusted) await trustedAddIntents.discardTab(tabId);
-        await injectLogoSelector(tabId);
+        if (!(await openTrustedAddSelector(tabId, job, { scores: scoreSnapshot(result), candidates }))) {
+          await finalizeCancelledJob(tabId, job);
+          return;
+        }
         if (!finishJob(tabId, job)) {
           await finalizeCancelledJob(tabId, job);
           return;
@@ -2862,11 +2900,17 @@ async function handleMessage(message, tabId, senderUrl, sender) {
           displayedVerdict: "logo_validation_pending",
           context: "add_to_trusted",
           preprocessing: { candidates },
+          logoSearchMs: job.logoSearchMs,
         });
         return;
       } catch (error) {
         const settled = await settleJobException(tabId, job, error);
-        if (isMoveToTrusted) {
+        // Manual selection and the timeout deliberately cancel the automatic
+        // job after claiming a selector session. Their cancellation rejection
+        // can race this catch before openTrustedAddSelector has consumed the
+        // Settings move intent; never mistake that successful handoff for an
+        // analysis failure and close its tab underneath the selector.
+        if (isMoveToTrusted && !job.selectorOpened) {
           await abortTrustedAddIntent(tabId).catch((cleanupError) => {
             console.warn("[YodelPhish] Failed to abort trusted-add intent after analysis failure:", cleanupError);
           });
@@ -2888,6 +2932,63 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       if (intent === null) return { ok: true, active: false };
       const origin = await parseListOrigin(senderUrl);
       return { ok: true, active: origin !== null && origin.fqdn === intent.fqdn };
+    }
+
+    // =========================================================================
+    // PROGRESS-BANNER CONTROLS (issue #14)
+    //
+    // Both are scoped to one exact job id, so a control clicked just as the
+    // flow moved on -- a superseding job, a navigation cancel, a result that
+    // landed first -- is a no-op rather than an action against whatever came
+    // next. Both are top-frame only, like every other message that can end a
+    // job (issue #88).
+    // =========================================================================
+
+    // "Cancel" on either progress banner, and the standard analysis the
+    // progress banner's "Add to trusted" replaces. The content script has
+    // already released its own UI and stopped accepting this job's messages;
+    // what is left is to make the job terminal so its in-flight work can no
+    // longer commit anything, and to give back a tab a Settings move opened
+    // for a confirmation that is not going to happen.
+    case "cancel_current_analysis": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: false };
+      const job = activeJobs.get(tabId);
+      if (job === undefined || job.jobId !== message.jobId || isJobTerminal(job)) {
+        return { ok: false, reason: "no_active_job" };
+      }
+      // Only a cancelled *move* gives its tab back: that tab exists solely for
+      // a confirmation that is now not going to happen. A tab the user was
+      // already on keeps its own life, exactly as it does when the same flow
+      // fails rather than being cancelled.
+      const wasMoveToTrusted = job.trustedAdd?.moveIntent != null;
+      cancelJobForUser(tabId, job, "user_cancelled");
+      await finalizeCancelledJob(tabId, job);
+      if (wasMoveToTrusted) {
+        await abortTrustedAddIntent(tabId).catch((error) => {
+          console.warn("[YodelPhish] Failed to abort trusted-add intent after cancellation:", error);
+        });
+      }
+      return { ok: true };
+    }
+
+    // "Select logo manually": stop waiting for the automatic search and mount
+    // the selector now. The job is cancelled first, so a search that is still
+    // physically running cannot come back and overwrite the session the user
+    // is about to draw into.
+    case "select_logo_manually": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: false };
+      const job = activeJobs.get(tabId);
+      if (job === undefined || job.jobId !== message.jobId || job.kind !== "add_to_trusted") {
+        return { ok: false, reason: "no_active_job" };
+      }
+      // The automatic path won the race to the selector; it is already open (or
+      // opening) with the same session, and there is nothing else to do.
+      if (job.selectorOpened) return { ok: true };
+      if (isJobTerminal(job)) return { ok: false, reason: "no_active_job" };
+      cancelJobForUser(tabId, job, "manual_logo_selection");
+      const opened = await openTrustedAddSelector(tabId, job, {});
+      await finalizeCancelledJob(tabId, job);
+      return { ok: opened };
     }
 
     case "add_to_muted": {
@@ -3525,7 +3626,12 @@ async function handleMessage(message, tabId, senderUrl, sender) {
             : {
               origin: session.add.origin,
               variantId: crypto.randomUUID(),
-              scores: [{ datetime: timestamp, ...session.add.scores }],
+              // A session whose automatic search was bypassed or timed out
+              // (issue #14) never produced a score snapshot; the entry records
+              // no scores at all rather than a dated row of blanks.
+              scores: session.add.scores === undefined || session.add.scores === null
+                ? []
+                : [{ datetime: timestamp, ...session.add.scores }],
               lastVisited: todayString(),
               ...(session.add.moveFromMuted === true ? { moveFromMuted: true } : {}),
             };
@@ -3877,6 +3983,81 @@ async function checkSelectorSession(tabId, sessionId, attemptId = undefined) {
   return { status, session, tab };
 }
 
+// =============================================================================
+// TRUSTED-ADD SELECTOR HANDOVER — issue #14
+//
+// Three routes end the automatic logo search: it finishes, the user presses
+// "Select logo manually", or its deadline expires. All three continue into the
+// same manual selector, so they all go through this one function, and the
+// job's `selectorOpened` flag (set synchronously before the first await) is
+// what keeps them mutually exclusive: whichever arrives first opens the
+// selector, the others are told it is already open.
+//
+// A bypassed search has no scores and no candidate boxes, so the selector
+// opens in free-draw with the notice explaining why it did.
+// =============================================================================
+
+async function openTrustedAddSelector(tabId, job, { scores, candidates = [], notice } = {}) {
+  const trustedAdd = job.trustedAdd;
+  if (trustedAdd === null || trustedAdd === undefined) return false;
+  if (job.selectorOpened) return false;
+  job.selectorOpened = true;
+
+  const moveIntent = trustedAdd.moveIntent;
+  // The session carries only what the confirmed selection will rebuild the
+  // entry from — the analysis result itself is far too large for session
+  // storage.
+  await selectorSessions.start(tabId, {
+    fqdn: trustedAdd.origin.fqdn,
+    add: {
+      origin: trustedAdd.origin,
+      ...(scores === undefined ? {} : { scores }),
+      ...(moveIntent !== null ? { moveFromMuted: true } : {}),
+    },
+    candidates,
+    ...(notice === undefined ? {} : { notice }),
+    // A move-to-trusted (issue #8) confirms in a tab we opened, so it closes on
+    // completion and hands focus back to Settings; an ordinary add confirms in
+    // the page the user is already on and keeps it.
+    closeTabOnComplete: moveIntent !== null,
+    ...(moveIntent?.settingsTabId !== undefined ? { settingsTabId: moveIntent.settingsTabId } : {}),
+  });
+  // From here the durable selector session owns reload/cancel handling.
+  // Consuming the bootstrap intent prevents a failed tab close after save from
+  // ever starting a second add flow in the same tab.
+  if (moveIntent !== null) await trustedAddIntents.discardTab(tabId);
+  await injectLogoSelector(tabId);
+  return true;
+}
+
+// The UX fallback itself: past TRUSTED_ADD_LOGO_SEARCH_TIMEOUT_MS, waiting for
+// the automatic search no longer beats drawing the box by hand, so the flow
+// stops waiting and hands over to the selector with an explanation. Nothing is
+// reported as failed -- the job is cancelled exactly the way the user's own
+// "Select logo manually" cancels it, and the pipeline's own longer timeouts
+// stay in place for work that is genuinely broken rather than merely slow.
+function armLogoSearchDeadline(tabId, job) {
+  clearLogoSearchDeadline(job);
+  job.logoSearchTimeoutHandle = setTimeout(() => {
+    job.logoSearchTimeoutHandle = undefined;
+    if (job.selectorOpened || isJobTerminal(job) || activeJobs.get(tabId) !== job) return;
+    cancelJobForUser(tabId, job, "logo_search_timeout");
+    void (async () => {
+      try {
+        await openTrustedAddSelector(tabId, job, { notice: "logo_search_timeout" });
+      } finally {
+        // The cancellation is recorded even when the handover itself fails --
+        // that is the sample the deadline is tuned against. A failed injection
+        // has already put the user back on the unknown banner by then (see
+        // injectLogoSelector).
+        await finalizeCancelledJob(tabId, job);
+      }
+    })().catch((error) => {
+      console.error("[YodelPhish] Failed to open the logo selector after the logo-search deadline:", error);
+    });
+  }, TRUSTED_ADD_LOGO_SEARCH_TIMEOUT_MS);
+}
+
 async function injectLogoSelector(tabId) {
   const session = await selectorSessions.get(tabId);
   if (session === null) return;
@@ -3891,10 +4072,18 @@ async function injectLogoSelector(tabId) {
 
     await chrome.scripting.executeScript({
       target: { tabId },
-      func: (fqdnVal, sessionIdVal, candidatesVal) => {
-        window.__YP_SELECTOR_CONFIG__ = { fqdn: fqdnVal, sessionId: sessionIdVal, candidates: candidatesVal };
+      func: (fqdnVal, sessionIdVal, candidatesVal, noticeVal) => {
+        window.__YP_SELECTOR_CONFIG__ = {
+          fqdn: fqdnVal,
+          sessionId: sessionIdVal,
+          candidates: candidatesVal,
+          notice: noticeVal,
+        };
       },
-      args: [session.fqdn, session.sessionId, session.candidates ?? []],
+      // `notice` is a code, never display text (issue #14): the overlay maps it
+      // to its own fixed wording, exactly as it does for failure codes, so no
+      // background string can ever be rendered into the page.
+      args: [session.fqdn, session.sessionId, session.candidates ?? [], session.notice ?? null],
     });
 
     await chrome.scripting.executeScript({

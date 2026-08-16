@@ -420,6 +420,7 @@ function buildIncompleteBody(record) {
     ["Extension version", record.extension_version],
     ["Failure code", record.failure_code],
     ["Reason", record.reason],
+    ["Logo search", logoSearchDuration(record.logo_search_ms)],
   ]);
   appendSection(body, "Pipeline error", record.error);
   return body;
@@ -447,6 +448,7 @@ function buildCompletedBody(record) {
       ["Matched variant", record.matched_variant_id],
     ] : []),
     ["Extension version", record.extension_version],
+    ["Logo search", logoSearchDuration(record.logo_search_ms)],
     ["Protocol", record.origin?.protocol],
     ["Origin mismatch", yesNo(record.origin?.origin_mismatch)],
     ["Trusted page", yesNo(record.origin?.in_trusted_list)],
@@ -558,6 +560,14 @@ function yesNo(value) {
 
 function orDash(value) {
   return value === undefined || value === null || value === "" ? "—" : String(value);
+}
+
+// Issue #14: how long the automatic logo search behind "Add to trusted" ran
+// before it finished, was bypassed, or hit its fallback deadline. Only that
+// flow's records carry it, so every other card drops the row.
+function logoSearchDuration(milliseconds) {
+  if (typeof milliseconds !== "number" || !Number.isFinite(milliseconds)) return undefined;
+  return `${(milliseconds / 1000).toFixed(1)} s`;
 }
 
 function humanize(value) {

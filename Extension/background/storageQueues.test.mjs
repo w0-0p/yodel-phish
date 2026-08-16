@@ -1399,13 +1399,27 @@ test("moving a muted site to trusted launches the interactive confirmation, not 
   );
   assert.match(addCase, /trustedAddIntents\.get\(tabId\)/);
   assert.match(addCase, /moveIntent !== null && moveIntent\.fqdn === parsedOrigin\.fqdn/);
-  assert.match(addCase, /closeTabOnComplete: isMoveToTrusted/);
-  assert.match(addCase, /settingsTabId: moveIntent\.settingsTabId/);
-  assert.match(addCase, /moveFromMuted: true/, "the atomic commit knows this is a real move");
+  assert.match(
+    addCase,
+    /job\.trustedAdd = \{ origin: parsedOrigin, moveIntent: isMoveToTrusted \? moveIntent : null \}/,
+    "the move survives into the routes that bypass the automatic search (issue #14)"
+  );
   assert.ok(
     addCase.indexOf("abortTrustedAddIntent(tabId)") < addCase.indexOf("if (!settled) throw error"),
     "capture and detection failures must abort before they are rethrown"
   );
+
+  // The move's own session fields are written where every route into the
+  // selector now goes through (issue #14), so they hold for a search that
+  // finished, one the user bypassed, and one that ran past its deadline.
+  const openSelector = serviceWorker.slice(
+    serviceWorker.indexOf("async function openTrustedAddSelector"),
+    serviceWorker.indexOf("function armLogoSearchDeadline")
+  );
+  assert.match(openSelector, /closeTabOnComplete: moveIntent !== null/);
+  assert.match(openSelector, /settingsTabId: moveIntent\.settingsTabId/);
+  assert.match(openSelector, /moveFromMuted: true/, "the atomic commit knows this is a real move");
+  assert.match(openSelector, /trustedAddIntents\.discardTab\(tabId\)/, "the bootstrap intent is consumed once");
 
   const navigationErrorHandler = serviceWorker.slice(
     serviceWorker.indexOf("chrome.webNavigation.onErrorOccurred.addListener"),

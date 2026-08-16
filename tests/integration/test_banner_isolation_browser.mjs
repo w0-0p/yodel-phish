@@ -104,7 +104,7 @@ async function snapshotBannerOnPage(context, html) {
   await page.addScriptTag({ content: loginDetectorSource });
   await page.addScriptTag({ content: contentSource });
 
-  const snapshot = await page.evaluate(() => {
+  const snapshot = await page.evaluate(async () => {
     const BUTTON_PROPS = [
       "appearance", "background-color", "color",
       "border-top-style", "border-top-width", "border-top-color", "border-radius",
@@ -120,6 +120,18 @@ async function snapshotBannerOnPage(context, html) {
 
     const captureState = (verdict, data, buttonSelectors) => {
       window.__ypDispatch({ type: "show_banner", verdict, data }, {}, () => {});
+      return readState(buttonSelectors);
+    };
+
+    // A progress banner is deliberately delayed (PROGRESS_DELAY_MS), so its
+    // controls (issue #14) can only be measured once that timer has run.
+    const captureProgressState = async (verdict, buttonSelectors) => {
+      window.__ypDispatch({ type: "show_banner", verdict, data: {} }, {}, () => {});
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return readState(buttonSelectors);
+    };
+
+    const readState = (buttonSelectors) => {
       const mounted = window.__ypShadows.at(-1);
       const banner = mounted.shadow.querySelector("#yp-banner");
       const buttons = {};
@@ -149,6 +161,12 @@ async function snapshotBannerOnPage(context, html) {
       analysis_failed: captureState("analysis_failed", { code: "job_timeout" }, [
         ".yp-btn-retry", ".yp-btn-close-x",
       ]),
+      // Issue #14: the controls that end an analysis, or take it straight to
+      // manual logo selection, are the ones a user reaches for while the page
+      // is blocked — so page CSS must not be able to hide or restyle them
+      // either.
+      analysing: await captureProgressState("analysing", [".yp-btn-add-trusted", ".yp-btn-cancel"]),
+      adding_to_trusted: await captureProgressState("adding_to_trusted", [".yp-btn-manual-logo", ".yp-btn-cancel"]),
     };
 
     const mounted = window.__ypShadows.at(-1);
@@ -252,6 +270,34 @@ try {
 
     assert.equal(analysis_failed.buttons[".yp-btn-retry"]["background-color"], "rgb(46, 125, 50)", `${label}: Retry is styled`);
     assert.equal(analysis_failed.banner["background-color"], "rgb(230, 81, 0)", `${label}: failure banner is orange`);
+
+    // Issue #14: a progress banner is the one state where the page underneath
+    // is deliberately unusable, so its way out has to survive the page's CSS.
+    const { analysing, adding_to_trusted } = snapshot.states;
+    assert.equal(analysing.banner["background-color"], "rgb(143, 188, 242)", `${label}: progress banner is blue`);
+    const progressControls = {
+      "add to trusted": analysing.buttons[".yp-btn-add-trusted"],
+      "cancel": analysing.buttons[".yp-btn-cancel"],
+      "select logo manually": adding_to_trusted.buttons[".yp-btn-manual-logo"],
+    };
+    for (const [name, button] of Object.entries(progressControls)) {
+      assert.equal(button.display, "block", `${label}: ${name} cannot be hidden by the page`);
+      assert.equal(button.visibility, "visible", `${label}: ${name} stays visible`);
+      assert.equal(button.cursor, "pointer", `${label}: ${name} stays clickable-looking under a busy page`);
+      assert.equal(button.appearance, "none", `${label}: ${name} resets native appearance`);
+      assert.equal(button["text-transform"], "none", `${label}: ${name} ignores page text-transform`);
+      assert.equal(button["box-shadow"], "none", `${label}: ${name} ignores page box-shadow`);
+      assert.match(button["font-family"], /system-ui/, `${label}: ${name} keeps the banner font`);
+    }
+    assert.equal(
+      progressControls["add to trusted"]["background-color"],
+      "rgb(46, 125, 50)",
+      `${label}: Add to trusted is the same green action it is on a verdict banner`
+    );
+    for (const name of ["cancel", "select logo manually"]) {
+      assert.equal(progressControls[name]["background-color"], "rgba(0, 0, 0, 0)", `${label}: ${name} is outlined`);
+      assert.equal(progressControls[name]["border-top-style"], "solid", `${label}: ${name} draws its own border`);
+    }
 
     // The reverse boundary: no extension stylesheet lands in the document, and
     // page elements wearing the banner's class names take nothing from it.

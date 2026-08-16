@@ -107,11 +107,13 @@ function createFakeElement(tagName) {
     querySelector(selector) {
       return selector === ".yp-message" ? messageNode : this._buttons.get(selector) ?? null;
     },
+    // Several controls share the .yp-btn class, so a class selector has to
+    // report all of them -- that is how the banner disables its whole action
+    // row while one of them is working (issue #14).
     querySelectorAll(selector) {
       const matches = selector
         .split(",")
-        .map((part) => this._buttons.get(part.trim()))
-        .filter(Boolean);
+        .flatMap((part) => this._buttonGroups.get(part.trim()) ?? []);
       return [...new Set(matches)];
     },
     addEventListener() {},
@@ -138,10 +140,13 @@ function createFakeElement(tagName) {
       this._renders += 1;
       this._html = value;
       this._buttons = new Map();
+      this._buttonGroups = new Map();
       for (const match of value.matchAll(/<button class="([^"]+)"/g)) {
         const button = createFakeButton();
         for (const className of match[1].split(/\s+/)) {
-          this._buttons.set(`.${className}`, button);
+          const selector = `.${className}`;
+          this._buttons.set(selector, button);
+          this._buttonGroups.set(selector, [...(this._buttonGroups.get(selector) ?? []), button]);
         }
       }
     },
@@ -661,7 +666,7 @@ test("the content deadline reports cancellation and reaches a terminal failure l
 });
 
 
-test("the OpenCV loader stays idle for clipboard-only use and reports a bounded startup failure after ping", () => {
+test("the inference coordinator stays idle for clipboard-only use and loads only after ping", () => {
   const loaderPath = require.resolve("../runtime/loader.js");
   const originalNow = Date.now;
   const originalSetTimeout = global.setTimeout;
@@ -705,21 +710,16 @@ test("the OpenCV loader stays idle for clipboard-only use and reports a bounded 
 
     delete require.cache[loaderPath];
     require(loaderPath);
-    assert.deepEqual(appendedScripts, [], "clipboard-only startup must not load OpenCV");
-    assert.deepEqual(timers, [], "clipboard-only startup must not begin polling");
+    assert.deepEqual(appendedScripts, [], "clipboard-only startup must not load the inference coordinator");
+    assert.deepEqual(timers, [], "clipboard-only startup must not begin runtime polling");
 
     listeners[0](
       { target: "yodel-offscreen", type: "ping" },
       { id: "extension-id", url: "dist/service_worker.js" }
     );
-    assert.deepEqual(appendedScripts, ["opencv/opencv.js"]);
-    while (sent.length === 0 && timers.length > 0) {
-      now += 5_000;
-      timers.shift()();
-    }
-
-    assert.deepEqual(sent, [{ type: "offscreen_runtime_failed", reason: "opencv_timeout" }]);
-    assert.ok(now <= 35_000, "startup failure must be reported near the configured 30s deadline");
+    assert.deepEqual(appendedScripts, ["dist/offscreen.js"]);
+    assert.deepEqual(timers, [], "OpenCV readiness is now bounded inside the cancellable Worker");
+    assert.deepEqual(sent, []);
   } finally {
     Date.now = originalNow;
     global.setTimeout = originalSetTimeout;
@@ -1634,4 +1634,190 @@ test("an unknown verdict with no hostname still reads as a complete instruction"
   assert.match(page.bannerMessage, /Only enter your credentials if you know and trust this website\.$/);
   assert.doesNotMatch(page.bannerMessage, /undefined/);
   assert.equal(page.createdWithTag("strong").length, 0, "a stand-in names no site, so it is not emphasized");
+});
+
+// =============================================================================
+// Issue #14 — the progress banners' controls. Waiting is never the only option:
+// an analysis in flight can be ended or turned into the trusted-site flow, and
+// the trusted-site flow can be ended or taken straight to manual selection.
+// Every one of them must leave the page in a state the user can act in, and
+// none of them may leave the finished job able to talk back.
+// =============================================================================
+
+// Paints the progress banner a job has been holding back for its screenshot.
+function showProgressBanner(page, context, jobId) {
+  page.dispatch({ type: "capture_complete", jobId });
+  context.mock.timers.tick(300);
+}
+
+test("the analysis progress banner offers both add-to-trusted and cancel", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  showProgressBanner(page, context, jobId);
+
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.match(page.bannerHtml, /yp-btn-add-trusted">Add to trusted</);
+  assert.match(page.bannerHtml, /yp-btn-cancel">Cancel</);
+});
+
+test("cancelling an analysis drops the job, the shield and the banner", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+  assert.equal(page.busyOverlayPresent, true);
+  assert.equal(page.submissionBlocked, true);
+
+  page.bannerButton(".yp-btn-cancel").click();
+
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+  assert.equal(page.bannerRemoved, true, "no banner is left behind");
+  assert.equal(page.busyOverlayPresent, false, "the busy shield is gone");
+  assert.equal(page.submissionBlocked, false, "the page is interactive again");
+  assert.equal(page.submitForm(), false);
+  assert.equal(page.lastMessageOfType("set_icon_state")?.state, "active");
+});
+
+test("a cancelled job can no longer paint a verdict or a failure", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+
+  page.bannerButton(".yp-btn-cancel").click();
+
+  const late = page.dispatch({ type: "show_banner", jobId, verdict: "suspicious", data: {} });
+  assert.deepEqual(late.response, { accepted: false, reason: "stale_job" });
+  page.dispatch({ type: "analysis_failed", jobId, code: "job_timeout" });
+  page.dispatch({ type: "capture_complete", jobId });
+  context.mock.timers.tick(5_000);
+  assert.equal(page.bannerRemoved, true, "nothing the cancelled job produces may come back");
+});
+
+test("repeated cancel clicks cancel exactly one job", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+  const cancel = page.bannerButton(".yp-btn-cancel");
+
+  cancel.click();
+  cancel.click();
+  cancel.click();
+
+  const cancels = page.sentMessages.filter((message) => message.type === "cancel_current_analysis");
+  assert.deepEqual(cancels.map((message) => message.jobId), [jobId]);
+});
+
+test("add-to-trusted from the progress banner cancels the analysis it interrupts", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+
+  const addButton = page.bannerButton(".yp-btn-add-trusted");
+  addButton.click();
+  addButton.click();
+
+  assert.equal(page.lastMessageOfType("cancel_current_analysis")?.jobId, jobId);
+  const add = page.lastMessageOfType("add_to_trusted");
+  assert.ok(add, "the trusted-site flow starts");
+  assert.notEqual(add.jobId, jobId, "it is a new job, never the cancelled one");
+  const order = page.sentMessages.map((message) => message.type);
+  assert.ok(
+    order.indexOf("cancel_current_analysis") < order.indexOf("add_to_trusted"),
+    "the standard analysis is cancelled before the trusted-site flow starts"
+  );
+  const adds = page.sentMessages.filter((message) => message.type === "add_to_trusted");
+  assert.equal(adds.length, 1, "a repeated click during the transition still starts one flow");
+  assert.equal(addButton.disabled, true, "the old progress controls stay inert until their replacement renders");
+});
+
+test("the trusted-site progress banner offers manual logo selection and cancel", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaTrustedAdd();
+
+  showProgressBanner(page, context, jobId);
+
+  assert.equal(page.bannerVerdict, "adding_to_trusted");
+  assert.match(page.bannerHtml, /yp-btn-manual-logo">Select logo manually</);
+  assert.match(page.bannerHtml, /yp-btn-cancel">Cancel</);
+});
+
+test("select logo manually asks the background to bypass the automatic search", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaTrustedAdd();
+  showProgressBanner(page, context, jobId);
+  page.setSendMessageBehavior("select_logo_manually", () => Promise.resolve({ ok: true }));
+
+  const manual = page.bannerButton(".yp-btn-manual-logo");
+  manual.click();
+  manual.click();
+
+  const requests = page.sentMessages.filter((message) => message.type === "select_logo_manually");
+  assert.deepEqual(requests, [{ type: "select_logo_manually", jobId }], "one request, however often it is clicked");
+  assert.equal(manual.disabled, true, "the control is inert while its request runs");
+});
+
+test("a rejected manual-selection request gives the controls back", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaTrustedAdd();
+  showProgressBanner(page, context, jobId);
+  page.setSendMessageBehavior("select_logo_manually", () => Promise.reject(new Error("no service worker")));
+
+  const manual = page.bannerButton(".yp-btn-manual-logo");
+  manual.click();
+  context.mock.timers.reset();
+  await nextTick();
+
+  assert.equal(manual.disabled, false, "the user can try again, or cancel");
+});
+
+test("cancelling the trusted-site flow returns to the verdict it started from", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const detectionJobId = page.startJobViaManualTrigger();
+  page.dispatch({ type: "show_banner", jobId: detectionJobId, verdict: "unknown", data: { fqdn: "shop.example" } });
+  page.bannerButton(".yp-btn-add").click();
+  const addJobId = page.lastMessageOfType("add_to_trusted").jobId;
+  showProgressBanner(page, context, addJobId);
+  assert.equal(page.bannerVerdict, "adding_to_trusted");
+
+  page.bannerButton(".yp-btn-cancel").click();
+
+  assert.equal(page.lastMessageOfType("cancel_current_analysis")?.jobId, addJobId);
+  assert.equal(page.bannerVerdict, "unknown", "the banner the user acted on comes back");
+  assert.match(page.bannerMessage, /shop\.example/);
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, false);
+  assert.equal(
+    page.sentMessages.some((message) => message.type === "add_to_muted" || message.type === "logo_selection_confirmed"),
+    false,
+    "cancelling writes no list"
+  );
+});
+
+test("cancelling a trusted-site flow with nothing behind it leaves no banner", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const detectionJobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, detectionJobId);
+  // Started from the progress banner, so there is no verdict to go back to.
+  page.bannerButton(".yp-btn-add-trusted").click();
+  const addJobId = page.lastMessageOfType("add_to_trusted").jobId;
+  showProgressBanner(page, context, addJobId);
+
+  page.bannerButton(".yp-btn-cancel").click();
+
+  assert.equal(page.bannerRemoved, true);
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, false);
 });

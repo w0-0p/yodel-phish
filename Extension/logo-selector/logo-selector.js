@@ -25,6 +25,15 @@
       candidate.yRatio + candidate.heightRatio <= 1)
     .sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
 
+  // Issue #14: why this selector opened without suggestions. Like a failure
+  // code, it is a code the background sends and this file maps to fixed
+  // wording — never display text the background chose. It explains a fallback,
+  // not a failure, so it is styled as a notice rather than as an error.
+  const NOTICE_MESSAGES = Object.freeze({
+    logo_search_timeout: "The logo detection took too long, please select the logo manually",
+  });
+  const noticeText = NOTICE_MESSAGES[config.notice] ?? "";
+
   const host = document.createElement("div");
   document.documentElement.appendChild(host);
   const shadow = host.attachShadow({ mode: "closed" });
@@ -56,6 +65,22 @@
       border-radius: 6px;
       font-size: 14px;
       white-space: nowrap;
+      pointer-events: none;
+    }
+    #notice {
+      position: absolute;
+      top: 58px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(230, 81, 0, 0.92);
+      color: #fff;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-size: 13px;
+      display: none;
+      max-width: 70vw;
+      white-space: normal;
+      text-align: center;
       pointer-events: none;
     }
     #selection {
@@ -135,6 +160,13 @@
   instructions.id = "instructions";
   instructions.textContent = candidates.length > 0 ? SELECT_INSTRUCTIONS : DRAW_INSTRUCTIONS;
 
+  const notice = document.createElement("div");
+  notice.id = "notice";
+  if (noticeText !== "") {
+    notice.textContent = noticeText;
+    notice.style.display = "block";
+  }
+
   const selectionEl = document.createElement("div");
   selectionEl.id = "selection";
 
@@ -181,6 +213,7 @@
   overlay.appendChild(backdrop);
   for (const candidateEl of candidateEls) overlay.appendChild(candidateEl);
   overlay.appendChild(instructions);
+  overlay.appendChild(notice);
   overlay.appendChild(selectionEl);
   overlay.appendChild(toolbar);
   overlay.appendChild(errorMsg);
@@ -400,6 +433,9 @@
     });
     currentRect = { x, y, width: w, height: h };
     instructions.style.display = "none";
+    // The notice explains why the user is drawing at all; once they have, it
+    // has been read and would only crowd the selection.
+    notice.style.display = "none";
     positionToolbar({ x, y, width: w, height: h });
   });
 
