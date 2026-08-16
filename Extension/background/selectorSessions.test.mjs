@@ -434,7 +434,11 @@ test("document identity scopes verdict delivery and guards capture-derived trust
   assert.match(validate, /isInitiatingDocumentCurrent\(tabId, job\.documentId\)/);
   assert.match(
     serviceWorker,
-    /chrome\.tabs\.sendMessage\(tabId, scopedMessage, \{ documentId: job\.documentId \}\)/
+    /function sendDocumentMessage\(tabId, documentId, message\)[\s\S]*?chrome\.tabs\.sendMessage\(tabId, message, \{ documentId \}\)/
+  );
+  assert.match(
+    serviceWorker,
+    /return sendDocumentMessage\(tabId, job\.documentId, scopedMessage\);/
   );
 
   assert.equal(

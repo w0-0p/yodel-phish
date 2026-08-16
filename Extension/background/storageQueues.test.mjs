@@ -1570,7 +1570,10 @@ test("ordinary origins require an HTTP(S) URL with a hostname", async () => {
 
   assert.match(parseOrigin, /parsedUrl\.protocol !== "http:" && parsedUrl\.protocol !== "https:"\) return null/);
   assert.match(parseOrigin, /if \(hostname === ""\) return null/);
-  assert.match(serviceWorker, /const currentUrl = senderUrl;/);
+  // Issue #18: the analysed URL comes from the authoritative resolved top frame,
+  // never from the sender snapshot or from message content.
+  assert.match(serviceWorker, /const currentUrl = resolved\.url;/);
+  assert.doesNotMatch(serviceWorker, /const currentUrl = senderUrl;/);
   assert.doesNotMatch(serviceWorker, /message\.url/);
 });
 
@@ -1586,7 +1589,7 @@ test("permitted file pages use list storage but remain origin mismatches", async
   assert.match(serviceWorker, /chrome\.extension\.isAllowedFileSchemeAccess\(\)/);
   assert.match(serviceWorker, /const fqdn = `file-\$\{digest\.slice\(0, 24\)\}\.local`/);
   assert.match(serviceWorker, /origin_mismatch: fileOrigin !== null \|\|/);
-  assert.match(serviceWorker, /const parsedOrigin = await parseListOrigin\(currentUrl\)/);
+  assert.match(serviceWorker, /(?:const|let) parsedOrigin = await parseListOrigin\(currentUrl\)/);
   assert.match(serviceWorker, /const origin = await parseListOrigin\(senderUrl\)/);
   assert.match(serviceWorker, /origin\.protocol === "https"/);
   assert.doesNotMatch(serviceWorker, /fileScan && verdict === "phishing"/);
@@ -1905,18 +1908,16 @@ test("a run_pipeline job is anchored to the authoritative top frame, not the sen
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   const caseStart = serviceWorker.indexOf('case "run_pipeline": {');
   const caseEnd = serviceWorker.indexOf('case "child_frame_login_detected": {', caseStart);
-  const resolved = serviceWorker.indexOf("const topFrame = await resolveTopFrame(tabId, sender.documentId);", caseStart);
-  const documentGuard = serviceWorker.indexOf("topFrame?.documentId !== sender.documentId", resolved);
-  const lifecycleGuard = serviceWorker.indexOf('topFrame?.documentLifecycle !== "active"', resolved);
-  const jobStart = serviceWorker.indexOf("const job = startJob(", documentGuard);
+  const resolved = serviceWorker.indexOf("const resolved = await resolveAuthoritativeTopFrame(tabId, sender);", caseStart);
+  const guard = serviceWorker.indexOf("if (!resolved.ok) {", resolved);
+  const jobStart = serviceWorker.indexOf("const job = startJob(", guard);
 
   assert.ok(resolved > caseStart, "the current top frame is resolved before the job is created");
-  assert.ok(documentGuard > resolved, "a request from an already replaced document is rejected");
-  assert.ok(lifecycleGuard > documentGuard, "a non-active top document is rejected");
-  assert.ok(jobStart > documentGuard);
+  assert.ok(guard > resolved, "an unresolvable or stale sender is rejected before the job is created");
+  assert.ok(jobStart > guard);
   assert.match(
     serviceWorker.slice(jobStart, jobStart + 260),
-    /currentUrl,\s*"detection",\s*topFrame\.documentId/,
+    /currentUrl,\s*"detection",\s*resolved\.documentId/,
     "the job stores the resolved frame's URL and documentId"
   );
   assert.match(
@@ -1926,9 +1927,21 @@ test("a run_pipeline job is anchored to the authoritative top frame, not the sen
   );
   assert.doesNotMatch(
     serviceWorker.slice(caseStart, caseEnd),
-    /topFrame\?\.url \?\? senderUrl|topFrame\?\.documentId \?\? sender\?\.documentId/,
+    /senderUrl|sender\?\.documentId/,
     "sender snapshots are never accepted as an authoritative fallback"
   );
+
+  // Issue #18: run_pipeline and add_to_trusted share one resolver, whose
+  // contract (reject a sender with no document id, reject a document the live
+  // top frame no longer matches, reject a non-active or urlless frame) is
+  // behaviour-tested against classifyTopFrameForJob in navigationState.test.mjs.
+  const resolver = serviceWorker.slice(
+    serviceWorker.indexOf("async function resolveAuthoritativeTopFrame"),
+    serviceWorker.indexOf("async function loadTrustedEntries")
+  );
+  assert.match(resolver, /typeof senderDocumentId !== "string" \|\| senderDocumentId === ""/);
+  assert.match(resolver, /const frame = await resolveTopFrame\(tabId, senderDocumentId\);/);
+  assert.match(resolver, /return classifyTopFrameForJob\(sender, frame\);/);
 });
 
 // The SPA race: the login form and the route change happen in one task, so
@@ -1963,16 +1976,17 @@ test("navigation notifications describing the active job's own state never inter
   assert.ok(tabsCaptureGuard > tabsUpdated);
   assert.match(
     serviceWorker,
-    /function interruptForNavigation\(tabId, url\) \{[\s\S]*?if \(job\.url === url\) return;[\s\S]*?cancelJobForNavigation\(tabId, job, "address_changed", url\);/
+    /function interruptForNavigation\(tabId, url\) \{[\s\S]*?if \(job\.url === url\) return;[\s\S]*?cancelJobForNavigation\(tabId, job, CANCELLATION_REASONS\.URL_CHANGED, url, navigationDiagnostics\(\{/
   );
 
   // History API / fragment events additionally require the same document.
-  const sameDocumentEvents = serviceWorker.indexOf(
-    "for (const event of [chrome.webNavigation.onHistoryStateUpdated, chrome.webNavigation.onReferenceFragmentUpdated])"
-  );
+  const sameDocumentEvents = serviceWorker.indexOf("for (const [event, reasonHint, source] of [");
   const historyGuard = serviceWorker.indexOf("if (!isActiveJobSameDocumentState(details)) {", sameDocumentEvents);
   const historyCapture = serviceWorker.indexOf("captureTracker.interruptTab(details.tabId);", historyGuard);
-  const historyCancel = serviceWorker.indexOf("interruptForSameDocumentNavigation(details);", historyCapture);
+  const historyCancel = serviceWorker.indexOf(
+    "interruptForSameDocumentNavigation(details, reasonHint, source);",
+    historyCapture
+  );
   const historyForward = serviceWorker.indexOf("handleDeviceFlowHistoryChange(details.tabId, details.url)", historyCancel);
   assert.ok(historyGuard > sameDocumentEvents);
   assert.ok(historyCapture > historyGuard && historyCancel > historyCapture);
@@ -1980,10 +1994,14 @@ test("navigation notifications describing the active job's own state never inter
     historyForward > historyCancel,
     "page_history_changed is forwarded whether or not the event was already represented"
   );
+  // Same-document History API and fragment changes are cancelled with their
+  // own reason and diagnostic source; no flow is automatically retried.
   assert.match(
     serviceWorker,
-    /function interruptForSameDocumentNavigation\(details\) \{[\s\S]*?if \(isActiveJobSameDocumentState\(details\)\) return;\s*cancelJobForNavigation\(details\.tabId, job, "address_changed", details\.url\);/
+    /function interruptForSameDocumentNavigation\(details, reasonHint, source\) \{[\s\S]*?if \(isActiveJobSameDocumentState\(details\)\) return;[\s\S]*?source,[\s\S]*?cancelJobForNavigation\(details\.tabId, job, reasonHint, details\.url, diagnostics\);/
   );
+  assert.match(serviceWorker, /CANCELLATION_REASONS\.HISTORY_STATE_CHANGED,[\s\S]*?"webNavigation\.onHistoryStateUpdated"/);
+  assert.match(serviceWorker, /CANCELLATION_REASONS\.REFERENCE_FRAGMENT_CHANGED,[\s\S]*?"webNavigation\.onReferenceFragmentUpdated"/);
 
   // onCommitted stays the authoritative guard for a replacement document at
   // the same address: it interrupts unconditionally and invalidates on the
@@ -1994,7 +2012,7 @@ test("navigation notifications describing the active job's own state never inter
   assert.ok(committedCapture > committed && committedInvalidate > committedCapture);
   assert.match(
     serviceWorker,
-    /function interruptForCommittedDocument\(details\) \{[\s\S]*?if \(job\.documentId !== details\.documentId\) \{\s*cancelJobForNavigation\(details\.tabId, job, "address_changed", details\.url\);/
+    /function interruptForCommittedDocument\(details\) \{[\s\S]*?if \(job\.documentId !== details\.documentId\) \{\s*cancelJobForNavigation\(details\.tabId, job, CANCELLATION_REASONS\.DOCUMENT_REPLACED, details\.url, navigationDiagnostics\(\{/
   );
 });
 
@@ -2006,10 +2024,11 @@ test("navigation notifications describing the active job's own state never inter
 test("the worker routes navigation cancellation and late verdict delivery through the silent policy", async () => {
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
 
-  // The navigation helper opts into both parts of the silent contract.
+  // The navigation helper opts into both parts of the silent contract and
+  // carries the safe navigation diagnostics through to the cancellation record.
   assert.match(
     serviceWorker,
-    /function cancelJobForNavigation\(tabId, job, reasonHint, reanalyseUrl\) \{\s*return cancelJob\(tabId, job, reasonHint, \{\s*interruptionMode: "silent",\s*resetContent: true,\s*reanalyseUrl,/
+    /function cancelJobForNavigation\(tabId, job, reasonHint, reanalyseUrl, diagnostics\) \{\s*return cancelJob\(tabId, job, reasonHint, \{\s*interruptionMode: "silent",\s*resetContent: true,\s*reanalyseUrl,\s*diagnostics,/
   );
 
   // Content reset and warning/interstitial delivery are mutually exclusive.
@@ -2032,7 +2051,64 @@ test("the worker routes navigation cancellation and late verdict delivery throug
   );
   assert.match(
     serviceWorker,
-    /if \(commit === "document_replaced"\) \{[\s\S]*?cancelJobForNavigation\(tabId, job, "document_replaced", job\.url\);/
+    /if \(commit === "document_replaced"\) \{[\s\S]*?cancelJobForNavigation\(tabId, job, CANCELLATION_REASONS\.DOCUMENT_REPLACED, job\.url, navigationDiagnostics\(\{/
+  );
+});
+
+// Issue #18 — add_to_trusted binds to the authoritative top frame (shared with
+// run_pipeline) and revalidates it after the async origin/intent reads. A stale
+// message sender can never start a job or paint unscoped UI into its replacement.
+test("add_to_trusted resolves and revalidates the authoritative top frame before startJob", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+  const caseStart = serviceWorker.indexOf('case "add_to_trusted": {');
+  const caseEnd = serviceWorker.indexOf('case "get_trusted_add_intent": {', caseStart);
+  const addCase = serviceWorker.slice(caseStart, caseEnd);
+
+  const resolve = addCase.indexOf("const resolved = await resolveAuthoritativeTopFrame(tabId, sender);");
+  const parse = addCase.indexOf("await parseListOrigin(currentUrl)");
+  const revalidate = addCase.indexOf("const revalidated = await resolveAuthoritativeTopFrame(tabId, sender);");
+  const jobStart = addCase.indexOf("const job = startJob(");
+  assert.ok(resolve >= 0 && parse > resolve, "the frame is resolved before the origin is parsed");
+  assert.ok(revalidate > parse, "the document is revalidated after the async origin/intent reads");
+  assert.ok(jobStart > revalidate, "revalidation happens immediately before the job is created");
+  assert.match(
+    addCase.slice(revalidate, jobStart),
+    /revalidated\.documentId !== resolved\.documentId/,
+    "a replaced sender document fails closed rather than binding a stale job"
+  );
+  assert.match(
+    addCase.slice(revalidate, jobStart),
+    /if \(revalidated\.url !== currentUrl\)[\s\S]*?const updatedOrigin = parseOrigin\(revalidated\.url\);[\s\S]*?updatedOrigin\.fqdn !== parsedOrigin\.fqdn[\s\S]*?currentUrl = revalidated\.url;[\s\S]*?parsedOrigin = updatedOrigin;/,
+    "a same-document web route update is rebound only after its fqdn is independently confirmed"
+  );
+  assert.match(
+    addCase.slice(jobStart, jobStart + 200),
+    /startJob\(tabId, message\.jobId, currentUrl, "add_to_trusted", revalidated\.documentId\)/
+  );
+  assert.doesNotMatch(addCase, /senderUrl/, "the sender snapshot is never the job's URL");
+  assert.match(
+    addCase,
+    /sendDocumentMessage\(tabId, resolved\.documentId,[\s\S]*?jobId: message\.jobId/,
+    "pre-job UI is scoped to the exact initiating document and job"
+  );
+  assert.doesNotMatch(addCase, /sendToTab\(/, "a stale sender can never paint unscoped UI");
+});
+
+// Issue #18 — cancellation diagnostics identify the event source and the
+// URL/document mismatch, as booleans only. The authentication URL and its
+// sensitive query string are never part of the stored record.
+test("cancellation diagnostics record the safe navigation comparison, never a URL", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+
+  assert.match(
+    serviceWorker,
+    /function recordCancelledDiagnostics[\s\S]*?job\.navigationDiagnostics === null \? \{\} : \{ navigation: job\.navigationDiagnostics \}/
+  );
+  // cancelJob stashes the diagnostics on the job only after it has actually
+  // become terminal, so a losing later cancel cannot rewrite them.
+  assert.match(
+    serviceWorker,
+    /if \(!markJobTerminalIfCurrent\(tabId, job, "cancelled", reasonHint\)\) return false;\s*if \(diagnostics !== undefined && diagnostics !== null\) job\.navigationDiagnostics = diagnostics;/
   );
 });
 

@@ -24,9 +24,12 @@ import {
   uiCoverCapturesMatch,
 } from "./uiCoverBoxes.mjs";
 import {
+  CANCELLATION_REASONS,
   cancellationPresentation,
+  classifyTopFrameForJob,
   jobMatchesAddress,
   jobMatchesSameDocumentState,
+  navigationDiagnostics,
 } from "./navigationState.mjs";
 import { createCaptureTracker, createSelectorSessionStore, selectorSessionStatus } from "./selectorSessions.mjs";
 import { createTrustedAddIntentStore } from "./trustedAddIntents.mjs";
@@ -310,15 +313,27 @@ function interruptForNavigation(tabId, url) {
   if (job.url === url) return; // see isActiveJobAddress
   // Ordinary top-level navigation: the arriving document runs its own login
   // detection, so cancel silently rather than warning the user (issue #2).
-  cancelJobForNavigation(tabId, job, "address_changed", url);
+  cancelJobForNavigation(tabId, job, CANCELLATION_REASONS.URL_CHANGED, url, navigationDiagnostics({
+    context: job.kind,
+    source: "tabs.onUpdated",
+    job,
+    url,
+  }));
 }
 
-function interruptForSameDocumentNavigation(details) {
+function interruptForSameDocumentNavigation(details, reasonHint, source) {
   const job = activeJobFor(details.tabId);
   if (job === null) return;
   if (job.expectedNavigationUrl === details.url) return;
   if (isActiveJobSameDocumentState(details)) return;
-  cancelJobForNavigation(details.tabId, job, "address_changed", details.url);
+  const diagnostics = navigationDiagnostics({
+    context: job.kind,
+    source,
+    job,
+    url: details.url,
+    documentId: details.documentId,
+  });
+  cancelJobForNavigation(details.tabId, job, reasonHint, details.url, diagnostics);
 }
 
 function interruptForCommittedDocument(details) {
@@ -330,7 +345,13 @@ function interruptForCommittedDocument(details) {
   // documentId) silently invalidates the old job; the fresh document analyses
   // itself independently.
   if (job.documentId !== details.documentId) {
-    cancelJobForNavigation(details.tabId, job, "address_changed", details.url);
+    cancelJobForNavigation(details.tabId, job, CANCELLATION_REASONS.DOCUMENT_REPLACED, details.url, navigationDiagnostics({
+      context: job.kind,
+      source: "webNavigation.onCommitted",
+      job,
+      url: details.url,
+      documentId: details.documentId,
+    }));
   }
 }
 
@@ -384,7 +405,18 @@ for (const event of [chrome.tabs.onAttached, chrome.tabs.onDetached]) {
   event.addListener((tabId) => captureTracker.interruptTab(tabId));
 }
 
-for (const event of [chrome.webNavigation.onHistoryStateUpdated, chrome.webNavigation.onReferenceFragmentUpdated]) {
+for (const [event, reasonHint, source] of [
+  [
+    chrome.webNavigation.onHistoryStateUpdated,
+    CANCELLATION_REASONS.HISTORY_STATE_CHANGED,
+    "webNavigation.onHistoryStateUpdated",
+  ],
+  [
+    chrome.webNavigation.onReferenceFragmentUpdated,
+    CANCELLATION_REASONS.REFERENCE_FRAGMENT_CHANGED,
+    "webNavigation.onReferenceFragmentUpdated",
+  ],
+]) {
   event.addListener((details) => {
     void clickfixWarnings.discardSourceDocument(details.tabId, details.frameId)
       .then(scheduleClickfixWarningExpiry)
@@ -398,7 +430,7 @@ for (const event of [chrome.webNavigation.onHistoryStateUpdated, chrome.webNavig
     // forwarded either way, so DOM and device-flow evaluation are unaffected.
     if (!isActiveJobSameDocumentState(details)) {
       captureTracker.interruptTab(details.tabId);
-      interruptForSameDocumentNavigation(details);
+      interruptForSameDocumentNavigation(details, reasonHint, source);
     }
     void handleDeviceFlowHistoryChange(details.tabId, details.url).catch((error) => {
       console.warn("[YodelPhish] Failed to evaluate device-flow history navigation:", error);
@@ -1707,13 +1739,22 @@ async function screenshotDimensions(screenshot) {
   }
 }
 
+async function sendDocumentMessage(tabId, documentId, message) {
+  if (tabId === undefined || typeof documentId !== "string" || documentId === "") return undefined;
+  try {
+    return await chrome.tabs.sendMessage(tabId, message, { documentId });
+  } catch {
+    return undefined;
+  }
+}
+
 async function sendJobDocumentMessage(tabId, job, message) {
   if (tabId === undefined || typeof job?.jobId !== "string") return undefined;
   const scopedMessage = { ...message, jobId: job.jobId };
+  if (typeof job.documentId === "string" && job.documentId !== "") {
+    return sendDocumentMessage(tabId, job.documentId, scopedMessage);
+  }
   try {
-    if (typeof job.documentId === "string" && job.documentId !== "") {
-      return await chrome.tabs.sendMessage(tabId, scopedMessage, { documentId: job.documentId });
-    }
     return await chrome.tabs.sendMessage(tabId, scopedMessage);
   } catch {
     return undefined;
@@ -1746,6 +1787,22 @@ async function isInitiatingDocumentCurrent(tabId, documentId) {
   if (typeof documentId !== "string" || documentId.length === 0) return false;
   const frame = await resolveTopFrame(tabId);
   return frame?.documentId === documentId;
+}
+
+// Issue #18: the single authoritative way a message handler binds a new job to
+// a tab. It rejects a sender with no document identity, resolves the live top
+// frame from that document id, and returns its own URL and document id only
+// when the frame is still the sender's active top document. Both run_pipeline
+// and add_to_trusted use it so neither can anchor a job to a stale
+// MessageSender snapshot. Returns { ok: true, url, documentId } or
+// { ok: false, reason }.
+async function resolveAuthoritativeTopFrame(tabId, sender) {
+  const senderDocumentId = sender?.documentId;
+  if (typeof senderDocumentId !== "string" || senderDocumentId === "") {
+    return { ok: false, reason: CANCELLATION_REASONS.STALE_SENDER_DOCUMENT };
+  }
+  const frame = await resolveTopFrame(tabId, senderDocumentId);
+  return classifyTopFrameForJob(sender, frame);
 }
 
 async function loadTrustedEntries() {
@@ -2125,8 +2182,15 @@ function computeVerdict(result, origin) {
 // =============================================================================
 
 const REASON_MESSAGES = {
+  // Retained for analysis-history records written before issue #18 split it into
+  // the specific reasons below.
   address_changed: "The page address changed.",
+  url_changed: "The page address changed.",
+  history_state_changed: "The page updated its address without reloading.",
+  reference_fragment_changed: "The page updated its address fragment.",
   document_replaced: "The page was reloaded or replaced by a new document.",
+  stale_sender_document: "The page's document changed before analysis could start.",
+  document_inactive: "The page is no longer active.",
   credential_fields_changed: "Credential fields were added, removed, or displayed.",
   visual_changed: "Security-relevant visual content changed.",
   unclassified: "The page changed in a way that could not be safely classified.",
@@ -2186,6 +2250,11 @@ function startJob(tabId, jobId, url, kind = "detection", documentId = null) {
     interruptionMode: "decision_required",
     interruptionPromise: undefined,
     expectedNavigationUrl: undefined,
+    // Safe comparison data (source + equality booleans, never a URL) describing
+    // the navigation event that cancelled this job, recorded into the analysis
+    // history so a false address-change cancel can be told apart from a real one
+    // (issue #18).
+    navigationDiagnostics: null,
     cancellationRecorded: false,
     failureRecorded: false,
     failureCode: null,
@@ -2256,9 +2325,10 @@ function cancelJob(
   tabId,
   job,
   reasonHint = "unclassified",
-  { interruptionMode = "decision_required", resetContent = false, reanalyseUrl } = {}
+  { interruptionMode = "decision_required", resetContent = false, reanalyseUrl, diagnostics } = {}
 ) {
   if (!markJobTerminalIfCurrent(tabId, job, "cancelled", reasonHint)) return false;
+  if (diagnostics !== undefined && diagnostics !== null) job.navigationDiagnostics = diagnostics;
   // The first cancellation wins the presentation policy; a later silent
   // navigation cancel cannot demote an interruption already scheduled, and a
   // later decision cannot promote one an ordinary navigation already silenced.
@@ -2290,11 +2360,12 @@ function cancelJob(
   return true;
 }
 
-function cancelJobForNavigation(tabId, job, reasonHint, reanalyseUrl) {
+function cancelJobForNavigation(tabId, job, reasonHint, reanalyseUrl, diagnostics) {
   return cancelJob(tabId, job, reasonHint, {
     interruptionMode: "silent",
     resetContent: true,
     reanalyseUrl,
+    diagnostics,
   });
 }
 
@@ -2352,18 +2423,35 @@ async function validateJobForCommit(tabId, job) {
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    cancelJobForNavigation(tabId, job, "address_changed");
+    cancelJobForNavigation(tabId, job, CANCELLATION_REASONS.URL_CHANGED, undefined, navigationDiagnostics({
+      context: job.kind,
+      source: "validateJobForCommit.tabGone",
+      job,
+    }));
     return false;
   }
   if (isJobStale(tabId, job)) return false;
   if (tab.url !== job.url) {
     // The destination is evaluated independently by its own document; a late
     // result from this job must never commit across the navigation (issue #2).
-    cancelJobForNavigation(tabId, job, "address_changed", tab.url);
+    cancelJobForNavigation(tabId, job, CANCELLATION_REASONS.URL_CHANGED, tab.url, navigationDiagnostics({
+      context: job.kind,
+      source: "validateJobForCommit.url",
+      job,
+      url: tab.url,
+    }));
     return false;
   }
   if (!(await isInitiatingDocumentCurrent(tabId, job.documentId))) {
-    cancelJobForNavigation(tabId, job, "address_changed", tab.url);
+    // Same address, different (or gone) document: a reload or replacement. The
+    // capture result can no longer be committed against the originating
+    // document (issue #18).
+    cancelJobForNavigation(tabId, job, CANCELLATION_REASONS.DOCUMENT_REPLACED, tab.url, navigationDiagnostics({
+      context: job.kind,
+      source: "validateJobForCommit.document",
+      job,
+      url: tab.url,
+    }));
     return false;
   }
   return !isJobStale(tabId, job);
@@ -2410,6 +2498,10 @@ async function recordCancelledDiagnostics(job) {
       status: "cancelled",
       context: job.kind,
       reason: job.reasonHint ?? "unclassified",
+      // Issue #18: the event source and URL/document equality that classified
+      // this cancellation. Booleans only -- the authentication URL and its
+      // sensitive query string are deliberately never stored.
+      ...(job.navigationDiagnostics === null ? {} : { navigation: job.navigationDiagnostics }),
       // A logo search that was abandoned is exactly the sample the deadline
       // needs to be tuned against, so it is recorded here too (issue #14).
       ...(job.logoSearchMs === undefined ? {} : { logo_search_ms: job.logoSearchMs }),
@@ -2505,24 +2597,19 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       // for a same-document route change, sender.url and the browser's own
       // frame URL do not necessarily settle at the same instant, and this
       // job's stored URL is what every later navigation notification is
-      // compared against (see isActiveJobAddress).
-      if (typeof sender?.documentId !== "string" || sender.documentId === "") {
+      // compared against (see isActiveJobAddress). Shared with add_to_trusted
+      // (issue #18).
+      const resolved = await resolveAuthoritativeTopFrame(tabId, sender);
+      if (!resolved.ok) {
         return { error: true, code: "analysis_failed" };
       }
-      const topFrame = await resolveTopFrame(tabId, sender.documentId);
-      if (topFrame?.documentId !== sender.documentId ||
-          topFrame?.documentLifecycle !== "active" ||
-          typeof topFrame?.url !== "string" ||
-          topFrame.url === "") {
-        return { error: true, code: "analysis_failed" };
-      }
-      const currentUrl = topFrame.url;
+      const currentUrl = resolved.url;
       const job = startJob(
         tabId,
         message.jobId,
         currentUrl,
         "detection",
-        topFrame.documentId
+        resolved.documentId
       );
       let origin;
       let fileScan = false;
@@ -2840,10 +2927,26 @@ async function handleMessage(message, tabId, senderUrl, sender) {
     case "add_to_trusted": {
       if (tabId === undefined) return;
       if (!isTopFrameSender(sender)) return;
-      const currentUrl = senderUrl;
-      const parsedOrigin = await parseListOrigin(currentUrl);
+      // Issue #18: bind to the authoritative current top frame, exactly as
+      // run_pipeline does, rather than the sender's possibly-stale snapshot. A
+      // History API URL change between page load and this click otherwise leaves
+      // the job anchored to a URL the browser's navigation events no longer
+      // report, and the next same-document event cancels the capture as a false
+      // address change (the Zalando symptom in issue #18). A stale or replaced
+      // sender document cannot start a job at all.
+      const resolved = await resolveAuthoritativeTopFrame(tabId, sender);
+      if (!resolved.ok) {
+        return { error: true, code: "analysis_failed", reason: resolved.reason };
+      }
+      let currentUrl = resolved.url;
+      let parsedOrigin = await parseListOrigin(currentUrl);
       if (parsedOrigin === null) {
-        return sendToTab(tabId, { type: "show_banner", verdict: "unknown", data: {} });
+        return sendDocumentMessage(tabId, resolved.documentId, {
+          type: "show_banner",
+          jobId: message.jobId,
+          verdict: "unknown",
+          data: {},
+        });
       }
       // Issue #8: when this tab was opened by a Settings "Move to trusted", the
       // same confirmation flow runs, but on completion the tab is closed and
@@ -2852,9 +2955,33 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       // page makes before confirmation, yet never turns an unrelated site the
       // tab later navigates to into a move. The selector session consumes it.
       const moveIntent = await trustedAddIntents.get(tabId);
+      // Revalidate the top document immediately before startJob (issue #18): the
+      // origin parse and intent read above are asynchronous, so re-resolve to be
+      // sure the same active document is still current before binding the job.
+      const revalidated = await resolveAuthoritativeTopFrame(tabId, sender);
+      if (!revalidated.ok || revalidated.documentId !== resolved.documentId) {
+        return {
+          error: true,
+          code: "analysis_failed",
+          reason: revalidated.ok ? CANCELLATION_REASONS.STALE_SENDER_DOCUMENT : revalidated.reason,
+        };
+      }
+      if (revalidated.url !== currentUrl) {
+        // A History API update can legitimately settle between the first frame
+        // resolution and the intent read. It is still the same document, and web
+        // History API changes cannot cross origin, so bind to the browser's
+        // latest URL after independently confirming the fqdn. File references
+        // retain exact-URL identity and therefore fail closed here.
+        const updatedOrigin = parseOrigin(revalidated.url);
+        if (updatedOrigin === null || updatedOrigin.fqdn !== parsedOrigin.fqdn) {
+          return { error: true, code: "analysis_failed", reason: CANCELLATION_REASONS.URL_CHANGED };
+        }
+        currentUrl = revalidated.url;
+        parsedOrigin = updatedOrigin;
+      }
       const isMoveToTrusted = moveIntent !== null && moveIntent.fqdn === parsedOrigin.fqdn;
       const origin = { valid: true, ...parsedOrigin };
-      const job = startJob(tabId, message.jobId, currentUrl, "add_to_trusted", sender?.documentId);
+      const job = startJob(tabId, message.jobId, currentUrl, "add_to_trusted", revalidated.documentId);
       job.origin = origin;
       // What the two routes that bypass the automatic search ("Select logo
       // manually" and the logo-search deadline) need to open the same selector
@@ -3948,7 +4075,11 @@ async function refreshTrustedEntry(fqdn, result, tabId, job) {
   if (commit === "document_replaced") {
     // A trusted page's background reference refresh abandoned by navigation:
     // cancel silently, without warning the user (issue #2).
-    cancelJobForNavigation(tabId, job, "document_replaced", job.url);
+    cancelJobForNavigation(tabId, job, CANCELLATION_REASONS.DOCUMENT_REPLACED, job.url, navigationDiagnostics({
+      context: job.kind,
+      source: "refreshTrustedEntry.document",
+      job,
+    }));
     return false;
   }
   if (commit === null) return true;
