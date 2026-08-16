@@ -12,6 +12,7 @@ import {
 } from "../../src/detection/browser/trustedAddCandidates.ts";
 
 const offscreenSource = readFileSync(new URL("./offscreen.js", import.meta.url), "utf8");
+const inferenceWorkerSource = readFileSync(new URL("./inference-worker.js", import.meta.url), "utf8");
 const stackSource = readFileSync(
   new URL("../../src/detection/browser/browserStackServices.ts", import.meta.url),
   "utf8"
@@ -19,15 +20,15 @@ const stackSource = readFileSync(
 
 test("a confirmed manual selection is described by the region engine, not hand-built", () => {
   assert.match(
-    offscreenSource,
+    inferenceWorkerSource,
     /services\.logoRegions\.describeManualRegion\(screenshot, normalizedRect\)/,
     "the manual reference path must go through the descriptor engine"
   );
   // The old path multiplied the ratios itself and shipped a bare box with an
   // unused confidence field, leaving every scoring descriptor undefined.
-  assert.doesNotMatch(offscreenSource, /normalizedRect\.(?:xRatio|yRatio|widthRatio|heightRatio)/);
-  assert.doesNotMatch(offscreenSource, /source: "manual"/);
-  assert.doesNotMatch(offscreenSource, /confidence:/);
+  assert.doesNotMatch(inferenceWorkerSource, /normalizedRect\.(?:xRatio|yRatio|widthRatio|heightRatio)/);
+  assert.doesNotMatch(inferenceWorkerSource, /source: "manual"/);
+  assert.doesNotMatch(inferenceWorkerSource, /confidence:/);
 });
 
 test("manual and YOLO regions both bypass automatic candidate rejection", () => {
@@ -98,10 +99,19 @@ test("manual rectangle conversion rejects malformed or unusable selections", () 
 
 test("the offscreen runtime serves candidate proposals through the region engine", () => {
   assert.match(
-    offscreenSource,
+    inferenceWorkerSource,
     /if \(message\.type === "propose_trusted_add_candidates"\) \{\s*return services\.logoRegions\.proposeTrustedAddCandidates\(message\.screenshot\);/,
     "the proposal path must go through the shared services object"
   );
+});
+
+test("heavy inference is isolated behind a physically cancellable Worker", () => {
+  assert.match(offscreenSource, /new InferenceWorkerClient/);
+  assert.match(offscreenSource, /cancelRun: \(reason\) => inferenceWorker\.terminate\(message\.ticketId, reason\)/);
+  assert.doesNotMatch(offscreenSource, /runBrowserDetectionPipeline|createBrowserStackServices|DinoV2EmbeddingEngine/);
+  assert.match(inferenceWorkerSource, /runBrowserDetectionPipeline/);
+  assert.match(inferenceWorkerSource, /createBrowserStackServices/);
+  assert.match(inferenceWorkerSource, /DinoV2EmbeddingEngine/);
 });
 
 test("candidate proposals use the human-review floor and never the CV proposer", () => {

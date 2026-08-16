@@ -36,6 +36,13 @@ let analysisAttempted = false;
 let analysisDeadlineHandle = null;
 let deviceFlowActive = false;
 let deviceFlowProvider = null;
+// Issue #14: one progress banner may only ever start one operation. The flag
+// is held across the asynchronous ones (the manual-logo request), so repeated
+// or competing clicks on the same banner cannot create concurrent flows.
+let bannerActionPending = false;
+// The actionable verdict the user pressed "Add to trusted" on, so cancelling
+// the trusted-site flow can put exactly that banner back (issue #14).
+let restorableVerdict = null;
 
 const CONTENT_JOB_TIMEOUT_MS = 290_000;
 
@@ -257,6 +264,111 @@ function triggerTrustedAdd() {
     .catch(() => {
       enterFailedState(jobId, "dispatch_failed");
     });
+}
+
+// =============================================================================
+// USER-DRIVEN CANCELLATION — issue #14
+//
+// The progress banners carry the only controls that can end an analysis the
+// user did not ask to wait for. All three of them (Cancel, Add to trusted,
+// Select logo manually) go through this section, so the two halves of a
+// cancellation always happen together and in the same order: this document
+// releases everything it holds (deadline, timers, shield, form guard) and
+// forgets the job id, and the background is told to drop the job itself.
+//
+// Clearing currentJobId first is what makes the cancellation final on this
+// side: every inbound job message is matched against it, so nothing the
+// cancelled job still produces -- a late verdict, a capture handshake, a
+// terminal failure -- can reach the banner afterwards.
+// =============================================================================
+
+function stopAnalysisLocally() {
+  const jobId = currentJobId;
+  clearAnalysisDeadline();
+  clearProgressTimer();
+  stopProgressNote();
+  alreadyAnalysing = false;
+  analysisMode = null;
+  interruptionPending = false;
+  currentJobId = null;
+  capturePending = false;
+  bannerHiddenForCapture = false;
+  unblockFormSubmission();
+  removeBusyOverlay();
+  if (typeof jobId === "string") {
+    chrome.runtime.sendMessage({ type: "cancel_current_analysis", jobId }).catch(() => {});
+  }
+  return jobId;
+}
+
+// "Cancel" on either progress banner. A cancelled trusted-site flow returns to
+// the verdict it was started from and leaves the trusted list untouched (the
+// list is only ever written by a confirmed logo selection); a cancelled
+// analysis leaves no banner at all, so the page is exactly as interactive as
+// it was before the analysis started.
+function cancelAnalysisFromBanner() {
+  if (bannerActionPending || !alreadyAnalysing) return;
+  bannerActionPending = true;
+  const restore = analysisMode === "add_to_trusted" ? restorableVerdict : null;
+  stopAnalysisLocally();
+  if (restore !== null) {
+    setIconState(iconStateForVerdict(restore.verdict), bannerMessageFor(restore.verdict, restore.data));
+    showBanner(restore.verdict, restore.data);
+  } else {
+    setIconState("active");
+    removeBanner();
+  }
+  bannerActionPending = false;
+}
+
+// "Add to trusted", from a verdict banner (where nothing is running) or from
+// the progress banner (where the standard analysis is cancelled first, so the
+// trusted-site flow is never the second job in flight for this page).
+function startTrustedAddFromBanner() {
+  if (bannerActionPending) return;
+  if (!confirm("Add this site to your trusted list?")) return;
+  bannerActionPending = true;
+  setBannerActionsDisabled(true);
+  try {
+    if (alreadyAnalysing) stopAnalysisLocally();
+    triggerTrustedAdd();
+  } catch (error) {
+    bannerActionPending = false;
+    setBannerActionsDisabled(false);
+    throw error;
+  }
+}
+
+// "Select logo manually" on the trusted-site progress banner: the background
+// stops the automatic logo search and mounts the selector. It answers only
+// once the selector session exists, and mounting the selector is itself what
+// takes this banner and the shield down (cancel_analysis), so there is nothing
+// left to render here on success. On failure the controls come back.
+async function requestManualLogoSelection() {
+  if (bannerActionPending || analysisMode !== "add_to_trusted") return;
+  const jobId = currentJobId;
+  if (typeof jobId !== "string") return;
+  bannerActionPending = true;
+  setBannerActionsDisabled(true);
+  let accepted = false;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "select_logo_manually", jobId });
+    accepted = response?.ok === true;
+  } catch {
+    accepted = false;
+  }
+  bannerActionPending = false;
+  // The flow moved on while the request was in flight (cancelled, navigated,
+  // or the automatic search finished first) -- whatever is on screen now owns
+  // the banner, so leave it alone.
+  if (jobId !== currentJobId) return;
+  if (!accepted) setBannerActionsDisabled(false);
+}
+
+function setBannerActionsDisabled(disabled) {
+  bannerEl?.querySelectorAll(".yp-btn").forEach((button) => {
+    button.disabled = disabled;
+  });
 }
 
 // =============================================================================
@@ -804,6 +916,38 @@ const BANNER_CSS = `
   .yp-btn-retry:hover {
     background-color: #1b5e20;
   }
+
+  /* Progress-banner controls (issue #14). "Add to trusted" is the same green
+     affirmative action it is on a verdict banner; ending or redirecting the
+     analysis is quieter, so both read as outlined controls on the blue
+     progress background. */
+  .yp-btn-add-trusted {
+    background-color: #2e7d32;
+  }
+
+  .yp-btn-add-trusted:hover {
+    background-color: #1b5e20;
+  }
+
+  .yp-btn-cancel,
+  .yp-btn-manual-logo {
+    background-color: transparent;
+    color: currentColor;
+    border: 1px solid currentColor;
+    opacity: 0.75;
+  }
+
+  .yp-btn-cancel:hover,
+  .yp-btn-manual-logo:hover {
+    opacity: 1;
+  }
+
+  /* A control whose operation is already running must not look clickable --
+     the busy shield's cursor applies to the page, not to the banner. */
+  .yp-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
 `;
 
 // A constructed stylesheet is preferred over a <style> element: an inline
@@ -840,23 +984,26 @@ const BANNER_CONFIG = {
   // Preparation and analysis share one progress presentation. Informational
   // progress banners are blue with light text (issue #68) — the previous
   // near-white background matched the light text and made them unreadable.
+  // Issue #14: waiting is never the only option. An analysis in progress can
+  // be ended outright or turned into the trusted-site flow, and the
+  // trusted-site flow can be ended or taken straight to manual logo selection.
   analysing: {
     color:   "var(--yp-blue)",
     icon:    "spinner",
     message: "Login detected, Yodel-Phish Analysis in progress",
-    buttons: [],
+    buttons: ["add-trusted", "cancel-analysis"],
   },
   analysing_manual: {
     color:   "var(--yp-blue)",
     icon:    "spinner",
     message: "Manual analysis in progress…",
-    buttons: [],
+    buttons: ["add-trusted", "cancel-analysis"],
   },
   adding_to_trusted: {
     color:   "var(--yp-blue)",
     icon:    "spinner",
     message: "Adding this site to your trusted list…",
-    buttons: [],
+    buttons: ["manual-logo", "cancel-analysis"],
   },
   trusted: {
     color:   "var(--yp-green)",
@@ -1019,7 +1166,16 @@ function showBanner(verdict, data) {
   if (!PROGRESS_VERDICTS.has(verdict)) {
     capturePending = false;
   }
-  if (bannerEl !== null && state === bannerState) return;
+  if (bannerEl !== null && state === bannerState) {
+    // A terminal response can legitimately restore the same verdict that was
+    // visible when Add-to-trusted started. That still completes the old
+    // button's transition and must give its controls back.
+    if (bannerActionPending) {
+      bannerActionPending = false;
+      setBannerActionsDisabled(false);
+    }
+    return;
+  }
 
   if (PROGRESS_VERDICTS.has(verdict)) {
     progressTimer = setTimeout(() => {
@@ -1042,6 +1198,16 @@ function renderBanner(verdict, config, data, message, state) {
   // Avoid replacing buttons that are already in the correct state.
   if (bannerEl !== null && state === bannerState) return;
   bannerState = state;
+
+  // Issue #14: the two verdicts that offer "Add to trusted" are also the two a
+  // cancelled trusted-site flow returns to. A progress banner replaces such a
+  // verdict without ending it, so it deliberately keeps the memory; any other
+  // verdict has genuinely superseded it.
+  if (verdict === "unknown" || verdict === "suspicious") {
+    restorableVerdict = { verdict, data };
+  } else if (!PROGRESS_VERDICTS.has(verdict)) {
+    restorableVerdict = null;
+  }
 
   if (bannerEl === null) {
     // The host carries no stable id or class, avoiding ordinary selector
@@ -1085,16 +1251,32 @@ function renderBanner(verdict, config, data, message, state) {
         ${config.buttons.includes("re-analyse") ? `<button class="yp-btn yp-btn-reanalyse" hidden>Re-analyse</button>` : ""}
         ${config.buttons.includes("re-analyse-visible") ? `<button class="yp-btn yp-btn-reanalyse">Re-analyse</button>` : ""}
         ${config.buttons.includes("retry")       ? `<button class="yp-btn yp-btn-retry">Retry</button>` : ""}
+        ${config.buttons.includes("add-trusted") ? `<button class="yp-btn yp-btn-add-trusted">Add to trusted</button>` : ""}
+        ${config.buttons.includes("manual-logo") ? `<button class="yp-btn yp-btn-manual-logo">Select logo manually</button>` : ""}
+        ${config.buttons.includes("cancel-analysis") ? `<button class="yp-btn yp-btn-cancel">Cancel</button>` : ""}
       </div>
     </div>
   `;
+  // Replacing the banner is the acknowledgement for a synchronous action such
+  // as Add-to-trusted. Keep the old controls single-flight until this point so
+  // a double click cannot cancel and restart the new job during the delayed
+  // progress transition.
+  bannerActionPending = false;
   const messageEl = bannerEl.querySelector(".yp-message");
   if (messageEl !== null) renderBannerMessage(messageEl, bannerMessageParts(verdict, data));
 
-  bannerEl.querySelector(".yp-btn-add")?.addEventListener("click", () => {
-    if (!confirm("Add this site to your trusted list?")) return;
-    triggerTrustedAdd();
+  // Both entry points into the trusted-site flow: the verdict banner's own
+  // control, and the one the progress banner offers while an analysis the user
+  // no longer wants to wait for is still running (issue #14).
+  bannerEl.querySelectorAll(".yp-btn-add, .yp-btn-add-trusted").forEach((btn) => {
+    btn.addEventListener("click", startTrustedAddFromBanner);
   });
+
+  bannerEl.querySelector(".yp-btn-manual-logo")?.addEventListener("click", () => {
+    void requestManualLogoSelection();
+  });
+
+  bannerEl.querySelector(".yp-btn-cancel")?.addEventListener("click", cancelAnalysisFromBanner);
 
   bannerEl.querySelector(".yp-btn-mute")?.addEventListener("click", () => {
     if (!confirm("Mute this site forever? You will no longer see warnings for it.")) return;
@@ -1175,6 +1357,7 @@ function updateProgressNote() {
 function removeBanner() {
   clearProgressTimer();
   capturePending = false;
+  restorableVerdict = null;
   // Removing the banner is the other terminal path. It covers the routes that
   // clear the banner without a replacement verdict — silent same-document
   // cancellation, a bfcache restore, and cancel_analysis, which drops the

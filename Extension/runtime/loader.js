@@ -1,14 +1,11 @@
 // Clipboard mediation shares Chrome's one permitted offscreen document with
 // the detection runtime. Keep that document lightweight until the worker asks
-// for an inference-runtime ping; an ordinary clipboard write must not load and
-// retain OpenCV, ONNX runtimes, and the model stack.
-const OPENCV_READY_TIMEOUT_MS = 30_000;
-const OPENCV_POLL_INTERVAL_MS = 50;
+// for an inference-runtime ping; an ordinary clipboard write must not load the
+// coordinator or its dedicated OpenCV/OCR/ONNX Worker.
 const OFFSCREEN_TARGET = "yodel-offscreen";
 const SERVICE_WORKER_URL = chrome.runtime.getURL("dist/service_worker.js");
 
 let startupState = "idle";
-let startedAt = 0;
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.target !== OFFSCREEN_TARGET || message.type !== "ping") return false;
@@ -24,42 +21,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 function startDetectionRuntime() {
   if (startupState !== "idle") return;
-  startupState = "loading_opencv";
-  startedAt = Date.now();
-
-  const script = document.createElement("script");
-  script.src = chrome.runtime.getURL("opencv/opencv.js");
-  script.onerror = () => reportStartupFailure("opencv_load_failed");
-  document.body.appendChild(script);
-  pollForOpenCv();
-}
-
-function isOpenCvUsable() {
-  if (globalThis.cv?.Mat === undefined) return false;
-  try {
-    const probe = new globalThis.cv.Mat();
-    probe.delete();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function pollForOpenCv() {
-  if (startupState !== "loading_opencv") return;
-  if (isOpenCvUsable()) {
-    injectDetectionBundle();
-    return;
-  }
-  if (Date.now() - startedAt >= OPENCV_READY_TIMEOUT_MS) {
-    reportStartupFailure("opencv_timeout");
-    return;
-  }
-  setTimeout(pollForOpenCv, OPENCV_POLL_INTERVAL_MS);
+  injectDetectionBundle();
 }
 
 function injectDetectionBundle() {
-  if (startupState !== "loading_opencv") return;
+  if (startupState !== "idle") return;
   startupState = "loading_bundle";
   const script = document.createElement("script");
   script.src = chrome.runtime.getURL("dist/offscreen.js");

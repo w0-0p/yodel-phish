@@ -48,7 +48,7 @@ function createFakeElement(tagName) {
   };
 }
 
-function loadSelector({ fqdn = "example.test", sessionId = "session-1", candidates } = {}) {
+function loadSelector({ fqdn = "example.test", sessionId = "session-1", candidates, notice } = {}) {
   const created = [];
   const sentMessages = [];
   let pendingConfirm = null;
@@ -67,7 +67,12 @@ function loadSelector({ fqdn = "example.test", sessionId = "session-1", candidat
   const fakeWindow = {
     innerWidth: 1000,
     innerHeight: 800,
-    __YP_SELECTOR_CONFIG__: { fqdn, sessionId, ...(candidates === undefined ? {} : { candidates }) },
+    __YP_SELECTOR_CONFIG__: {
+      fqdn,
+      sessionId,
+      ...(candidates === undefined ? {} : { candidates }),
+      ...(notice === undefined ? {} : { notice }),
+    },
     requestAnimationFrame(callback) {
       callback();
     },
@@ -118,6 +123,7 @@ function loadSelector({ fqdn = "example.test", sessionId = "session-1", candidat
     error: byId("error-msg"),
     selection: byId("selection"),
     instructions: byId("instructions"),
+    notice: byId("notice"),
     // Unlike byId, absence is a legal answer here: a dropped candidate must
     // leave no element behind.
     findId(id) {
@@ -554,4 +560,47 @@ test("an interrupted capture stays visible and can be retried", async () => {
   assert.match(ui.error.textContent, /changed during capture/i);
   assert.match(ui.error.textContent, /confirm again/i);
   assert.equal(ui.toolbar.style.display, "flex", "the existing selection remains available to retry");
+});
+
+// =============================================================================
+// Issue #14 — the selector can be reached because the automatic logo search ran
+// past the point where waiting for it still beat drawing the box by hand. That
+// is a fallback, not a failure: it is explained in its own notice, never in the
+// red failure strip, and the overlay behaves exactly as it does when the user
+// asked for it.
+// =============================================================================
+
+test("a timed-out logo search explains itself as a notice, not as an error", () => {
+  const ui = loadSelector({ candidates: [], notice: "logo_search_timeout" });
+
+  assert.equal(
+    ui.notice.textContent,
+    "The logo detection took too long, please select the logo manually"
+  );
+  assert.equal(ui.notice.style.display, "block");
+  assert.notEqual(ui.error.style.display, "block", "nothing failed, so no failure is shown");
+  assert.equal(ui.instructions.textContent, "Draw a rectangle around the logo for example.test");
+});
+
+test("a selector opened normally shows no notice", () => {
+  const ui = loadSelector();
+
+  assert.equal(ui.notice.textContent, "");
+  assert.notEqual(ui.notice.style.display, "block");
+});
+
+test("an unrecognized notice code renders nothing", () => {
+  const ui = loadSelector({ notice: "something-else" });
+
+  assert.equal(ui.notice.textContent, "");
+  assert.notEqual(ui.notice.style.display, "block");
+});
+
+test("the notice steps aside once the user has drawn", () => {
+  const ui = loadSelector({ candidates: [], notice: "logo_search_timeout" });
+
+  ui.drawSelection();
+
+  assert.equal(ui.notice.style.display, "none");
+  assert.equal(ui.confirm.disabled, false, "confirming a hand-drawn box is unaffected");
 });

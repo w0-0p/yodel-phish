@@ -3,7 +3,7 @@
 // queue, timeouts, and cancellation.
 //
 // A small, dependency-free scheduler that serializes access to a shared,
-// expensive resource (the offscreen document's OpenCV/OCR/ONNX runtime) behind
+// expensive resource (the inference Worker's OpenCV/OCR/ONNX runtime) behind
 // a documented concurrency limit, a bounded queue, and per-request timeouts.
 // It has no chrome.* dependency so it can run and be unit-tested under plain
 // Node — all browser-specific behavior (creating/recycling the offscreen
@@ -11,9 +11,9 @@
 // caller via the `run` function passed to schedule() and the `onTimeout` hook.
 //
 // Model:
-//   - Work is submitted as schedule(key, run, { requestTimeoutMs }). `key` is
-//     whatever the caller considers "the same slot" (this extension uses the
-//     tabId, since at most one job may be current per tab).
+//   - Work is submitted as schedule(key, run, { requestTimeoutMs, cancelRun }).
+//     `key` is whatever the caller considers "the same slot" (this extension
+//     uses the tabId, since at most one job may be current per tab).
 //   - A new call under a key already queued or running SUPERSEDES the old
 //     ticket: if it was still queued, it is removed before it ever starts; if
 //     it was already running, only its caller-facing promise is rejected —
@@ -24,7 +24,8 @@
 //     settling, never to when the caller-facing promise settles. This means
 //     the scheduler never believes a resource is free while it is still
 //     actually busy, even after a caller has been rejected early (timeout or
-//     supersession).
+//     supersession). Explicit cancellation/timeout may additionally stop the
+//     real task when its ticket supplied the optional cancelRun hook.
 //   - Capacity is counted in distinct keys currently queued+running;
 //     superseding an existing key never consumes extra capacity.
 // =============================================================================
@@ -68,7 +69,7 @@ export class OffscreenQueue {
    * early with a SchedulerError on supersession, overload, or timeout. Never
    * throws synchronously.
    */
-  schedule(key, run, { requestTimeoutMs, ticketId } = {}) {
+  schedule(key, run, { requestTimeoutMs, ticketId, cancelRun } = {}) {
     const queuedIndex = this.#queue.findIndex((ticket) => ticket.key === key);
     let supersededQueued = null;
     if (queuedIndex !== -1) {
@@ -88,10 +89,12 @@ export class OffscreenQueue {
         key,
         ticketId,
         run,
+        cancelRun,
         requestTimeoutMs,
         resolveCaller: resolve,
         rejectCaller: reject,
         callerSettled: false,
+        realRunCancelled: false,
         queuedAt: Date.now(),
         queueTimeoutHandle: undefined,
       };
@@ -145,6 +148,7 @@ export class OffscreenQueue {
 
     const runningTicket = this.#runningByKey.get(key);
     if (runningTicket !== undefined && matches(runningTicket)) {
+      this.#cancelRealRun(runningTicket, reason);
       this.#settleCaller(runningTicket, new SchedulerError("cancelled", reason));
       running = true;
     }
@@ -188,7 +192,12 @@ export class OffscreenQueue {
       racers.push(
         new Promise((_resolve, reject) => {
           timeoutHandle = setTimeout(() => {
-            reject(new SchedulerError("request_timeout", `Offscreen request timed out after ${ticket.requestTimeoutMs}ms`));
+            const error = new SchedulerError("request_timeout", `Offscreen request timed out after ${ticket.requestTimeoutMs}ms`);
+            reject(error);
+            // Queue the public timeout rejection before cancelRun synchronously
+            // rejects the underlying Worker RPC. Otherwise the termination error
+            // can win Promise.race() and hide the stable request_timeout code.
+            ticket.realRunCancelled = this.#cancelRealRun(ticket, error.message);
           }, ticket.requestTimeoutMs);
         })
       );
@@ -198,7 +207,7 @@ export class OffscreenQueue {
       (value) => this.#settleCaller(ticket, undefined, value),
       async (error) => {
         this.#settleCaller(ticket, error);
-        if (error instanceof SchedulerError && error.code === "request_timeout") {
+        if (error instanceof SchedulerError && error.code === "request_timeout" && !ticket.realRunCancelled) {
           await this.#safeOnTimeout(ticket);
         }
       }
@@ -221,6 +230,21 @@ export class OffscreenQueue {
     ticket.callerSettled = true;
     if (error !== undefined) ticket.rejectCaller(error);
     else ticket.resolveCaller(value);
+  }
+
+  // Most scheduler tasks cannot be interrupted safely, so cancelRun is
+  // deliberately opt-in. The inference runtime supplies it because that work
+  // lives in a dedicated Worker: terminating the Worker rejects the real
+  // run() promise as well as its caller-facing promise, which means the global
+  // slot is released only after the resource has genuinely stopped.
+  #cancelRealRun(ticket, reason) {
+    if (typeof ticket.cancelRun !== "function") return false;
+    try {
+      return ticket.cancelRun(reason) === true;
+    } catch (error) {
+      console.error("[OffscreenQueue] cancelRun hook failed:", error);
+      return false;
+    }
   }
 
   #distinctKeyCount() {

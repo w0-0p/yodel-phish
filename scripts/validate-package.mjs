@@ -58,6 +58,7 @@ for (const required of [
   "manifest.json",
   "dist/service_worker.js",
   "dist/offscreen.js",
+  "dist/inference_worker.js",
   "models/dinov2_vits14.onnx",
   "models/dinov2_vits14_config.json",
   "models/yolo-logo.onnx",
@@ -106,4 +107,3 @@ if (!sourceConfig.equals(packagedConfig)) throw new Error("Packaged DINO config 
 let totalBytes = 0;
 for (const relative of files) totalBytes += (await stat(path.join(buildRoot, relative))).size;
 console.log(`Validated ${files.size} packaged files (${(totalBytes / 1024 / 1024).toFixed(1)} MiB)`);
-
