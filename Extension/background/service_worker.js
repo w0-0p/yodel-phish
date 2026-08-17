@@ -68,6 +68,14 @@ import {
   repairTrustedMutedLists,
   variantRecency,
 } from "./storageQueues.mjs";
+import {
+  addTrustedGroupDestination,
+  isValidTrustedGroupId,
+  normalizeTrustedGroupName,
+  removeTrustedGroupDestination,
+  renameTrustedGroup,
+  repairTrustedGroups,
+} from "./trustedGroups.mjs";
 
 const OFFSCREEN_TARGET = "yodel-offscreen";
 const CLICKFIX_CLIPBOARD_TARGET = "yodel-clickfix-clipboard";
@@ -123,6 +131,9 @@ const SETTINGS_MESSAGE_TYPES = new Set([
   "add_manual_site",
   "edit_manual_site",
   "remove_manual_site",
+  "rename_trusted_group",
+  "remove_trusted_group_destination",
+  "add_manual_trusted_group_destination",
   "set_developer_mode",
   "set_device_code_auth",
   "reset_advanced_settings",
@@ -1191,7 +1202,7 @@ function touchTrustedEntry(entry) {
 
 const withTrustedMuted = createStorageDomain({
   storageArea: trustedLocalStorage,
-  keys: ["trusted_list", "muted_list"],
+  keys: ["trusted_list", "muted_list", "trusted_groups"],
   load(data) {
     // Issue #12: every read repairs the stored invariants (drop invalid
     // entries, backfill variant ids and storage revisions, collapse duplicate
@@ -1202,12 +1213,33 @@ const withTrustedMuted = createStorageDomain({
     const { trusted_list, muted_list, changed } = repairTrustedMutedLists(data, {
       newId: newStorageRevision,
     });
-    return { state: { trusted_list, muted_list }, dirty: changed };
+    // Issue #19: trusted_groups belongs to this same consistency domain. A
+    // missing key loads as an empty list; malformed, duplicate, dangling,
+    // inconsistent, or under-two-member group state fails closed (membership
+    // cleared, origins kept trusted) — never inferred or auto-grouped.
+    const groups = repairTrustedGroups({ trusted_groups: data.trusted_groups, trusted_list, muted_list });
+    return {
+      state: {
+        trusted_list: groups.trusted_list,
+        muted_list: groups.muted_list,
+        trusted_groups: groups.trusted_groups,
+      },
+      dirty: changed || groups.changed,
+    };
   },
-  persist: (state) => ({
-    trusted_list: state.trusted_list.map(removeStoredScreenshot),
-    muted_list: state.muted_list,
-  }),
+  persist(state) {
+    // The group invariants are re-asserted on the way out too: any mutation
+    // that removes or moves trusted entries (remove, mute, manual edit,
+    // reset, variant removal) dissolves the group it emptied in the same
+    // committed write, so no orphaned group or dangling trust_group_id ever
+    // waits for a later load to be repaired.
+    const groups = repairTrustedGroups(state);
+    return {
+      trusted_list: groups.trusted_list.map(removeStoredScreenshot),
+      muted_list: groups.muted_list,
+      trusted_groups: groups.trusted_groups,
+    };
+  },
 });
 
 function isValidClickfixDomain(value) {
@@ -3402,6 +3434,67 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       return { ok: true, listType, fqdn };
     }
 
+    // =========================================================================
+    // TRUSTED GROUP MANAGEMENT (issue #19) — settings-page only, gated via
+    // SETTINGS_MESSAGE_TYPES above. Groups are management metadata over exact
+    // trusted origins: every field below is treated as untrusted and
+    // re-validated here, every read-modify-write runs through the shared
+    // trusted/muted/group queue, and membership is never inferred from
+    // detection results. Responses stay small; storage change events drive the
+    // authoritative UI refresh.
+    // =========================================================================
+
+    case "rename_trusted_group": {
+      if (!isValidTrustedGroupId(message.groupId)) return invalidSettingsRequest("invalid_group");
+      const name = normalizeTrustedGroupName(message.name);
+      if (name === null) return invalidSettingsRequest("invalid_group_name");
+      const status = await withTrustedMuted((state) => {
+        const outcome = renameTrustedGroup(state, { groupId: message.groupId, name });
+        return { value: outcome.status, changed: outcome.changed };
+      });
+      if (status !== "saved") return invalidSettingsRequest(status);
+      return { ok: true, groupId: message.groupId, name };
+    }
+
+    case "remove_trusted_group_destination": {
+      const fqdn = typeof message.hostname === "string" ? normalizeFqdn(message.hostname) : null;
+      if (!isValidTrustedGroupId(message.groupId) || fqdn === null) return invalidSettingsRequest();
+      // The helper verifies the origin's membership in exactly this group
+      // against current storage — a stale group/hostname pairing from the UI
+      // is not_found, never a removal of something else.
+      const status = await withTrustedMuted((state) => {
+        const outcome = removeTrustedGroupDestination(state, {
+          groupId: message.groupId,
+          fqdn,
+          newId: newStorageRevision,
+        });
+        return { value: outcome.status, changed: outcome.changed };
+      });
+      if (status !== "saved") return invalidSettingsRequest(status);
+      return { ok: true, groupId: message.groupId, fqdn };
+    }
+
+    case "add_manual_trusted_group_destination": {
+      const fqdn = typeof message.hostname === "string" ? normalizeFqdn(message.hostname) : null;
+      if (fqdn === null) return invalidSettingsRequest("invalid_hostname");
+      if (!isValidTrustedGroupId(message.groupId)) return invalidSettingsRequest("invalid_group");
+      // The exact derivation checkOrigin applies to a visited page, like the
+      // manual add above: group destinations are exact https origins.
+      const origin = parseOrigin(`https://${fqdn}`);
+      if (origin === null) return invalidSettingsRequest("invalid_hostname");
+      const status = await withTrustedMuted((state) => {
+        const outcome = addTrustedGroupDestination(state, {
+          groupId: message.groupId,
+          origin,
+          timestamp: new Date().toISOString(),
+          newId: newStorageRevision,
+        });
+        return { value: outcome.status, changed: outcome.changed };
+      });
+      if (status !== "saved") return invalidSettingsRequest(status);
+      return { ok: true, groupId: message.groupId, fqdn };
+    }
+
     case "set_developer_mode": {
       if (typeof message.enabled !== "boolean") return invalidSettingsRequest();
       // Every dev-gated choice weakens protection, so none of them may stay
@@ -4058,6 +4151,13 @@ async function refreshTrustedEntry(fqdn, result, tabId, job) {
       // A manually added hostname's provenance (issue #93) spans every variant,
       // so a drift capture never hides the entry from Reset to defaults.
       ...(template.manual_entry === true ? { manual_entry: true } : {}),
+      // Trusted-group membership (issue #19) spans every variant of one exact
+      // origin too: a drift capture that dropped it would fail the shared-
+      // membership invariant closed and silently ungroup the origin.
+      ...(typeof template.trust_group_id === "string" ? {
+        trust_group_id: template.trust_group_id,
+        ...(template.trust_group_manual === true ? { trust_group_manual: true } : {}),
+      } : {}),
     };
 
     if (variants.length < MAX_TRUSTED_VARIANTS_PER_FQDN) {

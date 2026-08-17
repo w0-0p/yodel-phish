@@ -4,10 +4,11 @@
 
 let developerMode = false;
 
-const RENDERED_KEYS = ["trusted_list", "muted_list", "settings", "analysis_history"];
+const RENDERED_KEYS = ["trusted_list", "muted_list", "trusted_groups", "settings", "analysis_history"];
 const renderedState = {
   trusted_list: [],
   muted_list: [],
+  trusted_groups: [],
   settings: {},
   analysis_history: [],
 };
@@ -20,6 +21,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadAndRender();
   setupDeveloperModeToggle();
   setupManualSiteControls();
+  setupTrustedGroupControls();
   setupDeviceCodeAuthControls();
   setupResetDefaultsControl();
   setupBannerFontSizeControls();
@@ -74,6 +76,7 @@ function refreshFromStorage() {
 function normalizedStateValue(key, value) {
   if (key === "settings") return asObject(value);
   if (key === "trusted_list" || key === "muted_list") return asEntryList(value);
+  if (key === "trusted_groups") return asGroupList(value);
   return asArray(value);
 }
 
@@ -93,7 +96,7 @@ function applyStoredState(state) {
   });
 
   if (changed.has("settings")) applySettings(renderedState.settings);
-  if (changed.has("trusted_list") || changed.has("settings")) {
+  if (changed.has("trusted_list") || changed.has("settings") || changed.has("trusted_groups")) {
     renderList("trusted-list", renderedState.trusted_list, "trusted");
   }
   if (changed.has("muted_list") || changed.has("settings")) {
@@ -101,6 +104,9 @@ function applyStoredState(state) {
   }
   if (changed.has("trusted_list") || changed.has("muted_list")) {
     renderManualSites();
+  }
+  if (changed.has("trusted_groups")) {
+    renderTrustedGroupControls();
   }
   if (changed.has("analysis_history") || changed.has("settings")) {
     renderAnalysisHistory(renderedState.analysis_history);
@@ -167,6 +173,16 @@ function asEntryList(value) {
   );
 }
 
+// Only group records the page can act on: the id keys every mutation request
+// and the name is what the user sees (issue #19).
+function asGroupList(value) {
+  return asArray(value).filter(
+    (group) => group !== null && typeof group === "object" && !Array.isArray(group) &&
+      typeof group.id === "string" && group.id.length > 0 &&
+      typeof group.name === "string" && group.name.trim().length > 0
+  );
+}
+
 function applySettings(settings) {
   developerMode = settings.developer_mode === true;
 
@@ -174,6 +190,9 @@ function applySettings(settings) {
   // Hiding the manual add/edit controls never deactivates the entries they
   // created (issue #93): those stay on the normal Trusted/Muted lists.
   document.getElementById("manual-sites-section").hidden = !developerMode;
+  // The group-destination form follows developer mode the same way; the groups
+  // themselves stay visible on the Trusted Sites tab (issue #19).
+  document.getElementById("trusted-group-section").hidden = !developerMode;
   // ClickFix warn mode and device-code endpoints are technical-user controls;
   // both stay hidden until Developer mode is enabled (issue #3).
   document.getElementById("clickfix-warn-mode-row").hidden = !developerMode;
@@ -197,9 +216,32 @@ function renderList(containerId, entries, type) {
     return;
   }
 
+  // Trusted-group members (issue #19) render together, ahead of the ungrouped
+  // sites. An entry referencing an unknown group renders as ungrouped rather
+  // than disappearing; the worker's repair clears such references.
+  let ungrouped = entries;
+  if (type === "trusted") {
+    const groups = renderedState.trusted_groups;
+    const groupIds = new Set(groups.map((group) => group.id));
+    const membersByGroup = new Map();
+    ungrouped = [];
+    entries.forEach((entry) => {
+      if (typeof entry.trust_group_id === "string" && groupIds.has(entry.trust_group_id)) {
+        if (!membersByGroup.has(entry.trust_group_id)) membersByGroup.set(entry.trust_group_id, []);
+        membersByGroup.get(entry.trust_group_id).push(entry);
+      } else {
+        ungrouped.push(entry);
+      }
+    });
+    groups.forEach((group) => {
+      const members = membersByGroup.get(group.id);
+      if (members !== undefined) container.appendChild(buildTrustedGroupSection(group, members));
+    });
+  }
+
   // A trusted fqdn may have up to 2 stored reference variants (see [B.2] in
   // REVIEW_FINDINGS.md) — group them visually so they read as one site.
-  groupByFqdn(entries).forEach((group) => {
+  groupByFqdn(ungrouped).forEach((group) => {
     if (group.length > 1) {
       const wrapper = element("div", "entry-group");
       wrapper.appendChild(element("p", "entry-group-label", `${group.length} saved references for this site`));
@@ -306,6 +348,149 @@ function buildEntryCard(entry, type) {
   });
 
   return card;
+}
+
+// =============================================================================
+// TRUSTED GROUPS (issue #19) — grouped origins render together on the Trusted
+// Sites tab: a shared, editable name, every member origin's saved references,
+// and one removal action per exact member origin. All mutations go through the
+// service worker; storage change events re-render this section afterwards.
+// =============================================================================
+
+// In-flight guards survive the re-renders storage events trigger, so a second
+// click can never double-send while a mutation is pending.
+const trustedGroupRenamePending = new Set();
+const trustedGroupRemovalPending = new Set();
+
+function buildTrustedGroupSection(group, entries) {
+  const section = element("div", "trusted-group");
+  section.dataset.groupId = group.id;
+
+  const header = element("div", "trusted-group-header");
+  const nameEl = element("span", "trusted-group-name", group.name);
+  const editButton = element("button", "btn-secondary trusted-group-edit-name", "Edit name");
+  header.append(nameEl, editButton);
+
+  const editRow = element("div", "word-input-row trusted-group-edit");
+  editRow.hidden = true;
+  const nameInput = element("input", "word-input trusted-group-name-input");
+  nameInput.value = group.name;
+  const saveButton = element("button", "btn-add-word trusted-group-save-name", "Save");
+  const cancelButton = element("button", "btn-secondary trusted-group-cancel-name", "Cancel");
+  editRow.append(nameInput, saveButton, cancelButton);
+
+  const errorEl = element("p", "clickfix-error trusted-group-name-error");
+  errorEl.hidden = true;
+
+  editButton.addEventListener("click", () => {
+    nameInput.value = group.name;
+    errorEl.hidden = true;
+    editRow.hidden = false;
+    editButton.hidden = true;
+    nameInput.focus();
+  });
+  cancelButton.addEventListener("click", () => {
+    if (trustedGroupRenamePending.has(group.id)) return;
+    errorEl.hidden = true;
+    editRow.hidden = true;
+    editButton.hidden = false;
+    nameInput.value = group.name;
+  });
+  saveButton.addEventListener("click", async () => {
+    if (trustedGroupRenamePending.has(group.id)) return;
+    const name = nameInput.value.trim();
+    if (name.length === 0 || name.length > 80) {
+      errorEl.textContent = trustedGroupErrorMessage("invalid_group_name");
+      errorEl.hidden = false;
+      return;
+    }
+    trustedGroupRenamePending.add(group.id);
+    nameInput.disabled = true;
+    saveButton.disabled = true;
+    cancelButton.disabled = true;
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "rename_trusted_group", groupId: group.id, name });
+      if (response?.ok === true) {
+        // The committed name lands through storage.onChanged, which re-renders
+        // this section on every open settings page. Until then the displayed
+        // name stays what storage still holds.
+        errorEl.hidden = true;
+      } else {
+        errorEl.textContent = trustedGroupErrorMessage(response?.code);
+        errorEl.hidden = false;
+      }
+    } catch {
+      errorEl.textContent = trustedGroupErrorMessage("unavailable");
+      errorEl.hidden = false;
+    } finally {
+      trustedGroupRenamePending.delete(group.id);
+      nameInput.disabled = false;
+      saveButton.disabled = false;
+      cancelButton.disabled = false;
+    }
+  });
+  nameInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") saveButton.click();
+  });
+
+  const members = element("div", "trusted-group-members");
+  groupByFqdn(entries).forEach((variants) => {
+    const fqdn = variants[0].fqdn;
+    const member = element("div", "trusted-group-member");
+    member.dataset.fqdn = fqdn;
+    if (variants.length > 1) {
+      member.appendChild(element("p", "entry-group-label", `${variants.length} saved references for this site`));
+    }
+    variants.forEach((entry) => {
+      const card = buildEntryCard(entry, "trusted");
+      // One removal action per exact member origin, not one per variant: the
+      // per-variant Remove stays hidden inside a group.
+      const cardRemove = card.querySelector(".btn-remove");
+      if (cardRemove) cardRemove.hidden = true;
+      member.appendChild(card);
+    });
+    const removeButton = element("button", "btn-remove-destination", "Remove destination");
+    removeButton.addEventListener("click", async () => {
+      if (trustedGroupRemovalPending.has(group.id)) return;
+      const confirmed = confirm(
+        `Remove ${fqdn} from “${group.name}”? The origin and all its saved references ` +
+        "will be removed from Trusted Sites."
+      );
+      if (!confirmed) return;
+      trustedGroupRemovalPending.add(group.id);
+      removeButton.disabled = true;
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: "remove_trusted_group_destination",
+          groupId: group.id,
+          hostname: fqdn,
+        });
+        if (response?.ok !== true) await loadAndRender();
+      } catch {
+        await loadAndRender();
+      } finally {
+        trustedGroupRemovalPending.delete(group.id);
+        removeButton.disabled = false;
+      }
+    });
+    member.appendChild(removeButton);
+    members.appendChild(member);
+  });
+
+  section.append(header, editRow, errorEl, members);
+  return section;
+}
+
+function trustedGroupErrorMessage(code) {
+  if (code === "invalid_group" || code === "not_found") return "This group no longer exists.";
+  if (code === "invalid_group_name") return "Enter a group name of at most 80 characters.";
+  if (code === "duplicate_group_name") return "Another group already uses this name.";
+  if (code === "already_in_group") return "This destination is already in this group.";
+  if (code === "already_in_other_group") return "This destination already belongs to another trusted group.";
+  if (code === "group_full") return "This group has reached its maximum number of destinations.";
+  if (code === "too_many_sites") return "You have reached the maximum number of manually added sites.";
+  if (code === "unavailable") return "The extension could not update this group. Please try again.";
+  return "Enter an exact hostname (e.g. login.example.com) — no scheme, path, port, or wildcard.";
 }
 
 // =============================================================================
@@ -656,7 +841,13 @@ function manualSiteFqdns(listType) {
   const fqdns = [];
   const seen = new Set();
   entries.forEach((entry) => {
-    if (entry.manual_entry !== true || seen.has(entry.fqdn)) return;
+    // A manually created trusted destination that belongs to a group is
+    // managed from that group's card on the Trusted Sites tab. Hiding it here
+    // avoids a second generic Edit/Remove path that could silently alter or
+    // dissolve the group without naming that consequence.
+    if (entry.manual_entry !== true ||
+        (listType === "trusted" && typeof entry.trust_group_id === "string") ||
+        seen.has(entry.fqdn)) return;
     seen.add(entry.fqdn);
     fqdns.push(entry.fqdn);
   });
@@ -817,6 +1008,108 @@ function setupManualSiteControls() {
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") addButton.click();
     });
+  });
+}
+
+// =============================================================================
+// ADD DESTINATION TO TRUSTED GROUP (issue #19) — Advanced Settings. Like the
+// manual Trusted/Muted controls: exact hostnames only, normalized locally so
+// the confirmation names what will be stored, re-validated independently by
+// the worker, single-flight while a request is pending.
+// =============================================================================
+
+let trustedGroupAddPending = false;
+
+function trustedGroupControlElements() {
+  return {
+    select: document.getElementById("trusted-group-select"),
+    input: document.getElementById("trusted-group-destination-input"),
+    addButton: document.getElementById("trusted-group-add"),
+    emptyEl: document.getElementById("trusted-group-empty"),
+    errorEl: document.getElementById("trusted-group-error"),
+  };
+}
+
+// Re-rendered whenever trusted_groups changes: option values are group ids,
+// labels are group names, and the current selection survives as long as its
+// group still exists. Without any group the whole form is disabled behind an
+// explanatory empty state — groups are created by linking two trusted sign-in
+// origins, not from this form.
+function renderTrustedGroupControls() {
+  const { select, input, addButton, emptyEl } = trustedGroupControlElements();
+  const groups = renderedState.trusted_groups;
+  const previous = select.value;
+  select.innerHTML = "";
+  groups.forEach((group) => {
+    const option = document.createElement("option");
+    option.value = group.id;
+    option.textContent = group.name;
+    select.appendChild(option);
+  });
+  select.value = groups.some((group) => group.id === previous) ? previous : (groups[0]?.id ?? "");
+  const hasGroups = groups.length > 0;
+  emptyEl.hidden = hasGroups;
+  select.disabled = !hasGroups || trustedGroupAddPending;
+  input.disabled = !hasGroups || trustedGroupAddPending;
+  addButton.disabled = !hasGroups || trustedGroupAddPending;
+}
+
+async function submitTrustedGroupDestination() {
+  if (trustedGroupAddPending) return;
+  const { select, input, addButton, errorEl } = trustedGroupControlElements();
+  const group = renderedState.trusted_groups.find((candidate) => candidate.id === select.value);
+  if (group === undefined) {
+    errorEl.textContent = trustedGroupErrorMessage("invalid_group");
+    errorEl.hidden = false;
+    return;
+  }
+  const hostname = normalizeManualSiteHostname(input.value);
+  if (hostname === null) {
+    errorEl.textContent = trustedGroupErrorMessage("invalid_hostname");
+    errorEl.hidden = false;
+    return;
+  }
+  // Adding a destination weakens protection, so it is confirmed like every
+  // other protection-reducing action (issue #82): the dialog names the exact
+  // origin, the group, and the limits of what becomes trusted.
+  const confirmed = confirm(
+    `Add https://${hostname} to “${group.name}”? This exact origin will be treated as trusted. ` +
+    "Subdomains, paths on other origins, and sibling domains are not included."
+  );
+  if (!confirmed) return;
+  trustedGroupAddPending = true;
+  select.disabled = true;
+  input.disabled = true;
+  addButton.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "add_manual_trusted_group_destination",
+      groupId: group.id,
+      hostname,
+    });
+    if (response?.ok === true) {
+      errorEl.hidden = true;
+      input.value = "";
+      // The new membership arrives through storage.onChanged, which re-renders
+      // the Trusted Sites tab and this form's dropdown.
+    } else {
+      errorEl.textContent = trustedGroupErrorMessage(response?.code);
+      errorEl.hidden = false;
+    }
+  } catch {
+    errorEl.textContent = trustedGroupErrorMessage("unavailable");
+    errorEl.hidden = false;
+  } finally {
+    trustedGroupAddPending = false;
+    renderTrustedGroupControls();
+  }
+}
+
+function setupTrustedGroupControls() {
+  const { input, addButton } = trustedGroupControlElements();
+  addButton.addEventListener("click", () => submitTrustedGroupDestination());
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addButton.click();
   });
 }
 

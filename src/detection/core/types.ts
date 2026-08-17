@@ -23,6 +23,12 @@ export interface TrustedEntry {
   fqdn: string;
   etld1?: string;
   protocol?: string;
+  /**
+   * Trusted-group membership (issue #19): management metadata copied verbatim
+   * from the stored trusted entry. It never participates in matching and must
+   * never be populated from a visual result.
+   */
+  trustGroupId?: string;
   sourceImage?: ImageRef;
   ocrDomain: string;
   ocrLabels: string[];

@@ -402,6 +402,17 @@ export function applyManualLogoSelection(state, {
   delete movedBase.muted_until;
   delete movedBase.needs_reference_capture;
   const previousVariants = state.trusted_list.filter((item) => item.fqdn === addition.origin.fqdn);
+  // Issue #19: every visual variant of one exact origin carries the same
+  // trusted-group membership, so a variant appended next to grouped siblings
+  // inherits theirs. (A muted source can never be grouped, so movedBase never
+  // conflicts with this.)
+  const groupTemplate = previousVariants[0];
+  const groupFields = typeof groupTemplate?.trust_group_id === "string"
+    ? {
+      trust_group_id: groupTemplate.trust_group_id,
+      ...(groupTemplate.trust_group_manual === true ? { trust_group_manual: true } : {}),
+    }
+    : {};
   const trustedList = enforceTrustedVariantCap([
     ...state.trusted_list,
     {
@@ -413,6 +424,7 @@ export function applyManualLogoSelection(state, {
       etld1: addition.origin.etld1,
       protocol: addition.origin.protocol,
       ...(addition.origin.sourceUrl === undefined ? {} : { source_url: addition.origin.sourceUrl }),
+      ...groupFields,
       variant_id: addition.variantId,
       ocr_domain: addition.origin.ocrDomain,
       ...manualLogoFields(logo),

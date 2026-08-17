@@ -288,6 +288,12 @@ async function loadSettings({ stored = {}, deviceFlowBuiltins = [] } = {}) {
   addPageElement(document, "button", "manual-muted-add");
   addPageElement(document, "button", "manual-muted-cancel");
   addPageElement(document, "p", "manual-muted-error");
+  addPageElement(document, "div", "trusted-group-section");
+  addPageElement(document, "p", "trusted-group-empty");
+  addPageElement(document, "select", "trusted-group-select");
+  addPageElement(document, "input", "trusted-group-destination-input");
+  addPageElement(document, "button", "trusted-group-add");
+  addPageElement(document, "p", "trusted-group-error");
   addPageElement(document, "section", "analysis-history-section");
   addPageElement(document, "div", "analysis-history-list");
   addPageElement(document, "button", "export-analysis-history");
@@ -319,7 +325,7 @@ async function loadSettings({ stored = {}, deviceFlowBuiltins = [] } = {}) {
   addTemplate(document, "tpl-trusted-entry", TRUSTED_CARD_CLASSES);
   addTemplate(document, "tpl-muted-entry", MUTED_CARD_CLASSES);
 
-  const store = { trusted_list: [], muted_list: [], settings: {}, analysis_history: [], ...stored };
+  const store = { trusted_list: [], muted_list: [], trusted_groups: [], settings: {}, analysis_history: [], ...stored };
   const storageListeners = [];
   const runtimeListeners = [];
   const sentMessages = [];
@@ -981,6 +987,36 @@ test("only entries with manual provenance render in the manual lists, once per h
   assert.equal(page.card("manualmute.test", "muted-list")?.dataset.fqdn, "manualmute.test");
 });
 
+test("a grouped manual destination is managed only from its Trusted group", async () => {
+  const page = await loadSettings({
+    stored: {
+      settings: { developer_mode: true },
+      trusted_groups: [{ id: "group-1", name: "Microsoft sign-in" }],
+      trusted_list: [
+        trustedEntry({ fqdn: "source.test", variant_id: "source-1", trust_group_id: "group-1" }),
+        trustedEntry({
+          fqdn: "destination.test",
+          variant_id: "destination-1",
+          trust_group_id: "group-1",
+          trust_group_manual: true,
+          manual_entry: true,
+        }),
+        trustedEntry({ fqdn: "standalone.test", variant_id: "standalone-1", manual_entry: true }),
+      ],
+    },
+  });
+
+  const manualTags = page.document.getElementById("manual-trusted-list").querySelectorAll(".tag");
+  assert.equal(manualTags.length, 1);
+  assert.match(manualTags[0].textContent, /standalone\.test/);
+  assert.doesNotMatch(manualTags[0].textContent, /destination\.test/);
+
+  const groupedMember = groupSection(page).querySelectorAll(".trusted-group-member")
+    .find((member) => member.dataset.fqdn === "destination.test");
+  assert.ok(groupedMember, "the grouped destination stays manageable from the Trusted Sites group");
+  assert.equal(groupedMember.querySelectorAll(".btn-remove-destination").length, 1);
+});
+
 test("adding a manual trusted site confirms with the exact hostname before sending", async () => {
   const page = await loadSettings({ stored: { settings: { developer_mode: true } } });
   const confirmations = [];
@@ -1148,6 +1184,303 @@ test("a worker commit re-renders the manual lists from storage", async () => {
 });
 
 // =============================================================================
+// TRUSTED GROUPS (issue #19)
+// =============================================================================
+
+function groupedStore(extra = {}) {
+  return {
+    trusted_groups: [{ id: "group-1", name: "Microsoft sign-in" }],
+    trusted_list: [
+      trustedEntry({ fqdn: "login.microsoftonline.com", variant_id: "ms-1", trust_group_id: "group-1" }),
+      trustedEntry({ fqdn: "login.microsoftonline.com", variant_id: "ms-2", trust_group_id: "group-1" }),
+      trustedEntry({ fqdn: "login.live.com", variant_id: "live-1", trust_group_id: "group-1" }),
+      trustedEntry({ fqdn: "solo.test", variant_id: "solo-1" }),
+    ],
+    ...extra,
+  };
+}
+
+function groupSection(page, index = 0) {
+  return page.document.getElementById("trusted-list").querySelectorAll(".trusted-group")[index];
+}
+
+test("grouped origins render together, separately from ungrouped trusted sites", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+
+  const sections = page.document.getElementById("trusted-list").querySelectorAll(".trusted-group");
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].querySelector(".trusted-group-name").textContent, "Microsoft sign-in");
+
+  const members = sections[0].querySelectorAll(".trusted-group-member");
+  assert.deepEqual(members.map((member) => member.dataset.fqdn), ["login.microsoftonline.com", "login.live.com"]);
+  assert.equal(members[0].querySelectorAll(".entry-card").length, 2, "both variants render under one member origin");
+  assert.equal(members[0].querySelectorAll(".btn-remove-destination").length, 1, "one removal action per origin, not per variant");
+  members[0].querySelectorAll(".entry-card").forEach((card) => {
+    assert.equal(card.querySelector(".btn-remove").hidden, true, "the per-variant remove stays hidden inside a group");
+  });
+
+  // The ungrouped site keeps the current rendering, outside any group section.
+  const soloCard = page.card("solo.test");
+  assert.equal(soloCard?.dataset.fqdn, "solo.test");
+  assert.equal(sections[0].querySelectorAll(".entry-card").length, 3, "the ungrouped card is not inside the group");
+});
+
+test("an entry referencing an unknown group renders as ungrouped instead of disappearing", async () => {
+  const page = await loadSettings({
+    stored: {
+      trusted_groups: [],
+      trusted_list: [trustedEntry({ fqdn: "dangling.test", trust_group_id: "gone" })],
+    },
+  });
+
+  assert.equal(page.document.getElementById("trusted-list").querySelectorAll(".trusted-group").length, 0);
+  assert.equal(page.card("dangling.test")?.dataset.fqdn, "dangling.test");
+});
+
+test("editing a group name sends the trimmed rename and disables the controls while pending", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+  let release;
+  page.setSendMessageBehavior("rename_trusted_group", () => new Promise((resolve) => { release = resolve; }));
+
+  const section = groupSection(page);
+  await section.querySelector(".trusted-group-edit-name").fire("click");
+  assert.equal(section.querySelector(".trusted-group-edit").hidden, false);
+  const input = section.querySelector(".trusted-group-name-input");
+  assert.equal(input.value, "Microsoft sign-in", "the edit starts from the current name");
+
+  input.value = "  Microsoft login  ";
+  const save = section.querySelector(".trusted-group-save-name").fire("click");
+  assert.equal(input.disabled, true);
+  assert.equal(section.querySelector(".trusted-group-save-name").disabled, true);
+  assert.equal(section.querySelector(".trusted-group-cancel-name").disabled, true);
+
+  await section.querySelector(".trusted-group-save-name").fire("click");
+  assert.equal(page.sentMessages.filter((message) => message.type === "rename_trusted_group").length, 1,
+    "a pending rename is single-flight");
+
+  release({ ok: true, groupId: "group-1", name: "Microsoft login" });
+  await save;
+  const sent = page.lastMessageOfType("rename_trusted_group");
+  assert.equal(sent?.groupId, "group-1");
+  assert.equal(sent?.name, "Microsoft login");
+
+  // The displayed name only changes once the worker's commit lands.
+  assert.equal(section.querySelector(".trusted-group-name").textContent, "Microsoft sign-in");
+  page.store.trusted_groups = [{ id: "group-1", name: "Microsoft login" }];
+  await page.commit(["trusted_groups"]);
+  assert.equal(groupSection(page).querySelector(".trusted-group-name").textContent, "Microsoft login");
+});
+
+test("a failed rename keeps the original name and shows the error", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+  page.setSendMessageBehavior("rename_trusted_group", () => ({ ok: false, code: "duplicate_group_name" }));
+
+  const section = groupSection(page);
+  await section.querySelector(".trusted-group-edit-name").fire("click");
+  section.querySelector(".trusted-group-name-input").value = "Taken";
+  await section.querySelector(".trusted-group-save-name").fire("click");
+  await page.settle();
+
+  assert.equal(section.querySelector(".trusted-group-name").textContent, "Microsoft sign-in");
+  const errorEl = section.querySelector(".trusted-group-name-error");
+  assert.equal(errorEl.hidden, false);
+  assert.match(errorEl.textContent, /already uses this name/);
+  assert.equal(section.querySelector(".trusted-group-save-name").disabled, false, "the controls recover for a retry");
+
+  // An empty name is rejected before any message leaves the page.
+  const sentBefore = page.sentMessages.length;
+  section.querySelector(".trusted-group-name-input").value = "   ";
+  await section.querySelector(".trusted-group-save-name").fire("click");
+  assert.equal(page.sentMessages.length, sentBefore);
+  assert.match(errorEl.textContent, /group name/);
+});
+
+test("cancelling a group-name edit restores the display without sending anything", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+
+  const section = groupSection(page);
+  await section.querySelector(".trusted-group-edit-name").fire("click");
+  section.querySelector(".trusted-group-name-input").value = "Changed but abandoned";
+  await section.querySelector(".trusted-group-cancel-name").fire("click");
+
+  assert.equal(section.querySelector(".trusted-group-edit").hidden, true);
+  assert.equal(section.querySelector(".trusted-group-edit-name").hidden, false);
+  assert.equal(section.querySelector(".trusted-group-name-input").value, "Microsoft sign-in");
+  assert.equal(page.lastMessageOfType("rename_trusted_group"), undefined);
+});
+
+test("removing a destination confirms with the group and exact hostname before sending", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+  const confirmations = [];
+  global.confirm = (text) => {
+    confirmations.push(text);
+    return true;
+  };
+
+  const members = groupSection(page).querySelectorAll(".trusted-group-member");
+  const liveMember = members.find((member) => member.dataset.fqdn === "login.live.com");
+  await liveMember.querySelector(".btn-remove-destination").fire("click");
+  await page.settle();
+
+  assert.match(confirmations[0], /login\.live\.com/);
+  assert.match(confirmations[0], /Microsoft sign-in/);
+  assert.match(confirmations[0], /all its saved references will be removed/);
+  const sent = page.lastMessageOfType("remove_trusted_group_destination");
+  assert.equal(sent?.groupId, "group-1");
+  assert.equal(sent?.hostname, "login.live.com");
+});
+
+test("declining the destination removal sends nothing", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+  global.confirm = () => false;
+
+  await groupSection(page).querySelector(".btn-remove-destination").fire("click");
+  await page.settle();
+
+  assert.equal(page.lastMessageOfType("remove_trusted_group_destination"), undefined);
+});
+
+test("a dissolved group committed elsewhere re-renders its member as ungrouped", async () => {
+  const page = await loadSettings({ stored: groupedStore() });
+  assert.equal(page.document.getElementById("trusted-list").querySelectorAll(".trusted-group").length, 1);
+
+  // The worker removed login.live.com, dissolved the group, and cleared the
+  // remaining member's id — this page only sees the storage events.
+  page.store.trusted_groups = [];
+  page.store.trusted_list = [
+    trustedEntry({ fqdn: "login.microsoftonline.com", variant_id: "ms-1" }),
+    trustedEntry({ fqdn: "login.microsoftonline.com", variant_id: "ms-2" }),
+    trustedEntry({ fqdn: "solo.test", variant_id: "solo-1" }),
+  ];
+  await page.commit(["trusted_list", "trusted_groups"]);
+
+  assert.equal(page.document.getElementById("trusted-list").querySelectorAll(".trusted-group").length, 0);
+  assert.equal(page.card("login.microsoftonline.com")?.dataset.fqdn, "login.microsoftonline.com");
+});
+
+test("the Advanced group form lists current groups and follows developer mode", async () => {
+  const page = await loadSettings({
+    stored: groupedStore({
+      trusted_groups: [
+        { id: "group-1", name: "Microsoft sign-in" },
+        { id: "group-2", name: "Other portal" },
+      ],
+      settings: { developer_mode: true },
+    }),
+  });
+
+  assert.equal(page.document.getElementById("trusted-group-section").hidden, false);
+  const select = page.document.getElementById("trusted-group-select");
+  assert.deepEqual(select.children.map((option) => option.value), ["group-1", "group-2"],
+    "option values are group ids");
+  assert.deepEqual(select.children.map((option) => option.textContent), ["Microsoft sign-in", "Other portal"],
+    "option labels are group names");
+  assert.equal(select.disabled, false);
+  assert.equal(page.document.getElementById("trusted-group-empty").hidden, true);
+
+  page.store.settings = {};
+  await page.commit(["settings"]);
+  assert.equal(page.document.getElementById("trusted-group-section").hidden, true,
+    "the form follows developer mode like the other advanced controls");
+});
+
+test("without any group the form is disabled behind an explanatory empty state", async () => {
+  const page = await loadSettings({ stored: { settings: { developer_mode: true } } });
+
+  assert.equal(page.document.getElementById("trusted-group-empty").hidden, false);
+  assert.equal(page.document.getElementById("trusted-group-select").disabled, true);
+  assert.equal(page.document.getElementById("trusted-group-destination-input").disabled, true);
+  assert.equal(page.document.getElementById("trusted-group-add").disabled, true);
+});
+
+test("a trusted_groups change re-renders the dropdown options", async () => {
+  const page = await loadSettings({ stored: groupedStore({ settings: { developer_mode: true } }) });
+  assert.deepEqual(page.document.getElementById("trusted-group-select").children.map((option) => option.value), ["group-1"]);
+
+  page.store.trusted_groups = [
+    { id: "group-1", name: "Renamed" },
+    { id: "group-2", name: "New group" },
+  ];
+  await page.commit(["trusted_groups"]);
+
+  const select = page.document.getElementById("trusted-group-select");
+  assert.deepEqual(select.children.map((option) => option.textContent), ["Renamed", "New group"]);
+  assert.equal(select.value, "group-1", "the selection survives while its group exists");
+});
+
+test("adding a group destination normalizes the input and confirms the exact https origin", async () => {
+  const page = await loadSettings({ stored: groupedStore({ settings: { developer_mode: true } }) });
+  const confirmations = [];
+  global.confirm = (text) => {
+    confirmations.push(text);
+    return true;
+  };
+
+  const input = page.document.getElementById("trusted-group-destination-input");
+  input.value = " Login.Example.COM. ";
+  await page.document.getElementById("trusted-group-add").fire("click");
+  await page.settle();
+
+  assert.match(confirmations[0], /https:\/\/login\.example\.com/);
+  assert.match(confirmations[0], /Microsoft sign-in/);
+  assert.match(confirmations[0], /Subdomains, paths on other origins, and sibling domains are not included/);
+  const sent = page.lastMessageOfType("add_manual_trusted_group_destination");
+  assert.equal(sent?.groupId, "group-1");
+  assert.equal(sent?.hostname, "login.example.com");
+  assert.equal(input.value, "", "the input clears after an accepted add");
+});
+
+test("invalid group-destination input is rejected before confirmation or messaging", async () => {
+  const page = await loadSettings({ stored: groupedStore({ settings: { developer_mode: true } }) });
+  let confirmations = 0;
+  global.confirm = () => { confirmations += 1; return true; };
+
+  const input = page.document.getElementById("trusted-group-destination-input");
+  input.value = "https://login.example.com/path";
+  await page.document.getElementById("trusted-group-add").fire("click");
+
+  assert.equal(confirmations, 0);
+  assert.equal(page.lastMessageOfType("add_manual_trusted_group_destination"), undefined);
+  const errorEl = page.document.getElementById("trusted-group-error");
+  assert.equal(errorEl.hidden, false);
+  assert.match(errorEl.textContent, /exact hostname/);
+  assert.equal(input.value, "https://login.example.com/path");
+
+  page.setSendMessageBehavior("add_manual_trusted_group_destination", () => ({ ok: false, code: "already_in_other_group" }));
+  input.value = "login.example.com";
+  await page.document.getElementById("trusted-group-add").fire("click");
+  assert.match(errorEl.textContent, /another trusted group/);
+  assert.equal(input.value, "login.example.com", "a rejected hostname stays for correction");
+});
+
+test("a group-destination add is single-flight and recovers from transport failure", async () => {
+  const page = await loadSettings({ stored: groupedStore({ settings: { developer_mode: true } }) });
+  global.confirm = () => true;
+  let release;
+  page.setSendMessageBehavior("add_manual_trusted_group_destination", () => new Promise((resolve) => { release = resolve; }));
+
+  const input = page.document.getElementById("trusted-group-destination-input");
+  const addButton = page.document.getElementById("trusted-group-add");
+  input.value = "one.example";
+  const first = addButton.fire("click");
+  assert.equal(addButton.disabled, true);
+  assert.equal(input.disabled, true);
+  assert.equal(page.document.getElementById("trusted-group-select").disabled, true);
+
+  await addButton.fire("click");
+  assert.equal(page.sentMessages.filter((message) => message.type === "add_manual_trusted_group_destination").length, 1);
+  release({ ok: true });
+  await first;
+  assert.equal(addButton.disabled, false);
+
+  page.setSendMessageBehavior("add_manual_trusted_group_destination", () => Promise.reject(new Error("worker unavailable")));
+  input.value = "two.example";
+  await addButton.fire("click");
+  assert.match(page.document.getElementById("trusted-group-error").textContent, /could not update/);
+  assert.equal(addButton.disabled, false, "the form recovers after a worker failure");
+});
+
+// =============================================================================
 // CLICKFIX PROTECTION (issue #26)
 // =============================================================================
 
@@ -1259,12 +1592,16 @@ test("a fresh install with no stored keys still hides every developer-mode secti
   // #76) -- the static hidden attributes in settings.html are only an
   // anti-flash fallback, and these fake elements deliberately start visible.
   const page = await loadSettings({
-    stored: { trusted_list: undefined, muted_list: undefined, settings: undefined, analysis_history: undefined },
+    stored: {
+      trusted_list: undefined, muted_list: undefined, trusted_groups: undefined,
+      settings: undefined, analysis_history: undefined,
+    },
   });
 
   [
-    "manual-sites-section", "clickfix-warn-mode-row", "device-code-auth-row",
-    "device-flow-section", "reset-defaults-row", "analysis-history-section",
+    "manual-sites-section", "trusted-group-section", "clickfix-warn-mode-row",
+    "device-code-auth-row", "device-flow-section", "reset-defaults-row",
+    "analysis-history-section",
   ].forEach((id) => {
     assert.equal(page.document.getElementById(id).hidden, true, `${id} must be hidden on a fresh install`);
   });

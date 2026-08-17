@@ -30,6 +30,7 @@ interface StoredTrustedEntry {
   logo_regions?: unknown;
   logo_features?: unknown;
   dinov2_embedding?: unknown;
+  trust_group_id?: unknown;
 }
 
 export class ChromeTrustedSource implements TrustedSource {
@@ -73,6 +74,11 @@ function toTrustedEntry(record: unknown): TrustedEntry | null {
   if (etld1 !== undefined) trusted.etld1 = etld1;
   const protocol = optionalString(stored.protocol);
   if (protocol !== undefined) trusted.protocol = protocol;
+  // Group membership (issue #19) is copied straight from the stored record:
+  // it is management metadata, never derived from a match and never used by
+  // the detection pipeline.
+  const trustGroupId = validTrustGroupId(stored.trust_group_id);
+  if (trustGroupId !== undefined) trusted.trustGroupId = trustGroupId;
   const logoRegions = logoRegionArray(stored.logo_regions);
   if (logoRegions !== null) trusted.logoRegions = logoRegions;
   const logoFeatures = logoFeatureArray(stored.logo_features);
@@ -109,6 +115,12 @@ function normalizedFqdn(value: unknown): string | null {
 
 function validVariantId(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 && value.length <= 128
+    ? value
+    : undefined;
+}
+
+function validTrustGroupId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 128
     ? value
     : undefined;
 }

@@ -94,6 +94,31 @@
         </div>
       </div>
 
+      <!-- TRUSTED GROUP DESTINATIONS (issue #19) — shown in Developer mode only -->
+      <div class="clickfix-subsection" id="trusted-group-section" hidden>
+        <strong>Add destination to Trusted Group</strong>
+        <p class="setting-desc">
+          Adds an exact HTTPS origin (e.g. login.example.com) to an existing trusted group.
+          The origin becomes a trusted site; subdomains, paths on other origins, and sibling
+          domains are not included.
+        </p>
+        <p class="empty-state" id="trusted-group-empty" hidden>
+          No trusted groups exist yet. Groups are created when two trusted sign-in origins are linked.
+        </p>
+        <div class="word-input-row trusted-group-form">
+          <label class="trusted-group-field">
+            <span class="trusted-group-field-label">Group</span>
+            <select id="trusted-group-select" class="trusted-group-select"></select>
+          </label>
+          <label class="trusted-group-field">
+            <span class="trusted-group-field-label">Destination</span>
+            <input type="text" id="trusted-group-destination-input" class="word-input" placeholder="login.example.com" maxlength="253" />
+          </label>
+          <button id="trusted-group-add" class="btn-add-word">Add</button>
+        </div>
+        <p class="clickfix-error" id="trusted-group-error" hidden></p>
+      </div>
+
       <!-- CLICKFIX PROTECTION (issue #26) — shown in Developer mode only (issue #3) -->
       <div class="setting-row" id="clickfix-warn-mode-row" hidden>
         <div>

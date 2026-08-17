@@ -839,6 +839,25 @@ test("service-worker storage protocol is trusted, bounded, and returns targeted 
   assert.match(serviceWorker, /setAccessLevel\(\{ accessLevel: "TRUSTED_CONTEXTS" \}\)/);
   assert.match(serviceWorker, /SETTINGS_MESSAGE_TYPES\.has\(message\?\.type\) && !isSettingsSender\(sender\)/);
   assert.match(serviceWorker, /SETTINGS_MESSAGE_TYPES = new Set\(\[[\s\S]*?"open_logo_selector"/);
+  // Issue #19: every trusted-group mutation is settings-page gated, and each
+  // handler re-validates the untrusted group id, name, and hostname itself.
+  assert.match(
+    serviceWorker,
+    /SETTINGS_MESSAGE_TYPES = new Set\(\[[\s\S]*?"rename_trusted_group",\s*"remove_trusted_group_destination",\s*"add_manual_trusted_group_destination",/
+  );
+  const renameCase = serviceWorker.slice(
+    serviceWorker.indexOf('case "rename_trusted_group"'),
+    serviceWorker.indexOf('case "remove_trusted_group_destination"')
+  );
+  assert.match(renameCase, /isValidTrustedGroupId\(message\.groupId\)/);
+  assert.match(renameCase, /normalizeTrustedGroupName\(message\.name\)/);
+  const groupCases = serviceWorker.slice(
+    serviceWorker.indexOf('case "rename_trusted_group"'),
+    serviceWorker.indexOf('case "set_developer_mode"')
+  );
+  assert.equal((groupCases.match(/await withTrustedMuted\(/g) ?? []).length, 3,
+    "every group mutation must run through the shared trusted/muted/group queue");
+  assert.match(groupCases, /normalizeFqdn\(message\.hostname\)/);
   assert.match(serviceWorker, /sendResponse\(invalidSettingsRequest\("forbidden"\)\)/);
   assert.match(serviceWorker, /word\.length <= MAX_USER_WORD_LENGTH/);
   assert.match(serviceWorker, /ALLOWED_MUTED_UNTIL\.has\(value\)/);
@@ -895,6 +914,8 @@ test("every trusted/muted write site keeps the two lists mutually exclusive and 
   // Issue #7 moved the manual-logo write out of the service worker and into
   // applyManualLogoSelection, so both files are checked for the same invariant.
   const storageQueues = await readFile(new URL("./storageQueues.mjs", import.meta.url), "utf8");
+  // Issue #19 added the group helpers as a third writer of trusted_list.
+  const trustedGroups = await readFile(new URL("./trustedGroups.mjs", import.meta.url), "utf8");
 
   // The one read path into the domain repairs the invariants before any
   // mutator sees the lists, and reports the repair as a persistable change.
@@ -915,7 +936,11 @@ test("every trusted/muted write site keeps the two lists mutually exclusive and 
 
   // Every append to trusted_list runs through the cap, so no write site can
   // leave a third variant stored for one fqdn.
-  for (const [label, source] of [["service_worker.js", serviceWorker], ["storageQueues.mjs", storageQueues]]) {
+  for (const [label, source] of [
+    ["service_worker.js", serviceWorker],
+    ["storageQueues.mjs", storageQueues],
+    ["trustedGroups.mjs", trustedGroups],
+  ]) {
     assert.equal(
       (source.match(/state\.trusted_list = \[\s*\.\.\.state\.trusted_list,/g) ?? []).length,
       0,
@@ -927,8 +952,30 @@ test("every trusted/muted write site keeps the two lists mutually exclusive and 
   // #90, and move-muted-to-trusted stopped appending eagerly with issue #8 —
   // it now confirms through that same add path. storageQueues keeps two: the
   // add/confirm append and the manual Advanced Settings add (issue #93).
+  // trustedGroups.mjs never appends a trusted entry itself — its only entry
+  // creation delegates to applyManualSiteMutation, which enforces the cap.
   assert.equal((serviceWorker.match(/enforceTrustedVariantCap\(\[/g) ?? []).length, 1);
   assert.equal((storageQueues.match(/enforceTrustedVariantCap\(\[/g) ?? []).length, 2);
+  assert.equal((trustedGroups.match(/enforceTrustedVariantCap\(\[/g) ?? []).length, 0);
+  assert.match(trustedGroups, /applyManualSiteMutation\(state, \{/);
+
+  // Issue #19: trusted_groups belongs to the same consistency domain. The one
+  // read path repairs group state before any mutator sees it, and persist
+  // re-asserts the invariants so a mutation that removed or moved trusted
+  // entries commits the matching group dissolution in the same write — no
+  // orphaned group or dangling trust_group_id waits for a later restart.
+  assert.match(serviceWorker, /keys: \["trusted_list", "muted_list", "trusted_groups"\]/);
+  assert.match(
+    serviceWorker,
+    /const groups = repairTrustedGroups\(\{ trusted_groups: data\.trusted_groups, trusted_list, muted_list \}\)/
+  );
+  assert.match(serviceWorker, /persist\(state\) \{\s*[\s\S]{0,700}?const groups = repairTrustedGroups\(state\);/);
+
+  // Group membership spans every variant of one exact origin, so both places
+  // that append a sibling variant must propagate it: the drift capture in the
+  // worker and the manual-selection add path in storageQueues.mjs.
+  assert.match(serviceWorker, /\.\.\.\(typeof template\.trust_group_id === "string" \? \{/);
+  assert.match(storageQueues, /const groupTemplate = previousVariants\[0\]/);
 });
 
 test("the winning trusted variant identity is propagated into diagnostics", async () => {
@@ -1144,6 +1191,37 @@ test("manual logo: an add flow appends the variant and unmutes the fqdn", () => 
   assert.equal(saved.ocr_domain, "site");
   assert.equal(saved.last_visited, "29/07/2026");
   assert.deepEqual(state.muted_list.map((entry) => entry.fqdn), ["keep.example"]);
+});
+
+test("manual logo: a variant appended next to grouped siblings inherits their membership", () => {
+  // Issue #19: every visual variant of one exact origin carries the same
+  // trust_group_id, so an add flow that appends a second variant must copy it
+  // — otherwise the shared-membership invariant would fail closed and silently
+  // ungroup the origin.
+  const state = {
+    trusted_list: [
+      trustedVariant("site.example", "variant-1", { trust_group_id: "group-1", trust_group_manual: true }),
+    ],
+    muted_list: [],
+  };
+
+  const result = applyManualLogoSelection(state, manualSelectionInput({
+    targetVariantId: "variant-new",
+    addition: additionFor("site.example", "variant-new"),
+  }));
+
+  assert.equal(result.status, "saved");
+  const appended = state.trusted_list.find((entry) => entry.variant_id === "variant-new");
+  assert.equal(appended.trust_group_id, "group-1");
+  assert.equal(appended.trust_group_manual, true);
+
+  // An origin with no group stays ungrouped — nothing is invented.
+  const ungrouped = { trusted_list: [], muted_list: [] };
+  applyManualLogoSelection(ungrouped, manualSelectionInput({
+    targetVariantId: undefined,
+    addition: additionFor("fresh.example", "variant-a"),
+  }));
+  assert.equal("trust_group_id" in ungrouped.trusted_list[0], false);
 });
 
 test("manual logo: a move preserves muted metadata and strips mute-only state", () => {

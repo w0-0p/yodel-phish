@@ -482,7 +482,8 @@ main { padding: 24px; max-width: 900px; }
 }
 
 /* The preceding manual-sites group ends at the ClickFix group separator. */
-#manual-sites-section { border-bottom: none; }
+#manual-sites-section,
+#trusted-group-section { border-bottom: none; }
 
 /* Keep each override visually paired with its associated configuration. */
 #clickfix-exclusions .clickfix-subsection {
@@ -497,6 +498,82 @@ main { padding: 24px; max-width: 900px; }
 /* MANUAL TRUSTED/MUTED SITES (issue #93) */
 .manual-site-subsection { margin-top: 14px; }
 .manual-site-subsection > strong { display: block; margin-bottom: 4px; font-size: 13px; }
+
+/* TRUSTED GROUPS (issue #19) — a named collection of exact trusted origins,
+   rendered as one bordered section ahead of the ungrouped sites. */
+.trusted-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 2px solid var(--grey);
+  border-radius: 8px;
+}
+
+.trusted-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trusted-group-name {
+  font-weight: 600;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.trusted-group-members {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.trusted-group-member {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.btn-remove-destination {
+  align-self: flex-end;
+  background: transparent;
+  border: 1px solid #e0e0e0;
+  color: var(--red);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.btn-remove-destination:hover { background: #ffebee; }
+
+/* ADD DESTINATION TO TRUSTED GROUP (issue #19, Advanced Settings) */
+.trusted-group-form { align-items: flex-end; }
+
+.trusted-group-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trusted-group-field-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.trusted-group-select {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+  min-width: 180px;
+  cursor: pointer;
+  background: #fff;
+}
+
+.trusted-group-select:disabled,
+.trusted-group-form .word-input:disabled { opacity: 0.45; cursor: default; }
 
 .btn-modify-logo {
   background: transparent;
