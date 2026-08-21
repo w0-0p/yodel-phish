@@ -177,6 +177,9 @@ function loadContentScript({
 
   const submitListeners = new Set();
   const documentListenerTypes = [];
+  // The capture-phase document listeners (click/keydown/submit) that report
+  // trusted user activity for the handover feature (issue #24).
+  const documentListeners = new Map();
   // Emphasis in a banner message is real <strong>/<u>/<br> elements, so the
   // only way to see it is to record what was created.
   const createdElements = [];
@@ -222,6 +225,7 @@ function loadContentScript({
     // document, so installing and removing it is observable here.
     addEventListener(type, listener) {
       documentListenerTypes.push(type);
+      documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
       if (type === "submit") submitListeners.add(listener);
     },
     removeEventListener(type, listener) {
@@ -252,8 +256,11 @@ function loadContentScript({
     },
   };
 
+  const windowListeners = new Map();
   const fakeWindow = {
-    addEventListener() {},
+    addEventListener(type, listener) {
+      windowListeners.set(type, [...(windowListeners.get(type) ?? []), listener]);
+    },
     removeEventListener() {},
     // The page's own scheme decides whether it may be analysed automatically
     // (issue #25), so the stub carries both halves of the real location.
@@ -293,6 +300,10 @@ function loadContentScript({
 
   delete require.cache[CONTENT_SCRIPT_PATH];
   require(CONTENT_SCRIPT_PATH);
+  // The handover activity capture (issue #24) registers its own inert
+  // capture-phase "submit" listener at load. Only listeners added later --
+  // the form blocker -- represent a blocked page.
+  const baselineSubmitListeners = submitListeners.size;
 
   return {
     loginState,
@@ -374,7 +385,19 @@ function loadContentScript({
       return bannerRoot(lastPrepended)?.querySelector(selector) ?? null;
     },
     get submissionBlocked() {
-      return submitListeners.size > 0;
+      return submitListeners.size > baselineSubmitListeners;
+    },
+    // Fires the real capture-phase document listeners for a type, exactly as
+    // the browser would (used for the handover activity capture, issue #24).
+    fireDocumentEvent(type, event) {
+      for (const listener of documentListeners.get(type) ?? []) listener(event);
+    },
+    // Fires the real pageshow handler as a BFCache restore would; the handler
+    // is async, so callers await the restoration sequence.
+    async firePageShow(persisted) {
+      for (const listener of windowListeners.get("pageshow") ?? []) {
+        await listener({ persisted });
+      }
     },
     // Fires an ordinary cancellable form submission at the installed guard.
     submitForm() {
@@ -404,6 +427,14 @@ function loadContentScript({
 
 function nextTick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+// Issue #24: first-time login handling resolves a handover candidate with the
+// service worker before dispatching the ordinary pipeline, so automatic
+// detection paths now settle through a few awaited microtasks (and no timer --
+// safe while setTimeout is mocked).
+async function flushAsyncWork() {
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
 }
 
 // Issue #15: the service worker can only distinguish "the click was handled"
@@ -449,7 +480,7 @@ test("a manual trigger while a job is in flight reports analysing and leaves it 
   assert.equal(page.sentMessages.length, beforeCount, "the running job must not be restarted or re-rendered");
 });
 
-test("silent same-document cancellation releases the old job and analyses the new state", (context) => {
+test("silent same-document cancellation releases the old job and analyses the new state", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const url = "https://example.test/login#password";
   const page = loadContentScript({ url });
@@ -468,6 +499,8 @@ test("silent same-document cancellation releases the old job and analyses the ne
   assert.equal(page.lastMessageOfType("set_icon_state")?.state, "active");
 
   context.mock.timers.tick(250);
+  assert.equal(page.submissionBlocked, true, "the replacement handling owns a fresh form guard");
+  await flushAsyncWork();
   const runs = page.sentMessages.filter((message) => message.type === "run_pipeline");
   assert.equal(runs.length, 2, "the surviving route must run ordinary login detection again");
   assert.notEqual(runs[1].jobId, oldJobId);
@@ -963,22 +996,24 @@ function analyseOnPageChange(page, context) {
   context.mock.timers.tick(250);
 }
 
-test("a login page is analysed automatically over http and https", (context) => {
+test("a login page is analysed automatically over http and https", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
 
   for (const url of ["https://example.test/login", "http://example.test/login"]) {
     const page = loadContentScript({ url });
     analyseOnPageChange(page, context);
+    await flushAsyncWork();
 
     assert.ok(page.lastMessageOfType("run_pipeline"), `${url} should be analysed automatically`);
   }
 });
 
-test("automatic analysis retains login-detected progress wording", (context) => {
+test("automatic analysis retains login-detected progress wording", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const page = loadContentScript();
 
   analyseOnPageChange(page, context);
+  await flushAsyncWork();
   const jobId = page.lastMessageOfType("run_pipeline")?.jobId;
   page.dispatch({ type: "capture_complete", jobId });
   context.mock.timers.tick(300);
@@ -1029,7 +1064,7 @@ function elementNode(tagName = "DIV") {
   return { nodeType: 1, parentElement: null, tagName };
 }
 
-test("an attribute-only change that activates a hidden login UI triggers the pipeline", (context) => {
+test("an attribute-only change that activates a hidden login UI triggers the pipeline", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const page = loadContentScript();
   page.loginState.isLoginPage = true;
@@ -1037,17 +1072,19 @@ test("an attribute-only change that activates a hidden login UI triggers the pip
   // e.g. a login dialog losing its inert attribute — no insertion, no pixels.
   page.emitMutations([{ type: "attributes", target: elementNode(), attributeName: "inert" }]);
   context.mock.timers.tick(250);
+  await flushAsyncWork();
 
   assert.ok(page.lastMessageOfType("run_pipeline"), "detection-relevant attribute changes must re-enter detection");
 });
 
-test("identity-metadata attribute changes re-enter detection", (context) => {
+test("identity-metadata attribute changes re-enter detection", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const page = loadContentScript();
   page.loginState.isLoginPage = true;
 
   page.emitMutations([{ type: "attributes", target: elementNode(), attributeName: "placeholder" }]);
   context.mock.timers.tick(250);
+  await flushAsyncWork();
 
   assert.ok(page.lastMessageOfType("run_pipeline"));
 });
@@ -1071,7 +1108,7 @@ test("attribute changes outside the observed sets stay insignificant", (context)
   assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
 });
 
-test("dynamically inserted credential fields trigger exactly one pipeline run", (context) => {
+test("dynamically inserted credential fields trigger exactly one pipeline run", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const page = loadContentScript();
   page.loginState.isLoginPage = true;
@@ -1079,8 +1116,10 @@ test("dynamically inserted credential fields trigger exactly one pipeline run", 
   page.emitMutations([{ type: "childList", target: elementNode(), addedNodes: [elementNode("INPUT")], removedNodes: [] }]);
   page.emitMutations([{ type: "childList", target: elementNode(), addedNodes: [elementNode("DIV")], removedNodes: [] }]);
   context.mock.timers.tick(250);
+  await flushAsyncWork();
   page.emitMutations([{ type: "childList", target: elementNode(), addedNodes: [elementNode("DIV")], removedNodes: [] }]);
   context.mock.timers.tick(250);
+  await flushAsyncWork();
 
   const runs = page.sentMessages.filter((message) => message.type === "run_pipeline");
   assert.equal(runs.length, 1, "churn around one insertion must not start a second job");
@@ -1525,23 +1564,32 @@ test("iframe load events are no longer watched from the top document", () => {
   );
 });
 
-test("a child-frame login report starts exactly one analysis, owned by the top document", () => {
+test("a child-frame login report starts exactly one analysis, owned by the top document", async () => {
   const page = loadContentScript();
 
-  page.dispatch({ type: "embedded_login_detected" });
+  const { response } = page.dispatch({ type: "embedded_login_detected" });
+  assert.deepEqual(response, { ok: true, blocked: true },
+    "the exact reporting child is told to retain its local blocker");
+  assert.deepEqual(page.lastMessageOfType("set_child_frame_submission_block"), {
+    type: "set_child_frame_submission_block",
+    blocked: true,
+  });
+  await flushAsyncWork();
 
   const started = page.lastMessageOfType("run_pipeline");
   assert.ok(started, "the report asks the top document for the analysis it owns");
   assert.equal(page.sentMessages.filter((message) => message.type === "run_pipeline").length, 1);
 });
 
-test("simultaneous child-frame login reports cannot create concurrent jobs", () => {
+test("simultaneous child-frame login reports cannot create concurrent jobs", async () => {
   const page = loadContentScript();
 
   page.dispatch({ type: "embedded_login_detected" });
+  page.dispatch({ type: "embedded_login_detected" });
+  await flushAsyncWork();
   const jobId = page.lastMessageOfType("run_pipeline")?.jobId;
   page.dispatch({ type: "embedded_login_detected" });
-  page.dispatch({ type: "embedded_login_detected" });
+  await flushAsyncWork();
 
   assert.equal(page.sentMessages.filter((message) => message.type === "run_pipeline").length, 1);
   assert.equal(page.lastMessageOfType("run_pipeline")?.jobId, jobId);
@@ -1552,8 +1600,9 @@ test("a child-frame login report is ignored while an analysis is already running
   const jobId = page.startJobViaManualTrigger();
   const beforeCount = page.sentMessages.length;
 
-  page.dispatch({ type: "embedded_login_detected" });
+  const { response } = page.dispatch({ type: "embedded_login_detected" });
 
+  assert.deepEqual(response, { ok: true, blocked: true });
   assert.equal(page.sentMessages.length, beforeCount);
   assert.equal(page.lastMessageOfType("run_pipeline")?.jobId, jobId);
 });
@@ -1565,8 +1614,9 @@ test("a child-frame login report after an analysis offers a re-analysis instead 
   page.bannerButton(".yp-btn-close").click();
   const runsBefore = page.sentMessages.filter((message) => message.type === "run_pipeline").length;
 
-  page.dispatch({ type: "embedded_login_detected" });
+  const { response } = page.dispatch({ type: "embedded_login_detected" });
 
+  assert.deepEqual(response, { ok: true, blocked: false });
   assert.equal(page.bannerVerdict, "page_changed");
   assert.equal(page.sentMessages.filter((message) => message.type === "run_pipeline").length, runsBefore);
 });
@@ -1589,8 +1639,9 @@ test("a child-frame login report never displaces the device-code advisory", asyn
   await nextTick();
   const beforeCount = page.sentMessages.length;
 
-  page.dispatch({ type: "embedded_login_detected" });
+  const { response } = page.dispatch({ type: "embedded_login_detected" });
 
+  assert.deepEqual(response, { ok: true, blocked: false });
   assert.equal(page.bannerVerdict, "high_risk_login");
   assert.equal(page.sentMessages.length, beforeCount);
 });
@@ -1820,4 +1871,467 @@ test("cancelling a trusted-site flow with nothing behind it leaves no banner", (
   assert.equal(page.bannerRemoved, true);
   assert.equal(page.busyOverlayPresent, false);
   assert.equal(page.submissionBlocked, false);
+});
+
+// =============================================================================
+// Issue #24 — cross-domain login handover. A candidate proves navigation
+// context, never destination legitimacy: the prompt keeps submission blocked,
+// names the untrusted destination, and hands over into the existing flows.
+// The candidate store itself is covered in handoverCandidates.test.mjs; these
+// tests drive the content script's lookup, prompt, and transition lifecycle.
+// =============================================================================
+
+function handoverCandidate(overrides = {}) {
+  return {
+    candidateId: "cand-1",
+    sourceHost: "login.microsoftonline.com",
+    destinationHost: "login.live.com",
+    expiresAt: Date.now() + 120_000,
+    ...overrides,
+  };
+}
+
+function insertLoginMutation(page) {
+  page.emitMutations([
+    { type: "childList", target: elementNode(), addedNodes: [elementNode("INPUT")], removedNodes: [] },
+  ]);
+}
+
+// Drives a dynamically inserted login form through detection to the prompt.
+async function promptViaMutation(page, context, candidate = handoverCandidate()) {
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.resolve({ ok: true, candidate }));
+  page.loginState.isLoginPage = true;
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  await flushAsyncWork();
+  assert.equal(page.bannerVerdict, "handover_pending", "the prompt must be on screen");
+  return candidate;
+}
+
+test("dynamic login insertion with a valid candidate produces one prompt and no pipeline", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.resolve({ ok: true, candidate: handoverCandidate() }));
+  page.loginState.isLoginPage = true;
+
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  assert.equal(page.submissionBlocked, true, "submission is blocked before the lookup answers");
+  await flushAsyncWork();
+
+  assert.equal(page.bannerVerdict, "handover_pending");
+  assert.equal(page.bannerCount, 1);
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined, "no pipeline job while the decision is pending");
+  assert.equal(page.submissionBlocked, true);
+  assert.equal(page.busyOverlayPresent, false, "a shield would block the prompt's own buttons");
+  assert.equal(page.lastMessageOfType("set_icon_state")?.state, "unverified");
+});
+
+test("the prompt names both hostnames and never implies the destination was verified", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+
+  assert.match(page.bannerMessage, /trusted site login\.microsoftonline\.com/);
+  assert.match(page.bannerMessage, /untrusted site login\.live\.com/);
+  assert.match(page.bannerMessage, /Do you know and trust login\.live\.com\?/);
+  assert.doesNotMatch(page.bannerMessage, /safe|verified/i);
+  assert.match(page.bannerHtml, /yp-btn-handover-add">Add to trusted</);
+  assert.match(page.bannerHtml, /yp-btn-handover-analyse">Analyse normally</);
+  assert.match(page.bannerHtml, /yp-btn-handover-leave">Leave site</);
+});
+
+test("the prompt has no generic close action", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+
+  assert.doesNotMatch(page.bannerHtml, /yp-btn-close/, "neither Close nor the X control may dismiss the prompt");
+});
+
+test("dynamic login insertion without a candidate produces one normal pipeline job", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.resolve({ ok: true, candidate: null }));
+  page.loginState.isLoginPage = true;
+
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  await flushAsyncWork();
+
+  assert.equal(page.sentMessages.filter((message) => message.type === "run_pipeline").length, 1);
+  assert.equal(page.bannerVerdict, undefined, "no prompt without a candidate");
+  assert.equal(page.submissionBlocked, true, "the blocker transfers into the pipeline");
+});
+
+test("candidate lookup failure falls back to normal analysis", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.reject(new Error("no service worker")));
+  page.loginState.isLoginPage = true;
+
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  await flushAsyncWork();
+
+  assert.equal(page.sentMessages.filter((message) => message.type === "run_pipeline").length, 1,
+    "an unavailable handover store must never bypass normal analysis");
+});
+
+test("multiple mutations during candidate lookup produce one lookup", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  let resolveLookup;
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    new Promise((resolve) => { resolveLookup = resolve; }));
+  page.loginState.isLoginPage = true;
+
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  page.dispatch({ type: "embedded_login_detected" });
+  await flushAsyncWork();
+
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "resolve_handover_candidate").length,
+    1,
+    "detections while resolving share the single-flight lookup"
+  );
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+
+  resolveLookup({ ok: true, candidate: handoverCandidate() });
+  await flushAsyncWork();
+  assert.equal(page.bannerVerdict, "handover_pending");
+});
+
+test("mutation churn during a pending prompt leaves the prompt and form blocker intact", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+  const lookups = page.sentMessages.filter((message) => message.type === "resolve_handover_candidate").length;
+
+  // Ordinary page churn, prompt-owned DOM, and a late embedded-login report:
+  // none of it may replace the prompt, reveal Re-analyse, or start anything.
+  insertLoginMutation(page);
+  page.emitMutations([
+    { type: "childList", target: page.bannerHost, addedNodes: [elementNode()], removedNodes: [] },
+  ]);
+  context.mock.timers.tick(250);
+  page.dispatch({ type: "embedded_login_detected" });
+  await flushAsyncWork();
+
+  assert.equal(page.bannerVerdict, "handover_pending", "the prompt must remain visible");
+  assert.notEqual(page.bannerVerdict, "page_changed");
+  assert.doesNotMatch(page.bannerHtml, /yp-btn-reanalyse/);
+  assert.equal(page.submissionBlocked, true);
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "resolve_handover_candidate").length,
+    lookups,
+    "churn during a pending prompt starts no second lookup"
+  );
+});
+
+test("add to trusted consumes the candidate and starts the existing flow without a second confirmation", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+  let confirmCalls = 0;
+  global.confirm = () => { confirmCalls += 1; return true; };
+  page.setSendMessageBehavior("handover_add_to_trusted", () => Promise.resolve({ ok: true }));
+
+  const addButton = page.bannerButton(".yp-btn-handover-add");
+  addButton.click();
+  addButton.click();
+  assert.equal(addButton.disabled, true, "the prompt controls stay inert while the action runs");
+  await flushAsyncWork();
+
+  const consumes = page.sentMessages.filter((message) => message.type === "handover_add_to_trusted");
+  assert.deepEqual(consumes, [{ type: "handover_add_to_trusted", candidateId: candidate.candidateId }],
+    "one consume for exactly the displayed candidate, however often it is clicked");
+  assert.ok(page.lastMessageOfType("add_to_trusted"), "the existing interactive trusted-add flow starts");
+  assert.equal(confirmCalls, 0, "the prompt's button was already the confirmation");
+  assert.equal(page.submissionBlocked, true, "the blocker transfers into the trusted-add flow");
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+});
+
+test("analyse normally consumes the candidate and starts an explicitly requested pipeline", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+  page.setSendMessageBehavior("handover_analyse_normally", () => Promise.resolve({ ok: true }));
+
+  page.bannerButton(".yp-btn-handover-analyse").click();
+  await flushAsyncWork();
+
+  assert.equal(page.lastMessageOfType("handover_analyse_normally")?.candidateId, candidate.candidateId);
+  assert.ok(page.lastMessageOfType("run_pipeline"));
+  assert.equal(page.submissionBlocked, true, "the blocker transfers into the pipeline");
+  assert.equal(page.lastMessageOfType("add_to_trusted"), undefined);
+});
+
+test("leave site consumes the candidate and removes the prompt while the background navigates", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+  page.setSendMessageBehavior("handover_leave", () => Promise.resolve({ ok: true }));
+
+  page.bannerButton(".yp-btn-handover-leave").click();
+  await flushAsyncWork();
+
+  assert.equal(page.lastMessageOfType("handover_leave")?.candidateId, candidate.candidateId);
+  assert.equal(page.bannerRemoved, true);
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined, "leaving starts no analysis");
+
+  // A late expiry for the consumed candidate has nothing left to act on.
+  const before = page.sentMessages.length;
+  page.dispatch({ type: "handover_expired", candidateId: candidate.candidateId });
+  assert.equal(page.sentMessages.length, before);
+});
+
+test("a failed leave falls back to analysis instead of stranding the blocker", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+  page.setSendMessageBehavior("handover_leave", () => Promise.resolve({ ok: false }));
+
+  page.bannerButton(".yp-btn-handover-leave").click();
+  await flushAsyncWork();
+
+  assert.ok(page.lastMessageOfType("run_pipeline"),
+    "a destination that could not be left must enter a recoverable analysis flow");
+  assert.equal(page.submissionBlocked, true, "the pipeline takes ownership of the blocker");
+});
+
+test("a rejected consume falls back to the standard process", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+  page.setSendMessageBehavior("handover_analyse_normally", () =>
+    Promise.resolve({ ok: false, reason: "no_candidate" }));
+
+  page.bannerButton(".yp-btn-handover-analyse").click();
+  await flushAsyncWork();
+
+  assert.ok(page.lastMessageOfType("run_pipeline"),
+    "an expired or stale candidate must not leave the page blocked behind a dead prompt");
+  assert.equal(page.submissionBlocked, true);
+});
+
+test("expiry clears the prompt and automatically starts standard analysis", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+
+  context.mock.timers.tick(120_000);
+
+  assert.ok(page.lastMessageOfType("run_pipeline"), "the local fallback timer starts the standard process");
+  assert.equal(page.submissionBlocked, true, "expiry transfers the blocker into the pipeline");
+  assert.equal(page.lastMessageOfType("handover_analyse_normally"), undefined,
+    "expiry consumes nothing; the background alarm owns the candidate");
+});
+
+test("the background's expiry notification starts standard analysis and stale ids are ignored", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+
+  page.dispatch({ type: "handover_expired", candidateId: "some-older-candidate" });
+  assert.equal(page.bannerVerdict, "handover_pending", "a stale expiry must not terminate a newer prompt");
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+
+  page.dispatch({ type: "handover_expired", candidateId: candidate.candidateId });
+  assert.ok(page.lastMessageOfType("run_pipeline"));
+  assert.equal(page.submissionBlocked, true);
+
+  // The now-stale local timer must not disturb the analysis the expiry began.
+  const runsBefore = page.sentMessages.filter((message) => message.type === "run_pipeline").length;
+  context.mock.timers.tick(120_000);
+  assert.equal(page.sentMessages.filter((message) => message.type === "run_pipeline").length, runsBefore);
+});
+
+test("candidate invalidation clears the prompt and starts standard analysis", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+
+  page.dispatch({ type: "handover_invalidated", candidateId: "stale-candidate" });
+  assert.equal(page.bannerVerdict, "handover_pending");
+
+  page.dispatch({ type: "handover_invalidated", candidateId: candidate.candidateId });
+  assert.ok(page.lastMessageOfType("run_pipeline"));
+  assert.equal(page.submissionBlocked, true,
+    "invalidation transfers the top and embedded blockers into normal analysis");
+});
+
+test("same-document history changes revalidate rather than replacing the prompt", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+
+  // The candidate still stands: the prompt stays, and no evaluation replaces it.
+  page.dispatch({ type: "page_history_changed" });
+  await flushAsyncWork();
+  context.mock.timers.tick(250);
+  await flushAsyncWork();
+  assert.equal(page.bannerVerdict, "handover_pending");
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+  assert.equal(page.submissionBlocked, true);
+
+  // The background invalidated it (back/forward): normal login evaluation runs.
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.resolve({ ok: true, candidate: null }));
+  page.dispatch({ type: "page_history_changed" });
+  await flushAsyncWork();
+  assert.equal(page.bannerRemoved, true, "an invalidated prompt is cleared without interruption UI");
+  assert.notEqual(page.bannerVerdict, "interrupted");
+  context.mock.timers.tick(250);
+  await flushAsyncWork();
+  assert.ok(page.lastMessageOfType("run_pipeline"), "the page falls back to normal detection");
+  assert.notEqual(page.lastMessageOfType("run_pipeline")?.candidateId, candidate.candidateId);
+});
+
+test("a device-code advisory takes precedence over a pending prompt", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+
+  page.dispatch({ type: "page_history_changed", deviceFlow: { active: true, provider: "GitHub" } });
+
+  assert.equal(page.bannerVerdict, "high_risk_login");
+  assert.equal(page.submissionBlocked, false, "the advisory owns the page state now");
+
+  const before = page.sentMessages.length;
+  page.dispatch({ type: "handover_expired", candidateId: candidate.candidateId });
+  assert.equal(page.sentMessages.length, before, "a late expiry cannot disturb the advisory");
+  assert.equal(page.bannerVerdict, "high_risk_login");
+});
+
+test("a manual trigger during a pending prompt consumes the candidate as analyse-normally", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const candidate = await promptViaMutation(page, context);
+
+  const { response } = page.dispatch({ type: "manual_trigger" });
+
+  assert.equal(response.status, "started");
+  assert.equal(page.lastMessageOfType("handover_analyse_normally")?.candidateId, candidate.candidateId);
+  assert.ok(page.lastMessageOfType("run_pipeline"));
+});
+
+test("BFCache restore reloads candidate state from the service worker", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  await promptViaMutation(page, context);
+
+  // The service worker still vouches for the restored exact document.
+  await page.firePageShow(true);
+  assert.equal(page.bannerVerdict, "handover_pending", "a still-valid candidate restores the prompt");
+  assert.equal(page.submissionBlocked, true);
+
+  // It no longer does: the existing BFCache behavior stands, with no prompt
+  // rebuilt from content-script memory alone.
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.resolve({ ok: true, candidate: null }));
+  await page.firePageShow(true);
+  assert.equal(page.bannerVerdict, "page_changed");
+  assert.equal(page.submissionBlocked, false);
+});
+
+test("a stale lookup response cannot render into a replacement document's state", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  let resolveLookup;
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    new Promise((resolve) => { resolveLookup = resolve; }));
+  page.loginState.isLoginPage = true;
+  insertLoginMutation(page);
+  context.mock.timers.tick(250);
+  await flushAsyncWork();
+
+  // The document is restored (BFCache) before the lookup answers; the answer
+  // belongs to state that no longer exists.
+  page.loginState.isLoginPage = false;
+  await page.firePageShow(true);
+  resolveLookup({ ok: true, candidate: handoverCandidate() });
+  await flushAsyncWork();
+
+  assert.equal(page.bannerVerdict, undefined, "the stale candidate must not render a prompt");
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined, "nor start a pipeline");
+  assert.equal(page.submissionBlocked, false);
+});
+
+test("initial-load login detection resolves a candidate before any pipeline dispatch", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.setSendMessageBehavior("resolve_handover_candidate", () =>
+    Promise.resolve({ ok: true, candidate: handoverCandidate() }));
+  page.loginState.isLoginPage = true;
+  await settleInit();
+
+  assert.equal(page.bannerVerdict, "handover_pending");
+  assert.equal(page.lastMessageOfType("run_pipeline"), undefined);
+  const order = page.sentMessages.map((message) => message.type);
+  assert.ok(order.includes("resolve_handover_candidate"), "init consults the candidate store");
+});
+
+test("trusted user activity reports only its kind, and synthetic events report nothing", () => {
+  const page = loadContentScript();
+
+  page.fireDocumentEvent("click", {
+    isTrusted: true,
+    composedPath: () => [
+      { nodeType: 1, tagName: "A", hasAttribute: (name) => name === "href" },
+    ],
+  });
+  const report = page.lastMessageOfType("handover_user_activity");
+  assert.deepEqual(report, { type: "handover_user_activity", kind: "link" },
+    "only the activity kind travels; origin and timestamp are the worker's to derive");
+
+  page.fireDocumentEvent("click", {
+    isTrusted: false,
+    composedPath: () => [
+      { nodeType: 1, tagName: "A", hasAttribute: (name) => name === "href" },
+    ],
+  });
+  page.fireDocumentEvent("keydown", { isTrusted: false, key: "Enter" });
+  page.fireDocumentEvent("submit", { isTrusted: false });
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "handover_user_activity").length,
+    1,
+    "synthetic page events can never create a candidate"
+  );
+});
+
+test("clicks that cannot initiate navigation are not reported", () => {
+  const page = loadContentScript();
+
+  page.fireDocumentEvent("click", {
+    isTrusted: true,
+    composedPath: () => [
+      { nodeType: 1, tagName: "P", hasAttribute: () => false, getAttribute: () => null },
+    ],
+  });
+
+  assert.equal(page.lastMessageOfType("handover_user_activity"), undefined);
+});
+
+test("no activity is reported from a non-HTTPS page", () => {
+  const page = loadContentScript({ url: "http://example.test/login" });
+
+  page.fireDocumentEvent("click", {
+    isTrusted: true,
+    composedPath: () => [
+      { nodeType: 1, tagName: "A", hasAttribute: (name) => name === "href" },
+    ],
+  });
+  page.fireDocumentEvent("submit", { isTrusted: true });
+
+  assert.equal(page.lastMessageOfType("handover_user_activity"), undefined,
+    "only an HTTPS identity can be a handover source");
 });

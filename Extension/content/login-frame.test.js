@@ -3,10 +3,9 @@
 // IIFE touches, require it, then drive the observer callback and the shared
 // detector by hand.
 //
-// The contract under test is deliberately narrow (issue #88): this file may
-// report a login transition and do nothing else. Everything it must NOT do --
-// start analyses, capture, render banners, read settings, block submission --
-// is asserted here as the absence of any other message.
+// The contract under test is deliberately narrow (issues #88/#24): this file
+// reports a login transition and owns only its exact document's submit guard.
+// Analysis, capture, banners, settings and icon state remain top-owned.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -24,12 +23,22 @@ function loadFrameWatcher({
   detector = true,
   isLoginPage = false,
   bodyChildren = [],
+  reportBehavior = () => Promise.resolve({ ok: true, blocked: true }),
 } = {}) {
   const sentMessages = [];
   const loginState = { isLoginPage };
 
   const fakeBody = { tagName: "BODY", children: bodyChildren };
-  const fakeDocument = { body: hasBody ? fakeBody : null };
+  const submitListeners = new Set();
+  const fakeDocument = {
+    body: hasBody ? fakeBody : null,
+    addEventListener(type, listener) {
+      if (type === "submit") submitListeners.add(listener);
+    },
+    removeEventListener(type, listener) {
+      if (type === "submit") submitListeners.delete(listener);
+    },
+  };
   const fakeWindow = {};
   fakeWindow.top = isTopFrame ? fakeWindow : { different: true };
 
@@ -48,11 +57,17 @@ function loadFrameWatcher({
   global.document = fakeDocument;
   global.window = fakeWindow;
   global.MutationObserver = FakeMutationObserver;
+  const runtimeListeners = [];
   global.chrome = {
     runtime: {
+      onMessage: {
+        addListener(listener) {
+          runtimeListeners.push(listener);
+        },
+      },
       sendMessage(message) {
         sentMessages.push(message);
-        return Promise.resolve({});
+        return reportBehavior(message);
       },
     },
   };
@@ -77,6 +92,22 @@ function loadFrameWatcher({
     get loginReports() {
       return sentMessages.filter((message) => message.type === "child_frame_login_detected");
     },
+    get submissionBlocked() {
+      return submitListeners.size > 0;
+    },
+    submitForm() {
+      let prevented = false;
+      const event = { preventDefault() { prevented = true; } };
+      for (const listener of submitListeners) listener(event);
+      return prevented;
+    },
+    dispatch(message) {
+      let response;
+      for (const listener of runtimeListeners) {
+        listener(message, {}, (value) => { response = value; });
+      }
+      return response;
+    },
     // Fires the observer exactly as the browser would; the records themselves
     // are irrelevant here because the watcher re-scans rather than inspecting
     // them.
@@ -94,6 +125,28 @@ test("a frame that is already a login page reports on its initial scan", () => {
 
   assert.deepEqual(frame.loginReports, [{ type: "child_frame_login_detected" }]);
   assert.equal(frame.sentMessages.length, 1, "the watcher sends nothing else at all");
+  assert.equal(frame.submissionBlocked, true, "the exact child blocks before its report settles");
+  assert.equal(frame.submitForm(), true);
+});
+
+test("the top lifecycle releases the exact child-frame blocker", async () => {
+  const frame = loadFrameWatcher({ isLoginPage: true });
+  await Promise.resolve();
+  assert.equal(frame.submissionBlocked, true);
+  assert.deepEqual(frame.dispatch({ type: "set_submission_blocked", blocked: false }), { ok: true });
+  assert.equal(frame.submissionBlocked, false);
+  assert.equal(frame.submitForm(), false);
+});
+
+test("a refused child-frame report cannot strand the blocker", async () => {
+  const frame = loadFrameWatcher({
+    isLoginPage: true,
+    reportBehavior: () => Promise.reject(new Error("worker unavailable")),
+  });
+  assert.equal(frame.submissionBlocked, true);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(frame.submissionBlocked, false);
 });
 
 test("a frame that becomes a login page reports exactly once", (context) => {

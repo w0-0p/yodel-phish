@@ -43,6 +43,16 @@ let bannerActionPending = false;
 // The actionable verdict the user pressed "Add to trusted" on, so cancelling
 // the trusted-site flow can put exactly that banner back (issue #14).
 let restorableVerdict = null;
+// Issue #24 — cross-domain login handover. A pending handover is not an
+// analysis job: it has no job id, no pipeline, no busy overlay and never sets
+// alreadyAnalysing. It owns the form blocker and the prompt banner until the
+// user decides, the candidate expires, or the navigation context is
+// invalidated.
+let handoverResolutionPending = false;
+let handoverResolutionToken = 0;
+let pendingHandover = null;
+let handoverExpiryTimer = null;
+let handoverActionPending = false;
 
 const CONTENT_JOB_TIMEOUT_MS = 290_000;
 
@@ -87,7 +97,10 @@ function runChangeEvaluation() {
   // Device-flow risk (issue #39) is decided purely from the URL and does not
   // change with the DOM, so a mutation must never restart the normal pipeline
   // while it is active -- that could otherwise surface a trusted/"Safe." banner.
-  if (alreadyAnalysing || interruptionPending || deviceFlowActive) return;
+  // A handover lookup or a pending handover prompt equally owns the page
+  // (issue #24): login pages churn their DOM while rendering and validating,
+  // and none of that is evidence the navigation context changed.
+  if (alreadyAnalysing || interruptionPending || deviceFlowActive || hasHandoverState()) return;
 
   if (!bannerEl) {
     if (dismissed) dismissed = false;
@@ -100,13 +113,15 @@ function runChangeEvaluation() {
   offerReanalysis();
 }
 
-// The first login surface found on a page starts exactly one analysis; once an
-// analysis has been attempted, a later one only offers a re-analysis. Shared
-// with child-frame reports (issue #88), so several frames rendering login UIs
-// at the same time can never create concurrent or superseding jobs.
+// The first login surface found on a page starts exactly one handover lookup
+// or analysis; once login handling has been attempted, a later one only offers
+// a re-analysis. Shared with child-frame reports (issue #88), so several
+// frames rendering login UIs at the same time can never create concurrent or
+// superseding jobs, and shared with the handover lookup (issue #24), so the
+// candidate check always runs before ordinary pipeline dispatch.
 function handleLoginDetected() {
   if (!analysisAttempted) {
-    triggerPipeline();
+    beginLoginHandling();
   } else {
     showBanner("page_changed", {});
   }
@@ -372,6 +387,281 @@ function setBannerActionsDisabled(disabled) {
 }
 
 // =============================================================================
+// CROSS-DOMAIN LOGIN HANDOVER — issue #24
+//
+// A legitimate sign-in may hand over from a trusted site to a different,
+// previously unknown one. When this page's login surface is first detected,
+// the service worker is asked whether this exact top document is the bound
+// destination of such a handover before any pipeline job is created. A
+// returned candidate proves navigation context only -- never destination
+// legitimacy -- so the prompt describes the destination as untrusted, keeps
+// credential submission blocked, and offers exactly three ways out: the
+// existing interactive Add to trusted flow, an explicitly requested normal
+// analysis, or leaving the site. No candidate (or a failed lookup) falls
+// through to the ordinary pipeline unchanged.
+// =============================================================================
+
+function hasHandoverState() {
+  return handoverResolutionPending || pendingHandover !== null;
+}
+
+function clearHandoverExpiryTimer() {
+  if (handoverExpiryTimer !== null) {
+    clearTimeout(handoverExpiryTimer);
+    handoverExpiryTimer = null;
+  }
+}
+
+// Drops every piece of local handover state without touching the banner or
+// the form blocker -- each caller decides what replaces them. Bumping the
+// resolution token makes any in-flight lookup's answer stale, so a response
+// raced by a BFCache restore or a device-code advisory renders nothing.
+function clearHandoverLocalState() {
+  clearHandoverExpiryTimer();
+  handoverResolutionToken += 1;
+  handoverResolutionPending = false;
+  pendingHandover = null;
+  handoverActionPending = false;
+}
+
+// The one shared entry into first-time login handling: top-document detection,
+// child-frame reports, init and the BFCache path all come through here, so the
+// candidate lookup always happens before ordinary pipeline dispatch, several
+// simultaneous detections resolve to one lookup, and submission is blocked
+// before the lookup starts.
+function beginLoginHandling() {
+  if (alreadyAnalysing || interruptionPending || deviceFlowActive) return;
+  if (hasHandoverState()) return;
+  // Only an HTTPS document can be a handover destination; every other page
+  // keeps the pre-handover behavior exactly.
+  if (window.location.protocol !== "https:") {
+    triggerPipeline();
+    return;
+  }
+  handoverResolutionPending = true;
+  const token = ++handoverResolutionToken;
+  blockFormSubmission();
+  chrome.runtime.sendMessage({ type: "resolve_handover_candidate" })
+    .then((response) => finishHandoverResolution(token, response))
+    .catch(() => finishHandoverResolution(token, null));
+}
+
+function finishHandoverResolution(token, response) {
+  // A stale response -- the state was reset while the lookup was pending --
+  // must not render into whatever owns the page now.
+  if (token !== handoverResolutionToken || !handoverResolutionPending) return;
+  handoverResolutionPending = false;
+  if (alreadyAnalysing || interruptionPending || deviceFlowActive) return;
+  const candidate = response?.ok === true ? response.candidate : null;
+  if (candidate !== null && candidate !== undefined && typeof candidate.candidateId === "string") {
+    showHandoverPrompt(candidate);
+    return;
+  }
+  // No candidate, or the candidate store was unreachable: an unavailable
+  // handover store must never bypass normal analysis.
+  triggerPipeline();
+}
+
+// Renders the prompt through the banner's own renderer, never through the
+// terminal show_banner path -- that handler releases the form blocker, and the
+// blocker must stay on for as long as the decision is pending. The busy
+// overlay would swallow the prompt's own buttons, so it must not be up.
+function showHandoverPrompt(candidate) {
+  analysisAttempted = true;
+  clearHandoverExpiryTimer();
+  pendingHandover = {
+    candidateId: candidate.candidateId,
+    sourceHost: typeof candidate.sourceHost === "string" ? candidate.sourceHost : "",
+    destinationHost: typeof candidate.destinationHost === "string" ? candidate.destinationHost : "",
+  };
+  const data = {
+    sourceHost: pendingHandover.sourceHost,
+    destinationHost: pendingHandover.destinationHost,
+  };
+  blockFormSubmission();
+  removeBusyOverlay();
+  setIconState("unverified", bannerMessageFor("handover_pending", data));
+  showBanner("handover_pending", data);
+  // The background alarm owns authoritative expiry; this timer is the local
+  // recovery for an already loaded page, armed from the authoritative
+  // expires_at rather than any local lifetime.
+  const expiresAt = candidate.expiresAt;
+  if (Number.isFinite(expiresAt)) {
+    handoverExpiryTimer = setTimeout(() => {
+      handoverExpiryTimer = null;
+      handleHandoverExpiry(candidate.candidateId);
+    }, Math.max(0, expiresAt - Date.now()));
+    handoverExpiryTimer?.unref?.();
+  }
+}
+
+// Expiry of an unanswered prompt, from the background alarm or the local
+// fallback timer. A stale notification -- an older candidate id, or no prompt
+// pending -- changes nothing; a decision already in flight owns the
+// transition. Otherwise the destination follows the standard process:
+// submission stays blocked straight into the pipeline's own guard.
+function handleHandoverExpiry(candidateId) {
+  if (pendingHandover === null || pendingHandover.candidateId !== candidateId) return;
+  if (handoverActionPending) return;
+  clearHandoverLocalState();
+  removeBanner();
+  triggerPipeline();
+}
+
+const HANDOVER_ACTION_MESSAGES = Object.freeze({
+  add: "handover_add_to_trusted",
+  analyse: "handover_analyse_normally",
+  leave: "handover_leave",
+});
+
+// One prompt decision. The service worker validates and consumes exactly the
+// displayed candidate; only then does the chosen flow start. A rejected
+// consume means the candidate was already gone (expired or stale), and the
+// page falls back to the standard process rather than staying blocked behind
+// a dead prompt.
+async function handleHandoverAction(action) {
+  if (handoverActionPending || pendingHandover === null) return;
+  const candidateId = pendingHandover.candidateId;
+  handoverActionPending = true;
+  setBannerActionsDisabled(true);
+  let accepted = false;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: HANDOVER_ACTION_MESSAGES[action],
+      candidateId,
+    });
+    accepted = response?.ok === true;
+  } catch {
+    accepted = false;
+  }
+  handoverActionPending = false;
+  // Expiry or invalidation won while the request was in flight; whatever
+  // replaced the prompt owns the page now.
+  if (pendingHandover === null || pendingHandover.candidateId !== candidateId) return;
+  clearHandoverLocalState();
+  removeBanner();
+  if (accepted && action === "leave") {
+    // The background is navigating this tab back or closing it.
+    setIconState("active");
+    return;
+  }
+  if (accepted && action === "add") {
+    // The prompt's button was the confirmation, so the generic "Add this
+    // site?" dialog is not shown again; the existing interactive flow owns
+    // everything from here, and trust is persisted only by its confirmed
+    // logo selection.
+    triggerTrustedAdd();
+    return;
+  }
+  if (accepted && action === "analyse") {
+    triggerPipeline({ userInitiated: true });
+    return;
+  }
+  triggerPipeline();
+}
+
+// A same-document History API change arrived while the prompt is pending. The
+// scheme+host identity cannot change same-document, so a still-valid candidate
+// keeps its prompt; one the background invalidated (back/forward) clears the
+// handover state and falls back to normal login evaluation -- no analysis job
+// existed, so no interruption UI is involved.
+async function revalidatePendingHandover() {
+  if (pendingHandover === null || handoverActionPending) return;
+  const candidateId = pendingHandover.candidateId;
+  let stillValid = false;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "resolve_handover_candidate" });
+    stillValid = response?.ok === true && response.candidate?.candidateId === candidateId;
+  } catch {
+    stillValid = false;
+  }
+  if (pendingHandover === null || pendingHandover.candidateId !== candidateId) return;
+  if (handoverActionPending || stillValid) return;
+  clearHandoverLocalState();
+  removeBanner();
+  unblockFormSubmission();
+  setIconState("active");
+  // The prompt was the only login handling this document attempted -- it was
+  // never an analysis -- so the surviving route runs first-time login
+  // handling rather than the page-changed re-analyse offer.
+  analysisAttempted = false;
+  scheduleEvaluation();
+}
+
+// BFCache restoration: the prompt is only ever rebuilt from the service
+// worker's answer for this exact restored document, never from content-script
+// memory alone.
+async function restorePendingHandover() {
+  let candidate = null;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "resolve_handover_candidate" });
+    if (response?.ok === true) candidate = response.candidate ?? null;
+  } catch {
+    candidate = null;
+  }
+  if (candidate === null || typeof candidate.candidateId !== "string") return false;
+  if (alreadyAnalysing || interruptionPending || deviceFlowActive || hasHandoverState()) return false;
+  showHandoverPrompt(candidate);
+  return true;
+}
+
+// -----------------------------------------------------------------------------
+// User-activity capture. Only browser-generated events count -- a synthetic
+// event dispatched by page JavaScript has isTrusted === false and is ignored.
+// Only the activity kind is reported: the service worker derives the source
+// identity from the authoritative top frame it resolves itself, uses its own
+// receipt time, and verifies the source is currently trusted, so nothing a
+// page supplies here can arm a handover.
+// -----------------------------------------------------------------------------
+
+const HANDOVER_ACTIVITY_THROTTLE_MS = 1_000;
+let lastActivityReportAt = 0;
+
+function reportHandoverActivity(kind) {
+  const nowMs = Date.now();
+  if (nowMs - lastActivityReportAt < HANDOVER_ACTIVITY_THROTTLE_MS) return;
+  lastActivityReportAt = nowMs;
+  chrome.runtime.sendMessage({ type: "handover_user_activity", kind }).catch(() => {});
+}
+
+// Link clicks and button-like clicks may initiate navigation; anything else a
+// click lands on is not reported at all.
+function handoverActivityKindForClick(event) {
+  const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+  for (const node of path) {
+    if (node?.nodeType !== Node.ELEMENT_NODE) continue;
+    const tag = typeof node.tagName === "string" ? node.tagName.toLowerCase() : "";
+    if (tag === "a" && node.hasAttribute?.("href")) return "link";
+    if (tag === "button" || tag === "summary") return "button";
+    if (tag === "input" && ["submit", "button", "image"].includes(node.type)) return "button";
+    if (node.getAttribute?.("role") === "button") return "button";
+  }
+  return null;
+}
+
+// Only an HTTPS page can be a handover source, so anything else never reports.
+function isPotentialHandoverSourcePage() {
+  return window.location.protocol === "https:";
+}
+
+document.addEventListener("click", (event) => {
+  if (event.isTrusted !== true || !isPotentialHandoverSourcePage()) return;
+  const kind = handoverActivityKindForClick(event);
+  if (kind !== null) reportHandoverActivity(kind);
+}, { capture: true, passive: true });
+
+document.addEventListener("keydown", (event) => {
+  if (event.isTrusted !== true || !isPotentialHandoverSourcePage()) return;
+  if (event.key !== "Enter") return;
+  reportHandoverActivity("enter");
+}, { capture: true, passive: true });
+
+document.addEventListener("submit", (event) => {
+  if (event.isTrusted !== true || !isPotentialHandoverSourcePage()) return;
+  reportHandoverActivity("submit");
+}, { capture: true, passive: true });
+
+// =============================================================================
 // MANUAL TRIGGER — fired by extension icon click (from service worker)
 // =============================================================================
 
@@ -396,6 +686,20 @@ function handleManualTrigger() {
 
   dismissed = false;
   interruptionPending = false;
+
+  // An explicit request supersedes a pending handover decision (issue #24):
+  // the candidate is consumed as "analyse normally" and the standard pipeline
+  // takes the page over. A lookup still in flight is simply invalidated.
+  if (pendingHandover !== null) {
+    chrome.runtime.sendMessage({
+      type: "handover_analyse_normally",
+      candidateId: pendingHandover.candidateId,
+    }).catch(() => {});
+    clearHandoverLocalState();
+    removeBanner();
+  } else if (handoverResolutionPending) {
+    clearHandoverLocalState();
+  }
 
   // Explicit user intent bypasses only the automatic login-page heuristic.
   // URL support, device-flow priority, delivery errors, and the single-job
@@ -462,7 +766,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return false;
     }
     if (status?.active === false && deviceFlowActive) deactivateDeviceFlowAdvisory();
+    // Issue #24: a pending prompt is revalidated against the candidate store
+    // rather than replaced by mutation evaluation; a lookup in flight already
+    // owns login handling and needs no extra evaluation.
+    if (pendingHandover !== null) {
+      void revalidatePendingHandover();
+      return false;
+    }
+    if (handoverResolutionPending) return false;
     scheduleEvaluation();
+    return false;
+  }
+
+  // Issue #24: authoritative expiry of an unanswered handover prompt, sent to
+  // this exact document by the background alarm. Stale ids change nothing.
+  if (message.type === "handover_expired" || message.type === "handover_invalidated") {
+    if (typeof message.candidateId === "string") handleHandoverExpiry(message.candidateId);
     return false;
   }
 
@@ -472,13 +791,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // Only the lifecycle decision is shared with top-document detection, which
   // is what keeps simultaneous reports from several frames down to one job.
   if (message.type === "embedded_login_detected") {
-    if (alreadyAnalysing || interruptionPending || deviceFlowActive) return false;
+    // Issue #24: a report while a candidate lookup is pending or the prompt is
+    // showing must not create another lookup, prompt or job. The response tells
+    // the exact reporting child whether this top lifecycle still owns a blocker.
+    if (alreadyAnalysing || interruptionPending || deviceFlowActive || hasHandoverState()) {
+      sendResponse({ ok: true, blocked: submissionBlocker !== null });
+      return false;
+    }
     if (bannerEl) {
       offerReanalysis();
+      sendResponse({ ok: true, blocked: submissionBlocker !== null });
       return false;
     }
     dismissed = false;
     handleLoginDetected();
+    sendResponse({ ok: true, blocked: submissionBlocker !== null });
     return false;
   }
 
@@ -774,9 +1101,11 @@ const BANNER_CSS = `
   #yp-banner[data-font-size="medium"] { font-size: 17px; }
   #yp-banner[data-font-size="large"]  { font-size: 20px; }
 
-  /* The only light-background verdict needs dark text; the progress verdicts
-     are blue with light text (issue #68). */
-  #yp-banner[data-verdict="unknown"] {
+  /* The light-background verdicts need dark text; the progress verdicts are
+     blue with light text (issue #68). The handover prompt (issue #24) shares
+     the unknown verdict's presentation: an undecided page, not a verdict. */
+  #yp-banner[data-verdict="unknown"],
+  #yp-banner[data-verdict="handover_pending"] {
     color: var(--yp-text-dark);
   }
 
@@ -942,6 +1271,30 @@ const BANNER_CSS = `
     opacity: 1;
   }
 
+  /* Handover prompt controls (issue #24). "Add to trusted" is the same green
+     affirmative action it is everywhere else; the two fallback decisions read
+     as outlined controls on the prompt's light background. */
+  .yp-btn-handover-add {
+    background-color: #2e7d32;
+  }
+
+  .yp-btn-handover-add:hover {
+    background-color: #1b5e20;
+  }
+
+  .yp-btn-handover-analyse,
+  .yp-btn-handover-leave {
+    background-color: transparent;
+    color: currentColor;
+    border: 1px solid currentColor;
+    opacity: 0.75;
+  }
+
+  .yp-btn-handover-analyse:hover,
+  .yp-btn-handover-leave:hover {
+    opacity: 1;
+  }
+
   /* A control whose operation is already running must not look clickable --
      the busy shield's cursor applies to the page, not to the banner. */
   .yp-btn:disabled {
@@ -1082,6 +1435,30 @@ const BANNER_CONFIG = {
     icon:    "error",
     message: (data) => analysisFailureMessage(data.code) + " You can try again.",
     buttons: ["retry", "close-x"],
+  },
+  // Issue #24 — a trusted page's own recent navigation reached this unknown
+  // login page. The prompt names the exact untrusted destination hostname,
+  // never implies it was verified, and has no dismiss control: a decision,
+  // expiry or navigation is what ends it. Submission stays blocked meanwhile.
+  handover_pending: {
+    color:   "var(--yp-white)",
+    icon:    "info",
+    message: (data) => {
+      const source = data.sourceHost ? data.sourceHost : "a trusted site";
+      const destination = data.destinationHost ? data.destinationHost : "this site";
+      return [
+        "You started a sign-in navigation from your trusted site ",
+        { text: source, bold: true },
+        { text: ". " },
+        { text: "The sign-in page is now on the untrusted site ", newLine: true },
+        { text: destination, bold: true },
+        { text: ". " },
+        { text: "Do you know and trust ", underline: true },
+        { text: destination, underline: true, bold: true },
+        { text: "?", underline: true },
+      ];
+    },
+    buttons: ["handover-add", "handover-analyse", "handover-leave"],
   },
   // Issue #39 — never "Safe.", overrides trusted/muted, no add/mute controls.
   // Dismissible for this navigation only: reappears on the next qualifying one.
@@ -1254,6 +1631,9 @@ function renderBanner(verdict, config, data, message, state) {
         ${config.buttons.includes("add-trusted") ? `<button class="yp-btn yp-btn-add-trusted">Add to trusted</button>` : ""}
         ${config.buttons.includes("manual-logo") ? `<button class="yp-btn yp-btn-manual-logo">Select logo manually</button>` : ""}
         ${config.buttons.includes("cancel-analysis") ? `<button class="yp-btn yp-btn-cancel">Cancel</button>` : ""}
+        ${config.buttons.includes("handover-add") ? `<button class="yp-btn yp-btn-handover-add">Add to trusted</button>` : ""}
+        ${config.buttons.includes("handover-analyse") ? `<button class="yp-btn yp-btn-handover-analyse">Analyse normally</button>` : ""}
+        ${config.buttons.includes("handover-leave") ? `<button class="yp-btn yp-btn-handover-leave">Leave site</button>` : ""}
       </div>
     </div>
   `;
@@ -1277,6 +1657,18 @@ function renderBanner(verdict, config, data, message, state) {
   });
 
   bannerEl.querySelector(".yp-btn-cancel")?.addEventListener("click", cancelAnalysisFromBanner);
+
+  // The handover prompt's three decisions (issue #24). Each consumes exactly
+  // the displayed candidate; handleHandoverAction keeps them single-flight.
+  bannerEl.querySelector(".yp-btn-handover-add")?.addEventListener("click", () => {
+    void handleHandoverAction("add");
+  });
+  bannerEl.querySelector(".yp-btn-handover-analyse")?.addEventListener("click", () => {
+    void handleHandoverAction("analyse");
+  });
+  bannerEl.querySelector(".yp-btn-handover-leave")?.addEventListener("click", () => {
+    void handleHandoverAction("leave");
+  });
 
   bannerEl.querySelector(".yp-btn-mute")?.addEventListener("click", () => {
     if (!confirm("Mute this site forever? You will no longer see warnings for it.")) return;
@@ -1423,17 +1815,26 @@ function removeBusyOverlay() {
 // FORM SUBMISSION BLOCK (during in-page analysis)
 // =============================================================================
 
+function setChildFrameSubmissionBlocked(blocked) {
+  chrome.runtime.sendMessage({
+    type: "set_child_frame_submission_block",
+    blocked,
+  }).catch(() => {});
+}
+
 function blockFormSubmission() {
   if (submissionBlocker) return;
   const handler = (e) => e.preventDefault();
   document.addEventListener("submit", handler, { capture: true });
   submissionBlocker = handler;
+  setChildFrameSubmissionBlocked(true);
 }
 
 function unblockFormSubmission() {
   if (!submissionBlocker) return;
   document.removeEventListener("submit", submissionBlocker, { capture: true });
   submissionBlocker = null;
+  setChildFrameSubmissionBlocked(false);
 }
 
 // =============================================================================
@@ -1510,6 +1911,9 @@ function isExtensionOwnedNode(node) {
 
 function activateDeviceFlowAdvisory(provider) {
   clearAnalysisDeadline();
+  // Device Code handling takes precedence over a pending handover (issue #24);
+  // the advisory below replaces the prompt and its local state.
+  clearHandoverLocalState();
   alreadyAnalysing = false;
   dismissed = false;
   analysisMode = null;
@@ -1568,6 +1972,9 @@ window.addEventListener("pageshow", async (event) => {
   if (!event.persisted) return;
 
   clearAnalysisDeadline();
+  // Stale local handover timers and state die with the restore (issue #24);
+  // whether a candidate still exists is re-asked below, never assumed.
+  clearHandoverLocalState();
   alreadyAnalysing = false;
   dismissed = false;
   analysisMode = null;
@@ -1584,11 +1991,15 @@ window.addEventListener("pageshow", async (event) => {
 
   const result = detectLoginPage();
   if (result.isLogin) {
-    if (analysisAttempted) {
-      showBanner("page_changed", {});
-    } else {
-      triggerPipeline();
+    if (!analysisAttempted) {
+      beginLoginHandling();
+      return;
     }
+    // The restored exact document may still own an active candidate -- the
+    // prompt it showed before comes back only when the service worker still
+    // vouches for it; otherwise the existing page-changed behavior stands.
+    if (await restorePendingHandover()) return;
+    showBanner("page_changed", {});
   }
 });
 
@@ -1597,6 +2008,6 @@ window.addEventListener("pageshow", async (event) => {
   if (await checkTrustedAddIntent()) return;
   const result = detectLoginPage();
   if (result.isLogin) {
-    triggerPipeline();
+    beginLoginHandling();
   }
 })();
