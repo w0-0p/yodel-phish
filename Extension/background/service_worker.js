@@ -54,6 +54,13 @@ import {
 import { createDeviceFlowStore } from "./deviceFlowSessions.mjs";
 import { createDeviceFlowSameTabSourceStore } from "./deviceFlowSameTabSources.mjs";
 import {
+  classifyHandoverCommit,
+  createHandoverCandidateStore,
+  HANDOVER_ACTIVATION_TTL_MS,
+  handoverIdentity,
+  identityHostname,
+} from "./handoverCandidates.mjs";
+import {
   applyManualLogoSelection,
   applyManualSiteMutation,
   compensateTrustedMutedCommit,
@@ -258,6 +265,54 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
+// =============================================================================
+// CROSS-DOMAIN LOGIN HANDOVER — issue #24. A candidate records only navigation
+// context (trusted source → unknown destination, both reduced to scheme+host),
+// never destination legitimacy. It lives in chrome.storage.session so MV3
+// suspension between the user's click and the destination's login detection
+// cannot lose it, and chrome.alarms owns its authoritative two-minute expiry.
+// =============================================================================
+
+const HANDOVER_EXPIRY_ALARM = "handover-expiry";
+const handoverCandidates = createHandoverCandidateStore(chrome.storage.session);
+
+async function scheduleHandoverExpiry() {
+  const nextExpiry = await handoverCandidates.nextExpiry();
+  if (nextExpiry === null) {
+    await chrome.alarms.clear(HANDOVER_EXPIRY_ALARM);
+    return;
+  }
+  await chrome.alarms.create(HANDOVER_EXPIRY_ALARM, { when: Math.max(nextExpiry, Date.now() + 100) });
+}
+
+// An unresolved candidate that lapses is collected here, and the destination
+// document that may be showing its prompt is told, so it can fall back to
+// standard analysis without waiting for another DOM mutation. The candidate id
+// makes a late notification inert against any newer prompt.
+async function expireHandoverCandidates() {
+  const expired = await handoverCandidates.takeExpired();
+  for (const candidate of expired) {
+    if (typeof candidate.destinationDocumentId === "string" && candidate.destinationDocumentId !== "") {
+      void sendDocumentMessage(candidate.targetTabId, candidate.destinationDocumentId, {
+        type: "handover_expired",
+        candidateId: candidate.candidateId,
+      });
+    }
+  }
+  await scheduleHandoverExpiry();
+}
+
+void expireHandoverCandidates().catch((error) => {
+  console.warn("[YodelPhish] Failed to initialize handover candidate expiry:", error);
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== HANDOVER_EXPIRY_ALARM) return;
+  void expireHandoverCandidates().catch((error) => {
+    console.warn("[YodelPhish] Failed to expire handover candidate state:", error);
+  });
+});
+
 async function cleanupClickfixWarningTabNavigation(tabId, url) {
   const requestId = clickfixRequestIdFromInterstitial(url);
   if (requestId === null || await clickfixWarnings.getWarning(requestId, tabId) === null) {
@@ -432,6 +487,12 @@ for (const [event, reasonHint, source] of [
       captureTracker.interruptTab(details.tabId);
       interruptForSameDocumentNavigation(details, reasonHint, source);
     }
+    // Issue #24: a same-document change keeps its scheme+host identity, so
+    // only browser-driven back/forward or address-bar history entries
+    // invalidate a handover candidate.
+    void invalidateHandoverForHistoryChange(details).catch((error) => {
+      console.warn("[YodelPhish] Failed to evaluate handover history navigation:", error);
+    });
     void handleDeviceFlowHistoryChange(details.tabId, details.url).catch((error) => {
       console.warn("[YodelPhish] Failed to evaluate device-flow history navigation:", error);
     });
@@ -442,6 +503,67 @@ for (const [event, reasonHint, source] of [
 // chrome.storage.session survive MV3 worker suspension.
 const sameTabSourcePreparations = new Map();
 const createdDeviceFlowTargetPreparations = new Map();
+// Issue #24: keyed by the tab whose commit must await the preparation — the
+// navigating tab for a same-tab handover, the created target tab otherwise —
+// so a fast commit cannot overtake candidate preparation.
+const handoverPreparations = new Map();
+// A destination lookup may start as soon as its content script reaches
+// document_idle. Keep the completed commit binding visible until then so a
+// deliberately brief activity-coordination wait cannot make lookup overtake it.
+const handoverCommitBindings = new Map();
+// Runtime activity messages and webNavigation events travel independently.
+// Publishing each activity handler here before it awaits storage lets the
+// navigation preparation wait for the exact source document's durable record.
+const handoverActivityRecordings = new Map();
+const HANDOVER_ACTIVITY_COORDINATION_GRACE_MS = 50;
+
+function clearHandoverActivityRecordings(tabId) {
+  const byDocument = handoverActivityRecordings.get(tabId);
+  if (byDocument !== undefined) {
+    for (const receipt of byDocument.values()) clearTimeout(receipt.cleanupTimer);
+  }
+  handoverActivityRecordings.delete(tabId);
+}
+
+function trackHandoverActivityRecording(tabId, documentId, receipt, operation) {
+  let byDocument = handoverActivityRecordings.get(tabId);
+  if (byDocument === undefined) {
+    byDocument = new Map();
+    handoverActivityRecordings.set(tabId, byDocument);
+  }
+  const previous = byDocument.get(documentId);
+  if (previous !== undefined) clearTimeout(previous.cleanupTimer);
+  byDocument.set(documentId, receipt);
+  const remainingMs = Math.max(0, receipt.receivedAt + HANDOVER_ACTIVATION_TTL_MS - Date.now());
+  receipt.cleanupTimer = setTimeout(() => {
+    if (byDocument.get(documentId) !== receipt) return;
+    byDocument.delete(documentId);
+    if (byDocument.size === 0) clearHandoverActivityRecordings(tabId);
+  }, remainingMs);
+  receipt.cleanupTimer?.unref?.();
+  void Promise.resolve(operation).catch(() => {});
+}
+
+function claimHandoverActivityReceipt(tabId, documentId, receipt) {
+  receipt.claimed = true;
+  clearTimeout(receipt.cleanupTimer);
+  const byDocument = handoverActivityRecordings.get(tabId);
+  if (byDocument?.get(documentId) !== receipt) return;
+  byDocument.delete(documentId);
+  if (byDocument.size === 0) clearHandoverActivityRecordings(tabId);
+}
+
+async function waitForHandoverActivityRecording(tabId, documentId) {
+  let receipt = handoverActivityRecordings.get(tabId)?.get(documentId);
+  if (receipt === undefined) {
+    // A click's runtime IPC is sent before its default navigation, but the two
+    // APIs do not share a completion queue. One short grace period lets the
+    // already-dispatched receipt register without delaying browser navigation.
+    await new Promise((resolve) => setTimeout(resolve, HANDOVER_ACTIVITY_COORDINATION_GRACE_MS));
+    receipt = handoverActivityRecordings.get(tabId)?.get(documentId);
+  }
+  return receipt ?? null;
+}
 
 // A top-level commit can replace the document without changing the URL. If it
 // happens during capture, the screenshot guard must remain interrupted even if
@@ -453,6 +575,26 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId !== 0) return;
   captureTracker.interruptTab(details.tabId);
   interruptForCommittedDocument(details);
+  // Issue #24: the commit that binds (or invalidates) a handover candidate
+  // waits for the candidate its own onBeforeNavigate / created-target event
+  // may still be preparing, so a fast commit cannot overtake preparation.
+  const handoverPreparation = handoverPreparations.get(details.tabId);
+  handoverPreparations.delete(details.tabId);
+  const handoverBinding = Promise.resolve(handoverPreparation)
+    .catch((error) => {
+      console.warn("[YodelPhish] Failed to prepare handover candidate:", error);
+    })
+    .then(() => handleHandoverCommit(details));
+  handoverCommitBindings.set(details.tabId, handoverBinding);
+  void handoverBinding
+    .catch((error) => {
+      console.warn("[YodelPhish] Failed to evaluate handover navigation:", error);
+    })
+    .finally(() => {
+      if (handoverCommitBindings.get(details.tabId) === handoverBinding) {
+        handoverCommitBindings.delete(details.tabId);
+      }
+    });
   const sameTabPreparation = sameTabSourcePreparations.get(details.tabId);
   const createdTargetPreparation = createdDeviceFlowTargetPreparations.get(details.tabId);
   sameTabSourcePreparations.delete(details.tabId);
@@ -491,6 +633,16 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     }
     console.warn("[YodelPhish] Failed to prepare same-tab device-flow source:", error);
   });
+  // Issue #24: before the navigation replaces the source document, match it to
+  // recent user activity on that exact document and prepare the candidate.
+  const handoverPreparation = prepareHandoverSameTabCandidate(details);
+  handoverPreparations.set(details.tabId, handoverPreparation);
+  void handoverPreparation.catch((error) => {
+    if (handoverPreparations.get(details.tabId) === handoverPreparation) {
+      handoverPreparations.delete(details.tabId);
+    }
+    console.warn("[YodelPhish] Failed to prepare handover candidate:", error);
+  });
 });
 
 chrome.webNavigation.onErrorOccurred.addListener((details) => {
@@ -502,6 +654,16 @@ chrome.webNavigation.onErrorOccurred.addListener((details) => {
     .then(() => sameTabDeviceFlowSources.discardTab(details.tabId))
     .catch((error) => {
       console.warn("[YodelPhish] Failed to discard aborted same-tab device-flow source:", error);
+    });
+  // Every failed top-level navigation is a reset condition, including a
+  // client redirect or unrelated user navigation after the prompt appeared.
+  const handoverPreparation = handoverPreparations.get(details.tabId);
+  handoverPreparations.delete(details.tabId);
+  void Promise.resolve(handoverPreparation)
+    .catch(() => {})
+    .then(() => invalidateHandoverCandidate(details.tabId))
+    .catch((error) => {
+      console.warn("[YodelPhish] Failed to invalidate handover after a navigation error:", error);
     });
   void abortTrustedAddIntent(details.tabId).catch((error) => {
     console.warn("[YodelPhish] Failed to abort trusted-add intent after navigation error:", error);
@@ -559,6 +721,17 @@ async function recordSameTabDeviceFlowSource(details) {
 // tab's own analysis has a chance to run, so the target is protected even if
 // the source page is never itself flagged as anything.
 chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
+  // Issue #24: a trusted page's own activity may open the sign-in destination
+  // in a new tab or window; the candidate is prepared against the exact source
+  // document before the target's first commit can bind it.
+  const handoverPreparation = prepareHandoverNavigationTarget(details);
+  handoverPreparations.set(details.tabId, handoverPreparation);
+  void handoverPreparation.catch((error) => {
+    if (handoverPreparations.get(details.tabId) === handoverPreparation) {
+      handoverPreparations.delete(details.tabId);
+    }
+    console.warn("[YodelPhish] Failed to prepare handover navigation target:", error);
+  });
   const preparation = recordDeviceFlowNavigationTarget(details);
   createdDeviceFlowTargetPreparations.set(details.tabId, preparation);
   void preparation.then(
@@ -601,6 +774,188 @@ async function resolveDeviceFlowRelationshipSource(relationship) {
   });
   if (sourceOrigin === DEVICE_FLOW_UNKNOWN_SOURCE) return relationship;
   return await deviceFlowSessions.recordSourceOrigin(relationship.targetTabId, sourceOrigin) ?? relationship;
+}
+
+// =============================================================================
+// HANDOVER CANDIDATE PREPARATION AND NAVIGATION (issue #24)
+//
+// Chrome event wiring only; the decisions live in handoverCandidates.mjs. A
+// candidate is created when browser-generated activity on an exact, currently
+// trusted HTTPS top document is followed by an attributable top-level
+// navigation, and bound to the destination document its commit produces.
+// =============================================================================
+
+// Whether the resolved frame's page is a valid handover source right now: an
+// HTTPS identity whose fqdn is currently trusted (and not muted).
+async function resolveHandoverSource(frame) {
+  if (frame === null || typeof frame.documentId !== "string" || frame.documentId === "") return null;
+  const identity = handoverIdentity(frame.url);
+  if (identity === null) return null;
+  const origin = await checkOrigin(identity);
+  if (origin.valid !== true || !origin.in_trusted_list || !origin.protocol_matches ||
+      origin.protocol !== "https" || origin.in_muted_list) {
+    return null;
+  }
+  return { identity, documentId: frame.documentId };
+}
+
+// Consumes the tab's activation for the navigation now leaving sourceTabId's
+// top document and prepares the candidate keyed by targetTabId. The current
+// trusted source is resolved from the onBeforeNavigate snapshot before the
+// short activity-coordination wait. Matching the receipt and activation to its
+// exact document ID keeps replacement fail-closed after that document commits.
+async function prepareHandoverCandidate(sourceTabId, targetTabId) {
+  const frame = await resolveTopFrame(sourceTabId);
+  const source = await resolveHandoverSource(frame);
+  if (source === null) return;
+
+  const receipt = await waitForHandoverActivityRecording(sourceTabId, source.documentId);
+  if (receipt !== null) {
+    // Claiming the receipt lets preparation persist it even if the source
+    // document commits away before the asynchronous message handler finishes.
+    // The handler observes the claim and cannot leave a duplicate activation.
+    claimHandoverActivityReceipt(sourceTabId, source.documentId, receipt);
+    await handoverCandidates.recordActivation({
+      tabId: sourceTabId,
+      documentId: source.documentId,
+      sourceOrigin: source.identity,
+      createdAt: receipt.receivedAt,
+    });
+  }
+
+  const activation = await handoverCandidates.consumeActivation(sourceTabId, {
+    documentId: source.documentId,
+    sourceOrigin: source.identity,
+  });
+  if (activation === null) return;
+  await handoverCandidates.createCandidate({
+    sourceTabId,
+    targetTabId,
+    sourceDocumentId: activation.documentId,
+    sourceOrigin: activation.sourceOrigin,
+    activationAt: activation.createdAt,
+  });
+  await scheduleHandoverExpiry();
+}
+
+// Same-tab handover: the destination identity is not judged here -- a link on
+// the trusted site may server-redirect to the external sign-in host, so only
+// the final committed document (handleHandoverCommit) decides whether the
+// navigation actually left the source identity.
+async function prepareHandoverSameTabCandidate(details) {
+  await prepareHandoverCandidate(details.tabId, details.tabId);
+}
+
+async function prepareHandoverNavigationTarget(details) {
+  // Only top-level activity in the source page qualifies; a child frame's
+  // popup must not inherit the top document's trusted context.
+  if (details.sourceFrameId !== 0) return;
+  await prepareHandoverCandidate(details.sourceTabId, details.tabId);
+}
+
+// Binds the candidate to the committed destination document, follows client
+// redirects without extending the lifetime, and invalidates on everything
+// else: browser-driven navigation, a return to the source identity, a
+// non-HTTPS destination, or an unrelated new navigation.
+async function handleHandoverCommit(details) {
+  const candidate = await handoverCandidates.getCandidate(details.tabId);
+  if (candidate === null) return;
+  let hostname = "";
+  try {
+    hostname = new URL(details.url).hostname;
+  } catch {
+    hostname = "";
+  }
+  // An authority-less loading commit (about:blank while a created window
+  // loads) is not a real navigation yet.
+  if (hostname === "" && !isInterstitialUrl(details.url)) return;
+  const classification = classifyHandoverCommit(details);
+  const identity = handoverIdentity(details.url);
+  const bindable = identity !== null && identity !== candidate.sourceOrigin &&
+    !isInterstitialUrl(details.url);
+
+  if (candidate.destinationDocumentId === null) {
+    if ((classification === "page" || classification === "client_redirect") && bindable) {
+      await handoverCandidates.bindDestination(details.tabId, {
+        documentId: details.documentId,
+        destinationOrigin: identity,
+      });
+    } else {
+      await handoverCandidates.discardCandidate(details.tabId);
+    }
+    await scheduleHandoverExpiry();
+    return;
+  }
+
+  if (classification === "direct" || classification === "preserve") {
+    await handoverCandidates.discardCandidate(details.tabId);
+    await scheduleHandoverExpiry();
+    return;
+  }
+  if (details.documentId === candidate.destinationDocumentId) return;
+  if (classification === "client_redirect" && bindable) {
+    await handoverCandidates.bindDestination(details.tabId, {
+      documentId: details.documentId,
+      destinationOrigin: identity,
+    });
+  } else {
+    await handoverCandidates.discardCandidate(details.tabId);
+  }
+  await scheduleHandoverExpiry();
+}
+
+// Removes one candidate atomically and tells its exact bound document to
+// leave the prompt immediately. Stale notifications are candidate-id scoped.
+async function invalidateHandoverCandidate(tabId) {
+  const candidate = await handoverCandidates.takeCandidate(tabId);
+  if (candidate === null) return false;
+  await scheduleHandoverExpiry();
+  if (typeof candidate.destinationDocumentId === "string" && candidate.destinationDocumentId !== "") {
+    void sendDocumentMessage(tabId, candidate.destinationDocumentId, {
+      type: "handover_invalidated",
+      candidateId: candidate.candidateId,
+    });
+  }
+  return true;
+}
+
+// Same-document History API changes cannot change this feature's scheme+host
+// identity, so path/query/fragment updates keep the candidate; back/forward
+// and address-bar history navigation invalidate it.
+async function invalidateHandoverForHistoryChange(details) {
+  const classification = classifyHandoverCommit(details);
+  if (classification !== "direct" && classification !== "preserve") return;
+  await invalidateHandoverCandidate(details.tabId);
+}
+
+// "Leave site": back out of a same-tab handover (closing the tab when there is
+// no history to go back to), or close a created target and give the source tab
+// back its focus if it still exists. The candidate is already consumed.
+async function leaveHandoverDestination(tabId, candidate) {
+  if (candidate.sourceTabId === candidate.targetTabId) {
+    try {
+      await chrome.tabs.goBack(tabId);
+      return true;
+    } catch {
+      // No back entry (or the call failed): closing is the remaining exit.
+    }
+    try {
+      await chrome.tabs.remove(tabId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    await chrome.tabs.remove(candidate.targetTabId);
+  } catch {
+    return false;
+  }
+  const sourceTab = await chrome.tabs.get(candidate.sourceTabId).catch(() => null);
+  if (sourceTab !== null) {
+    await chrome.tabs.update(candidate.sourceTabId, { active: true }).catch(() => {});
+  }
+  return true;
 }
 
 // The effective registry: read-only built-ins (code) plus user-added endpoints.
@@ -714,10 +1069,30 @@ async function handleDeviceFlowHistoryChange(tabId, url) {
   }).catch(() => {});
 }
 
+chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  for (const tabId of [addedTabId, removedTabId]) {
+    handoverPreparations.delete(tabId);
+    handoverCommitBindings.delete(tabId);
+    clearHandoverActivityRecordings(tabId);
+  }
+  void Promise.all([
+    handoverCandidates.discardTab(removedTabId),
+    handoverCandidates.discardTab(addedTabId),
+  ]).then(scheduleHandoverExpiry).catch((error) => {
+    console.warn("[YodelPhish] Failed to discard replaced handover state:", error);
+  });
+});
+
 chrome.tabs.onRemoved.addListener((removedTabId) => {
   captureTracker.interruptTab(removedTabId);
   sameTabSourcePreparations.delete(removedTabId);
   createdDeviceFlowTargetPreparations.delete(removedTabId);
+  handoverPreparations.delete(removedTabId);
+  handoverCommitBindings.delete(removedTabId);
+  clearHandoverActivityRecordings(removedTabId);
+  void handoverCandidates.discardTab(removedTabId).then(scheduleHandoverExpiry).catch((error) => {
+    console.warn("[YodelPhish] Failed to discard handover candidate state:", error);
+  });
   void sameTabDeviceFlowSources.discardTab(removedTabId).catch((error) => {
     console.warn("[YodelPhish] Failed to discard same-tab device-flow source:", error);
   });
@@ -2570,8 +2945,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   const tabId = sender.tab?.id;
+  const context = { receivedAt: Date.now(), handoverActivityReceipt: null };
+  const activityKind = message?.kind;
+  const trackActivity = message?.type === "handover_user_activity" &&
+    (activityKind === "link" || activityKind === "button" ||
+      activityKind === "enter" || activityKind === "submit") &&
+    Number.isInteger(tabId) && isTopFrameSender(sender) &&
+    typeof sender?.documentId === "string" && sender.documentId !== "";
+  if (trackActivity) {
+    context.handoverActivityReceipt = { receivedAt: context.receivedAt, claimed: false };
+  }
+  const handling = storageAccessReady.then(() =>
+    handleMessage(message, tabId, sender.url ?? sender.tab?.url, sender, context)
+  );
+  if (trackActivity) {
+    trackHandoverActivityRecording(
+      tabId, sender.documentId, context.handoverActivityReceipt, handling
+    );
+  }
   withTimeout(
-    storageAccessReady.then(() => handleMessage(message, tabId, sender.url ?? sender.tab?.url, sender)),
+    handling,
     MESSAGE_RESPONSE_TIMEOUT_MS,
     new AnalysisExecutionError("job_timeout", "Message handler exceeded its response deadline")
   )
@@ -2583,7 +2976,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-async function handleMessage(message, tabId, senderUrl, sender) {
+async function handleMessage(message, tabId, senderUrl, sender, context = {}) {
   switch (message.type) {
     case "run_pipeline": {
       if (tabId === undefined) return;
@@ -2837,12 +3230,25 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       if (typeof topDocumentId !== "string" || topDocumentId === "" ||
           topFrame?.documentLifecycle !== "active") return;
 
-      await chrome.tabs.sendMessage(
+      const response = await chrome.tabs.sendMessage(
         tabId,
         { type: "embedded_login_detected" },
         { documentId: topDocumentId }
-      ).catch(() => {});
-      return;
+      ).catch(() => null);
+      return { ok: response?.ok === true, blocked: response?.blocked === true };
+    }
+
+    // The top document owns the blocker lifecycle, while each injected child
+    // frame owns the listener that can actually cancel its local submissions.
+    case "set_child_frame_submission_block": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: false };
+      const resolved = await resolveAuthoritativeTopFrame(tabId, sender);
+      if (!resolved.ok) return { ok: false };
+      await chrome.tabs.sendMessage(tabId, {
+        type: "set_submission_blocked",
+        blocked: message.blocked === true,
+      }).catch(() => {});
+      return { ok: true };
     }
 
     case "analysis_client_timed_out": {
@@ -3059,6 +3465,95 @@ async function handleMessage(message, tabId, senderUrl, sender) {
       if (intent === null) return { ok: true, active: false };
       const origin = await parseListOrigin(senderUrl);
       return { ok: true, active: origin !== null && origin.fqdn === intent.fqdn };
+    }
+
+    // =========================================================================
+    // CROSS-DOMAIN LOGIN HANDOVER (issue #24)
+    //
+    // Every handler is top-frame only and anchored to an exact document, like
+    // the job messages above. The content script reports only an activity
+    // kind; the URL, the timestamp and the trusted check all come from this
+    // side, so a page can neither forge its origin nor backdate its click.
+    // =========================================================================
+
+    // Browser-generated user activity (isTrusted-filtered in content.js) on
+    // what may be a trusted page. Arms the five-second activation window when
+    // the authoritative top frame is an HTTPS identity that is currently
+    // trusted; anything else records nothing.
+    case "handover_user_activity": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: false };
+      if (!["link", "button", "enter", "submit"].includes(message.kind)) return { ok: false };
+      if (typeof sender?.documentId !== "string" || sender.documentId === "") return { ok: false };
+      const resolved = await resolveAuthoritativeTopFrame(tabId, sender);
+      if (!resolved.ok) return { ok: false };
+      const source = await resolveHandoverSource({ documentId: resolved.documentId, url: resolved.url });
+      if (source === null) return { ok: false };
+      if (context.handoverActivityReceipt?.claimed === true) return { ok: true };
+      const activation = await handoverCandidates.recordActivation({
+        tabId,
+        documentId: source.documentId,
+        sourceOrigin: source.identity,
+        createdAt: context.receivedAt,
+      });
+      return { ok: activation !== null };
+    }
+
+    // Login detection asks whether its exact current top document is a
+    // handover destination, before any pipeline job is created. Trusted and
+    // muted destinations keep their existing behavior, and an identity that no
+    // longer matches the bound destination fails closed.
+    case "resolve_handover_candidate": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: true, candidate: null };
+      const binding = handoverCommitBindings.get(tabId);
+      if (binding !== undefined) await binding.catch(() => {});
+      const resolved = await resolveAuthoritativeTopFrame(tabId, sender);
+      if (!resolved.ok) return { ok: true, candidate: null };
+      const candidate = await handoverCandidates.getCandidateForDocument(tabId, resolved.documentId);
+      if (candidate === null) return { ok: true, candidate: null };
+      const identity = handoverIdentity(resolved.url);
+      const origin = identity === null ? { valid: false } : await checkOrigin(identity);
+      const trustedIdentity = origin.valid === true && origin.in_trusted_list &&
+        origin.protocol_matches && origin.protocol === "https";
+      if (identity !== candidate.destinationOrigin || origin.valid !== true ||
+          trustedIdentity || origin.in_muted_list) {
+        await handoverCandidates.discardCandidate(tabId);
+        await scheduleHandoverExpiry();
+        return { ok: true, candidate: null };
+      }
+      // Hostnames only: the prompt names both sides, and expires_at lets the
+      // content script arm its local fallback timer.
+      return {
+        ok: true,
+        candidate: {
+          candidateId: candidate.candidateId,
+          sourceHost: identityHostname(candidate.sourceOrigin),
+          destinationHost: identityHostname(candidate.destinationOrigin),
+          expiresAt: candidate.expiresAt,
+        },
+      };
+    }
+
+    // The three prompt decisions. Each consumes exactly the named candidate,
+    // and only from the bound destination document in the candidate's own
+    // target tab -- expired and stale ids, or an action from a different tab
+    // or document, are rejected and consume nothing. What the decision starts
+    // (the trusted-add flow, the explicit pipeline) is driven by the content
+    // script through the existing entry points; "leave" is performed here.
+    case "handover_add_to_trusted":
+    case "handover_analyse_normally":
+    case "handover_leave": {
+      if (tabId === undefined || !isTopFrameSender(sender)) return { ok: false };
+      if (typeof sender?.documentId !== "string" || sender.documentId === "") return { ok: false };
+      const candidate = await handoverCandidates.consumeCandidateForAction(tabId, {
+        candidateId: message.candidateId,
+        documentId: sender.documentId,
+      });
+      await scheduleHandoverExpiry();
+      if (candidate === null) return { ok: false, reason: "no_candidate" };
+      if (message.type === "handover_leave") {
+        return { ok: await leaveHandoverDestination(tabId, candidate) };
+      }
+      return { ok: true };
     }
 
     // =========================================================================

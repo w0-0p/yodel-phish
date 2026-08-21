@@ -8,11 +8,11 @@
 // them. Chrome can inject into those frames; reading them from outside is what
 // is impossible.
 //
-// This watcher is therefore injected into every frame and does exactly one
-// thing: tell the service worker when its own document *becomes* a login page.
-// It never starts an analysis, captures anything, renders a banner, reads
-// settings, touches the icon, or blocks submission. The top document decides
-// what the report means; the service worker forwards it there.
+// This watcher is therefore injected into every frame and tells the service
+// worker when its own document becomes a login page. It also owns the only
+// submit listener capable of blocking a cross-origin child document: the top
+// lifecycle tells it when to retain or release that guard. It still never
+// starts analysis, captures, renders UI, reads settings, or touches the icon.
 (function watchChildFrameLogin() {
   // The top document has the real content script. This file must stay inert
   // there, so a page can never end up with two owners of the same lifecycle.
@@ -31,6 +31,31 @@
   // a replacement document rendering a credential form is reported again.
   let reportedLogin = false;
   let evaluationScheduled = false;
+  let detectionBlock = false;
+  let lifecycleBlock = false;
+  let submissionBlocker = null;
+  let reportVersion = 0;
+  let controlVersion = 0;
+
+  function syncSubmissionBlocker() {
+    const shouldBlock = detectionBlock || lifecycleBlock;
+    if (shouldBlock && submissionBlocker === null) {
+      submissionBlocker = (event) => event.preventDefault();
+      document.addEventListener("submit", submissionBlocker, { capture: true });
+    } else if (!shouldBlock && submissionBlocker !== null) {
+      document.removeEventListener("submit", submissionBlocker, { capture: true });
+      submissionBlocker = null;
+    }
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "set_submission_blocked") return false;
+    controlVersion += 1;
+    lifecycleBlock = message.blocked === true;
+    syncSubmissionBlocker();
+    sendResponse({ ok: true });
+    return false;
+  });
 
   const observerOptions = {
     subtree: true,
@@ -56,14 +81,37 @@
     const isLogin = detector.detectLoginPage(document, window).isLogin;
     if (isLogin === reportedLogin) return;
     reportedLogin = isLogin;
-    if (!isLogin) return;
+    reportVersion += 1;
+    if (!isLogin) {
+      detectionBlock = false;
+      syncSubmissionBlocker();
+      return;
+    }
+
+    // Block this exact frame before the asynchronous report leaves it. The top
+    // response or lifecycle broadcast then decides whether the guard remains.
+    detectionBlock = true;
+    syncSubmissionBlocker();
+    const ownReportVersion = reportVersion;
+    const startingControlVersion = controlVersion;
     try {
-      // An orphaned frame (the extension was reloaded or disabled under it)
-      // throws synchronously rather than rejecting. Either way the report is
-      // simply lost: nothing in this file has state worth recovering.
-      chrome.runtime.sendMessage({ type: "child_frame_login_detected" }).catch(() => {});
+      chrome.runtime.sendMessage({ type: "child_frame_login_detected" })
+        .then((response) => {
+          if (reportVersion !== ownReportVersion) return;
+          detectionBlock = false;
+          if (controlVersion === startingControlVersion) {
+            lifecycleBlock = response?.blocked === true;
+          }
+          syncSubmissionBlocker();
+        })
+        .catch(() => {
+          if (reportVersion !== ownReportVersion) return;
+          detectionBlock = false;
+          syncSubmissionBlocker();
+        });
     } catch {
-      // no-op
+      detectionBlock = false;
+      syncSubmissionBlocker();
     }
   }
 
