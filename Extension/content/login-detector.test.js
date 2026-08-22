@@ -508,6 +508,211 @@ test("a heading outside the form but inside its enclosing dialog provides the cu
   assert.equal(withPlainCard.isLogin, false, "containers are never inferred from class names");
 });
 
+// -----------------------------------------------------------------------------
+// Issue #22 — an email/identity-verification login stage whose only cue is a
+// compound verification heading (e.g. "Verify Your Email"). The identity field
+// is form-owned with an associated forward action, but carries no
+// autocomplete="username", no sign-in/log-in text, and no hidden password step.
+// -----------------------------------------------------------------------------
+
+test("the email-verification stage with a heading beside the form is a login page", () => {
+  // Mirrors the reported Stage 1 modal: <h2>Verify Your Email</h2> is a sibling
+  // of the <form>, inside a wrapper with no role="dialog", and the only action
+  // named for the flow is a native "Continue" submit.
+  const result = detect(
+    el("div", { class: "modal-overlay", id: "emailModal" },
+      el("div", { class: "modal-content" },
+        el("h2", { class: "modal-title", text: "Verify Your Email" }),
+        el("p", { class: "modal-description", text: "Please enter your email address to continue verification." }),
+        el("form", { id: "emailForm" },
+          el("div", { class: "form-group" },
+            el("label", { class: "form-label", for: "emailInput", text: "Email address" }),
+            el("input", { type: "email", id: "emailInput", placeholder: "user@example.com" })
+          ),
+          el("div", { class: "modal-actions" },
+            el("button", { type: "button", text: "Cancel" }),
+            el("button", { type: "submit", text: "Continue" })
+          )
+        )
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, true);
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("a verification heading inside the form provides the cue", () => {
+  const result = detect(
+    el("form", {},
+      el("h2", { text: "Verify Your Email" }),
+      el("input", { type: "email" }),
+      el("button", { type: "submit", text: "Continue" })
+    )
+  );
+
+  assert.equal(result.isLogin, true);
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("the verification heading may sit in the form's nearest small wrapper", () => {
+  // The exact target structure from the issue: a bare <div> wrapper holding the
+  // heading and, as a sibling, the form with a Cancel and a Continue button.
+  const result = detect(
+    el("div", {},
+      el("h2", { text: "Verify Your Email" }),
+      el("form", {},
+        el("label", { for: "email", text: "Email address" }),
+        el("input", { id: "email", type: "email" }),
+        el("button", { type: "button", text: "Cancel" }),
+        el("button", { type: "submit", text: "Continue" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, true);
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("a hidden verification heading does not qualify", () => {
+  const result = detect(
+    el("div", {},
+      el("h2", { text: "Verify Your Email", style: { display: "none" } }),
+      el("form", {},
+        el("input", { type: "email" }),
+        el("button", { type: "submit", text: "Continue" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "only a visible verification heading is a cue");
+});
+
+test("an inactive email field does not qualify even with a verification heading", () => {
+  const result = detect(
+    el("div", {},
+      el("h2", { text: "Verify Your Email" }),
+      el("form", {},
+        el("input", { type: "email", disabled: true }),
+        el("button", { type: "submit", text: "Continue" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "the identity field must be active");
+});
+
+test("an email field without an associated forward action does not qualify", () => {
+  const result = detect(
+    el("div", {},
+      el("h2", { text: "Verify Your Email" }),
+      el("form", {},
+        el("input", { type: "email" }),
+        el("button", { type: "button", text: "Cancel" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a forward action associated with the form is still required");
+});
+
+test("an email form with Continue but no verification heading stays undetected", () => {
+  const result = detect(
+    el("div", {},
+      el("form", {},
+        el("label", { text: "Email address" }),
+        el("input", { type: "email" }),
+        el("button", { type: "submit", text: "Continue" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "email + Continue alone is a newsletter-shaped form");
+});
+
+test("a generic Verification Required heading does not qualify by itself", () => {
+  // The reported page's outer banner. "Verification Required" is not one of the
+  // compound identity phrases, so it must not stand in for the cue.
+  const result = detect(
+    el("div", {},
+      el("h1", { text: "Verification Required" }),
+      el("form", {},
+        el("input", { type: "email" }),
+        el("button", { type: "submit", text: "Continue" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, false, "bare 'verification' is not a compound identity cue");
+});
+
+test("verification text elsewhere on the page is not borrowed by an email form", () => {
+  const emailForm = () =>
+    el("form", {},
+      el("input", { type: "email" }),
+      el("button", { type: "submit", text: "Continue" })
+    );
+
+  // Two neutral wrappers deep, with the heading a body-level sibling.
+  const inBody = detect(
+    el("div", {}, el("div", {}, emailForm())),
+    el("h1", { text: "Verify Your Email" })
+  );
+  assert.equal(inBody.isLogin, false, "the walk stops before <body>");
+
+  // The heading sits inside <main>, above the form's wrapper; the walk stops at
+  // the landmark before reaching it.
+  const inMain = detect(
+    el("main", {},
+      el("h1", { text: "Verify Your Identity" }),
+      el("div", {}, emailForm())
+    )
+  );
+  assert.equal(inMain.isLogin, false, "an application landmark bounds the walk");
+
+  // A page header outside the modal that owns the form.
+  const inHeader = detect(
+    el("header", {}, el("h1", { text: "Verify Your Account" })),
+    el("div", {}, el("div", {}, emailForm()))
+  );
+  assert.equal(inHeader.isLogin, false, "a page header is not the form's wrapper");
+
+  // An unrelated widget elsewhere in the document.
+  const inWidget = detect(
+    el("div", {}, emailForm()),
+    el("aside", {}, el("h3", { text: "Verify Your Email" }))
+  );
+  assert.equal(inWidget.isLogin, false, "a sibling widget is not the form's wrapper");
+});
+
+test("nested sibling verification widgets do not provide a form cue", () => {
+  const emailForm = () =>
+    el("form", {},
+      el("input", { type: "email" }),
+      el("button", { type: "submit", text: "Continue" })
+    );
+
+  const siblingWidget = detect(
+    el("div", {},
+      el("aside", {}, el("h3", { text: "Verify Your Email" })),
+      el("section", {}, emailForm())
+    )
+  );
+  assert.equal(
+    siblingWidget.isLogin,
+    false,
+    "a heading nested in another widget under a shared wrapper is unrelated"
+  );
+
+  const headerAncestor = detect(
+    el("header", {},
+      el("h1", { text: "Verify Your Account" }),
+      el("section", {}, emailForm())
+    )
+  );
+  assert.equal(headerAncestor.isLogin, false, "a grandparent page header is not a local form wrapper");
+});
+
 test("a valid login is found after an earlier newsletter candidate", () => {
   const newsletterOnly = detect(
     el("form", {},
