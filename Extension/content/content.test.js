@@ -24,11 +24,15 @@ function createFakeButton() {
   const listeners = new Map();
   return {
     hidden: false,
+    disabled: false,
     addEventListener(type, listener) {
       listeners.set(type, listener);
     },
     click() {
-      listeners.get("click")?.();
+      if (!this.disabled) listeners.get("click")?.();
+    },
+    getBoundingClientRect() {
+      return { width: 10, height: 10, x: 0, y: 0, left: 0, top: 0 };
     },
   };
 }
@@ -69,8 +73,25 @@ function createFakeElement(tagName) {
     _attributes: {},
     _buttons: new Map(),
     tagName,
+    // Mutation records carry real nodes, and isExtensionOwnedNode() walks
+    // parentElement to the root, so both have to exist. `isConnected` is what
+    // tells a mounted banner host from one the page detached (issue #23);
+    // nothing is connected until the body accepts it.
+    nodeType: 1,
+    parentElement: null,
+    isConnected: false,
     style: {
       _properties: new Map(),
+      // The capture hiding is written as a plain property assignment and
+      // cleared through removeProperty(), so the fake keeps the two in sync
+      // the way a real CSSStyleDeclaration does.
+      get visibility() {
+        return this.getPropertyValue("visibility");
+      },
+      set visibility(value) {
+        if (value === "") this.removeProperty("visibility");
+        else this.setProperty("visibility", value);
+      },
       setProperty(property, value, priority = "") {
         this._properties.set(property, { value: String(value), priority: String(priority) });
       },
@@ -102,7 +123,7 @@ function createFakeElement(tagName) {
       return this._attributes[name] ?? null;
     },
     getBoundingClientRect() {
-      return { width: 10, height: 10, x: 0, y: 0 };
+      return { width: 10, height: 10, x: 0, y: 0, left: 0, top: 0 };
     },
     querySelector(selector) {
       return selector === ".yp-message" ? messageNode : this._buttons.get(selector) ?? null;
@@ -120,6 +141,8 @@ function createFakeElement(tagName) {
     removeEventListener() {},
     remove() {
       this._removed = true;
+      this.isConnected = false;
+      this.parentElement = null;
     },
     prepend() {},
     // The banner mounts inside a closed Shadow Root on an anonymous host
@@ -186,9 +209,12 @@ function loadContentScript({
   let lastPrepended = null;
   let prependCount = 0;
   const fakeBody = createFakeElement("body");
+  fakeBody.isConnected = true;
   fakeBody.prepend = (node) => {
     lastPrepended = node;
     prependCount += 1;
+    node.isConnected = true;
+    node.parentElement = fakeBody;
   };
   // The busy overlay is the only thing appended (not prepended) to the body, so
   // spying appendChild is enough to observe it; removeBusyOverlay() marks it
@@ -196,6 +222,8 @@ function loadContentScript({
   let busyOverlay = null;
   fakeBody.appendChild = (node) => {
     busyOverlay = node;
+    node.isConnected = true;
+    node.parentElement = fakeBody;
     return node;
   };
   // The Shadow-root walk reads `children`/`shadowRoot`, so the body needs a
@@ -205,6 +233,8 @@ function loadContentScript({
   const fakeDocument = {
     title: "",
     body: fakeBody,
+    // The capture stability wait samples the scroll box every frame.
+    documentElement: { scrollWidth: 1000, scrollHeight: 800 },
     images: [],
     getAnimations: () => [],
     querySelectorAll() {
@@ -212,6 +242,16 @@ function loadContentScript({
     },
     querySelector() {
       return null;
+    },
+    elementFromPoint() {
+      const host = lastPrepended;
+      const banner = bannerRoot(host);
+      if (
+        host?.isConnected === true
+        && host.parentElement === fakeBody
+        && banner?.style.getPropertyValue("visibility") !== "hidden"
+      ) return host;
+      return fakeBody;
     },
     createElement(tag) {
       const element = createFakeElement(tag);
@@ -289,6 +329,13 @@ function loadContentScript({
   global.chrome = fakeChrome;
   global.confirm = () => true;
   global.MutationObserver = FakeMutationObserver;
+  // The capture handshake awaits animation frames. Running them as microtasks
+  // keeps the whole preparation inside flushCapturePreparation(), with no real
+  // frames and no dependency on the mocked setTimeout.
+  global.requestAnimationFrame = (callback) => {
+    queueMicrotask(callback);
+    return 0;
+  };
   global.Node = { ELEMENT_NODE: 1 };
   global.YodelLoginDetector = {
     DETECTION_ATTRIBUTES,
@@ -354,6 +401,59 @@ function loadContentScript({
     },
     get bannerRemoved() {
       return lastPrepended?._removed ?? false;
+    },
+    // The banner is hidden for the screenshot with an inline visibility style
+    // on the element inside the shadow root (issue #77).
+    get bannerHidden() {
+      return bannerRoot(lastPrepended)?.style.getPropertyValue("visibility") === "hidden";
+    },
+    // A single-page app clearing document.body.firstElementChild takes the
+    // anonymous banner host with it, while the separately appended shield
+    // stays (issue #23). The observer sees the childList record the browser
+    // would have produced.
+    detachBannerHost({ notify = true } = {}) {
+      const host = lastPrepended;
+      assert.ok(host, "there is no mounted banner host to detach");
+      host.isConnected = false;
+      host.parentElement = null;
+      if (!notify) return;
+      this.emitMutations([
+        { type: "childList", target: fakeBody, addedNodes: [], removedNodes: [host] },
+      ]);
+    },
+    // A connected host can still be unreachable when an SPA moves it below
+    // one of its own hidden containers. This emits the reparenting mutation
+    // while deliberately keeping isConnected true.
+    reparentBannerHost() {
+      const host = lastPrepended;
+      assert.ok(host, "there is no mounted banner host to reparent");
+      const pageContainer = createFakeElement("div");
+      pageContainer.isConnected = true;
+      pageContainer.parentElement = fakeBody;
+      host.isConnected = true;
+      host.parentElement = pageContainer;
+      this.emitMutations([
+        { type: "childList", target: fakeBody, addedNodes: [pageContainer], removedNodes: [host] },
+      ]);
+    },
+    // A page hostile enough that the banner cannot be put back at all.
+    breakBannerMounting() {
+      fakeBody.prepend = () => {
+        throw new Error("this page refuses banner hosts");
+      };
+    },
+    // A real Escape keypress reaching the sealed document (issue #23).
+    pressEscape({ isTrusted = true } = {}) {
+      let defaultPrevented = false;
+      let propagationStopped = false;
+      this.fireDocumentEvent("keydown", {
+        isTrusted,
+        key: "Escape",
+        preventDefault() { defaultPrevented = true; },
+        stopImmediatePropagation() { propagationStopped = true; },
+        stopPropagation() { propagationStopped = true; },
+      });
+      return { defaultPrevented, propagationStopped };
     },
     // The busy overlay is present once it has been appended and not yet removed
     // (removeBusyOverlay calls the node's own remove(), flipping ._removed).
@@ -435,6 +535,13 @@ function nextTick() {
 // safe while setTimeout is mocked).
 async function flushAsyncWork() {
   for (let index = 0; index < 10; index += 1) await Promise.resolve();
+}
+
+// The capture handshake settles through several awaited animation frames --
+// queued as microtasks by the stub in loadContentScript() -- so it needs more
+// turns than the handover lookup does.
+async function flushCapturePreparation() {
+  for (let index = 0; index < 40; index += 1) await Promise.resolve();
 }
 
 // Issue #15: the service worker can only distinguish "the click was handled"
@@ -867,14 +974,31 @@ test("a provisional trusted verdict waits for the screenshot but releases the pa
 
   assert.equal(page.bannerCount, 1, "the capture is what paints the verdict");
   assert.deepEqual(page.bannerHistory, ["Safe."]);
-  assert.equal(page.busyOverlayPresent, true, "the trusted-drift check is still running behind the provisional verdict");
+  assert.equal(page.busyOverlayPresent, false, "Safe. must release the pointer-blocking shield");
 
-  // The drift check is still running: its progress must not take the verdict's
-  // place, and the verdict must not be repainted as a second banner.
+  // The drift check is still running in the background: its progress must not
+  // take the verdict's place, and the verdict must not be repainted as a second banner.
   context.mock.timers.tick(5_000);
   assert.equal(page.bannerVerdict, "trusted");
   assert.equal(page.bannerCount, 1);
   assert.deepEqual(page.bannerHistory, ["Safe."]);
+});
+
+test("a provisional trusted verdict received after capture also removes the shield", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  page.dispatch({ type: "capture_complete", jobId });
+  context.mock.timers.tick(300);
+  assert.equal(page.busyOverlayPresent, true);
+  assert.equal(page.bannerVerdict, "analysing_manual");
+
+  page.dispatch({ type: "show_banner", jobId, verdict: "trusted", data: {}, provisional: true });
+
+  assert.equal(page.bannerVerdict, "trusted");
+  assert.equal(page.busyOverlayPresent, false, "the message order cannot leave Safe. behind a shield");
+  assert.equal(page.submissionBlocked, false);
 });
 
 test("a capture that never reports back still gets a progress banner", (context) => {
@@ -1817,6 +1941,36 @@ test("select logo manually asks the background to bypass the automatic search", 
   assert.equal(manual.disabled, true, "the control is inert while its request runs");
 });
 
+test("remounting controls preserves an in-flight manual-selection request", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaTrustedAdd();
+  showProgressBanner(page, context, jobId);
+  let resolveSelection;
+  page.setSendMessageBehavior("select_logo_manually", () => new Promise((resolve) => {
+    resolveSelection = resolve;
+  }));
+
+  page.bannerButton(".yp-btn-manual-logo").click();
+  page.detachBannerHost();
+
+  const remountedManual = page.bannerButton(".yp-btn-manual-logo");
+  const remountedCancel = page.bannerButton(".yp-btn-cancel");
+  assert.equal(remountedManual.disabled, true, "the replacement keeps the request single-flight");
+  assert.equal(remountedCancel.disabled, true, "all replacement actions stay inert while it is pending");
+  remountedManual.click();
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "select_logo_manually").length,
+    1,
+    "a remount cannot start a duplicate request"
+  );
+
+  resolveSelection({ ok: false });
+  await flushAsyncWork();
+  assert.equal(remountedManual.disabled, false, "a rejected request gives the remounted controls back");
+  assert.equal(remountedCancel.disabled, false);
+});
+
 test("a rejected manual-selection request gives the controls back", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const page = loadContentScript();
@@ -1871,6 +2025,407 @@ test("cancelling a trusted-site flow with nothing behind it leaves no banner", (
   assert.equal(page.bannerRemoved, true);
   assert.equal(page.busyOverlayPresent, false);
   assert.equal(page.submissionBlocked, false);
+});
+
+// =============================================================================
+// Issue #23 — the busy shield may never outlive its own escape hatch.
+//
+// The shield swallows every click on the page, so the only thing that makes it
+// acceptable is a banner the user can see and press Cancel on. Two windows
+// used to break that pairing: the screenshot handshake, which hides the banner
+// and used to leave it hidden if capture_complete never arrived, and a page
+// removing the anonymous banner host out from under a still-live shield.
+// =============================================================================
+
+// Drives the real capture handshake as far as the background does, up to but
+// not including capture_complete: from here the banner exists and is hidden,
+// the shield is up, and the page is blocked.
+async function enterCaptureWindow(page, context, jobId) {
+  page.dispatch({ type: "prepare_capture", jobId });
+  await flushCapturePreparation();
+  context.mock.timers.tick(2_000);
+  assert.equal(page.bannerCount, 1, "the delayed progress fallback should have rendered");
+  assert.equal(page.bannerHidden, true, "the screenshot must not contain the banner");
+  assert.equal(page.busyOverlayPresent, true, "the shield is what makes this window dangerous");
+}
+
+test("a healthy capture hides the banner for the screenshot alone", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  page.dispatch({ type: "capture_complete", jobId });
+
+  assert.equal(page.bannerCount, 1, "one banner, hidden for the capture and shown again");
+  assert.equal(page.bannerHidden, false);
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.equal(page.busyOverlayPresent, true, "the analysis itself is still running");
+
+  // A capture that reported back disarms the recovery deadline, so a slow
+  // analysis is never cut short by it.
+  context.mock.timers.tick(60_000);
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.equal(page.busyOverlayPresent, true);
+  assert.equal(page.lastMessageOfType("cancel_current_analysis"), undefined);
+
+  page.bannerButton(".yp-btn-cancel").click();
+
+  assert.equal(page.busyOverlayPresent, false, "the shield is gone");
+  assert.equal(page.submissionBlocked, false, "the page is interactive again");
+  assert.equal(page.bannerRemoved, true);
+  assert.equal(
+    page.sentMessages.filter((message) => message.type === "cancel_current_analysis").length,
+    1,
+    "the background is told exactly once"
+  );
+});
+
+// The reported lock: prepare_capture arrives, capture_complete never does, and
+// the page is left with a live shield over a banner nobody can see.
+test("a stalled capture unblocks the page and offers a visible retry", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  context.mock.timers.tick(10_000);
+
+  assert.equal(page.busyOverlayPresent, false, "the shield must not outlive the capture window");
+  assert.equal(page.submissionBlocked, false, "the page is released, not merely un-shielded");
+  assert.equal(page.bannerVerdict, "analysis_failed");
+  assert.equal(page.bannerHidden, false, "the recovery banner has to be visible");
+  assert.ok(page.bannerButton(".yp-btn-retry"), "recovery is actionable");
+  assert.match(page.bannerMessage, /screenshot did not finish/);
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+  assert.equal(page.lastMessageOfType("set_icon_state")?.state, "failed");
+});
+
+// The recovery ends the job rather than quietly dropping the shield: nothing
+// the abandoned analysis still produces may reach the page.
+test("a stalled capture's recovery leaves the abandoned job unable to talk back", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  context.mock.timers.tick(10_000);
+
+  const late = page.dispatch({ type: "show_banner", jobId, verdict: "trusted", data: {} });
+  assert.deepEqual(late.response, { accepted: false, reason: "stale_job" });
+  page.dispatch({ type: "capture_complete", jobId });
+  context.mock.timers.tick(5_000);
+
+  assert.equal(page.bannerVerdict, "analysis_failed");
+  assert.equal(page.busyOverlayPresent, false);
+});
+
+test("a terminal failure during the capture window paints a visible banner", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  page.dispatch({ type: "analysis_failed", jobId, code: "job_timeout" });
+
+  assert.equal(page.bannerVerdict, "analysis_failed");
+  assert.equal(page.bannerHidden, false, "a failure the user must read cannot stay hidden");
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, false);
+  assert.ok(page.bannerButton(".yp-btn-retry"));
+});
+
+test("a terminal verdict during the capture window paints a visible banner", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  page.dispatch({ type: "show_banner", jobId, verdict: "unknown", data: { fqdn: "accounts.example.test" } });
+
+  assert.equal(page.bannerVerdict, "unknown");
+  assert.equal(page.bannerHidden, false, "the verdict is the whole point of the analysis");
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, false);
+  assert.ok(page.bannerButton(".yp-btn-add"));
+});
+
+test("an interruption during the capture window paints a visible banner", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  page.dispatch({ type: "analysis_interrupted", jobId });
+
+  assert.equal(page.bannerVerdict, "interrupted");
+  assert.equal(page.bannerHidden, false, "the explanation the user has to act on cannot be hidden");
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, true, "an interruption keeps credentials blocked");
+});
+
+test("a continuation without analysis during the capture window is visible", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  page.dispatch({ type: "continue_without_analysis", jobId });
+
+  assert.equal(page.bannerVerdict, "continued_unverified");
+  assert.equal(page.bannerHidden, false);
+  assert.equal(page.busyOverlayPresent, false);
+});
+
+test("an older job's capture messages cannot touch the current job's hold or shield", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+
+  const stale = page.dispatch({ type: "prepare_capture", jobId: "some-older-job-id" });
+  assert.deepEqual(stale.response, { ok: false, reason: "stale_job" });
+  page.dispatch({ type: "capture_complete", jobId: "some-older-job-id" });
+  assert.equal(page.bannerHidden, true, "an old capture must not un-hide the current screenshot's banner");
+
+  page.dispatch({ type: "capture_complete", jobId });
+  assert.equal(page.bannerHidden, false, "only the current job's capture releases the hold");
+
+  // The stale preparation must not have armed a deadline of its own: well past
+  // it, the current analysis is untouched.
+  context.mock.timers.tick(60_000);
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.equal(page.busyOverlayPresent, true);
+  assert.equal(page.lastMessageOfType("cancel_current_analysis"), undefined);
+});
+
+// The second half of the lock: the banner host is an ordinary child of the
+// page's own body, and the shield is a separate one, so a single-page app
+// clearing body.firstElementChild used to leave the shield up alone.
+test("a banner host the page removed is remounted while the shield is still up", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+  assert.equal(page.bannerCount, 1);
+
+  page.detachBannerHost();
+
+  assert.equal(page.bannerCount, 2, "the shield's controls come straight back");
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.equal(page.bannerHidden, false);
+  assert.equal(page.busyOverlayPresent, true, "the analysis itself continues");
+
+  page.bannerButton(".yp-btn-cancel").click();
+
+  assert.equal(page.busyOverlayPresent, false, "the remounted control really ends the analysis");
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+});
+
+test("a connected banner moved under page content is remounted before the shield can strand the user", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+
+  page.reparentBannerHost();
+
+  assert.equal(page.bannerCount, 2, "connected is not enough when the host is no longer a direct body child");
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.ok(page.bannerButton(".yp-btn-cancel"));
+  assert.equal(page.busyOverlayPresent, true);
+
+  page.bannerButton(".yp-btn-cancel").click();
+  assert.equal(page.busyOverlayPresent, false);
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+});
+
+test("a detached host during the trusted-site flow is remounted with that flow's controls", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaTrustedAdd();
+  showProgressBanner(page, context, jobId);
+
+  page.detachBannerHost();
+
+  assert.equal(page.bannerCount, 2, "the trusted-site flow gets its controls back too");
+  assert.equal(page.bannerVerdict, "adding_to_trusted");
+  assert.match(page.bannerHtml, /yp-btn-manual-logo/);
+  assert.match(page.bannerHtml, /yp-btn-cancel/);
+  assert.equal(page.bannerHidden, false);
+  assert.equal(page.busyOverlayPresent, true);
+});
+
+// No mutation record at all: only the connectivity check can catch this, and
+// the state being re-asserted is the one already on the dead banner.
+test("a same-state update is not trapped by references into a detached host", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+
+  page.detachBannerHost({ notify: false });
+  page.dispatch({ type: "capture_complete", jobId });
+  context.mock.timers.tick(300);
+
+  assert.equal(page.bannerCount, 2, "an identical state must remount rather than deduplicate against a dead host");
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.equal(page.bannerHidden, false);
+  assert.ok(page.bannerButton(".yp-btn-cancel"));
+});
+
+// A screenshot that is still owed is not a licence to seal the page: unlike
+// the handshake itself, that window has no deadline of its own and can span a
+// whole analysis when the background never asks for the capture.
+test("a detached host is remounted even while the screenshot is still owed", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.startJobViaManualTrigger();
+
+  // No prepare_capture at all: the delayed fallback paints progress at two
+  // seconds while the screenshot is still pending.
+  context.mock.timers.tick(2_000);
+  assert.equal(page.bannerCount, 1);
+
+  page.detachBannerHost();
+
+  assert.equal(page.bannerCount, 2, "an owed screenshot cannot excuse a shield with no controls");
+  assert.equal(page.bannerVerdict, "analysing_manual");
+  assert.equal(page.busyOverlayPresent, true);
+  assert.ok(page.bannerButton(".yp-btn-cancel"));
+});
+
+// Issue #77 still holds: a trusted verdict decided before the analysis runs is
+// held back for the screenshot, and page churn in that window must not paint
+// it early -- there is no banner to lose there, so nothing needs remounting.
+test("a verdict held back for its screenshot is not painted early by page churn", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  page.dispatch({ type: "show_banner", jobId, verdict: "trusted", data: {}, provisional: true });
+  assert.equal(page.bannerCount, 0);
+
+  page.emitMutations([
+    { type: "childList", target: elementNode(), addedNodes: [elementNode("DIV")], removedNodes: [] },
+  ]);
+
+  assert.equal(page.bannerCount, 0, "the screenshot must not contain the verdict");
+
+  page.dispatch({ type: "capture_complete", jobId });
+
+  assert.equal(page.bannerCount, 1);
+  assert.deepEqual(page.bannerHistory, ["Safe."]);
+});
+
+test("a shield whose controls cannot be remounted ends the analysis and frees the page", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+
+  page.breakBannerMounting();
+  page.detachBannerHost();
+
+  assert.equal(page.busyOverlayPresent, false, "a page that refuses the banner must not stay sealed");
+  assert.equal(page.submissionBlocked, false);
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+  assert.equal(page.lastMessageOfType("set_icon_state")?.state, "failed");
+});
+
+// Mutation churn while the banner is genuinely mounted must change nothing:
+// the safety net only fires when the escape hatch is actually gone.
+test("ordinary page churn under a live shield neither remounts nor ends the analysis", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+  showProgressBanner(page, context, jobId);
+  const rendersBefore = page.bannerRenders;
+
+  page.emitMutations([
+    { type: "childList", target: elementNode(), addedNodes: [elementNode("DIV")], removedNodes: [] },
+  ]);
+  page.emitMutations([{ type: "attributes", target: elementNode(), attributeName: "class" }]);
+
+  assert.equal(page.bannerCount, 1, "a mounted banner is never rebuilt by page churn");
+  assert.equal(page.bannerRenders, rendersBefore);
+  assert.equal(page.busyOverlayPresent, true);
+  assert.equal(page.lastMessageOfType("cancel_current_analysis"), undefined);
+});
+
+// The shield swallows pointer events but never keys, so Escape is a way out
+// that survives even a banner the user cannot see or reach.
+test("Escape cancels an analysis whose banner the user cannot reach", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaManualTrigger();
+
+  await enterCaptureWindow(page, context, jobId);
+  const { defaultPrevented, propagationStopped } = page.pressEscape();
+
+  assert.equal(defaultPrevented, true, "while the shield owns the page, Escape is ours");
+  assert.equal(propagationStopped, true);
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, false);
+  assert.equal(page.bannerRemoved, true);
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+});
+
+test("Escape force-cancels while another banner action is pending", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  const jobId = page.startJobViaTrustedAdd();
+  showProgressBanner(page, context, jobId);
+  page.setSendMessageBehavior("select_logo_manually", () => new Promise(() => {}));
+  page.bannerButton(".yp-btn-manual-logo").click();
+
+  const { defaultPrevented, propagationStopped } = page.pressEscape();
+
+  assert.equal(defaultPrevented, true, "Escape is consumed only after it cancels the job");
+  assert.equal(propagationStopped, true);
+  assert.equal(page.busyOverlayPresent, false);
+  assert.equal(page.submissionBlocked, false);
+  assert.deepEqual(page.lastMessageOfType("cancel_current_analysis"), {
+    type: "cancel_current_analysis",
+    jobId,
+  });
+});
+
+test("Escape is inert when no shield is blocking the page", () => {
+  const page = loadContentScript();
+  page.dispatch({ type: "show_banner", verdict: "unknown", data: {} });
+
+  const { defaultPrevented } = page.pressEscape();
+
+  assert.equal(defaultPrevented, false, "the page keeps its own Escape handling");
+  assert.equal(page.bannerVerdict, "unknown");
+  assert.equal(page.lastMessageOfType("cancel_current_analysis"), undefined);
+});
+
+test("a synthetic Escape dispatched by the page cannot cancel an analysis", (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const page = loadContentScript();
+  page.startJobViaManualTrigger();
+
+  page.pressEscape({ isTrusted: false });
+
+  assert.equal(page.busyOverlayPresent, true, "only a real keypress ends an analysis");
+  assert.equal(page.lastMessageOfType("cancel_current_analysis"), undefined);
 });
 
 // =============================================================================

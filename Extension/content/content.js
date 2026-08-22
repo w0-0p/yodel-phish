@@ -102,7 +102,7 @@ function runChangeEvaluation() {
   // and none of that is evidence the navigation context changed.
   if (alreadyAnalysing || interruptionPending || deviceFlowActive || hasHandoverState()) return;
 
-  if (!bannerEl) {
+  if (!bannerIsMounted()) {
     if (dismissed) dismissed = false;
     const result = detectLoginPage();
     if (!result.isLogin) return;
@@ -152,6 +152,11 @@ const OBSERVER_OPTIONS = {
 };
 
 const observer = new MutationObserver((mutations) => {
+  // Issue #23: the shield's escape hatch is checked before anything is
+  // filtered out. A page removing the banner host is the one mutation that
+  // matters most here, and it is also one hasPageMutation() would happily
+  // report as an ordinary page change and nothing else would act on.
+  ensureShieldHasEscape();
   if (hasPageMutation(mutations)) scheduleEvaluation();
 });
 observer.observe(document.body, OBSERVER_OPTIONS);
@@ -244,6 +249,8 @@ function triggerPipeline({ userInitiated = false } = {}) {
   const jobId = crypto.randomUUID();
   currentJobId = jobId;
   analysisMode = userInitiated ? "manual_detection" : "detection";
+  // A new job never inherits the previous one's capture hold (issue #23).
+  clearCaptureHold();
   capturePending = true;
   armAnalysisDeadline(jobId);
   blockFormSubmission();
@@ -266,6 +273,7 @@ function triggerTrustedAdd() {
   const jobId = crypto.randomUUID();
   currentJobId = jobId;
   analysisMode = "add_to_trusted";
+  clearCaptureHold();
   capturePending = true;
   armAnalysisDeadline(jobId);
   blockFormSubmission();
@@ -307,7 +315,7 @@ function stopAnalysisLocally() {
   interruptionPending = false;
   currentJobId = null;
   capturePending = false;
-  bannerHiddenForCapture = false;
+  clearCaptureHold();
   unblockFormSubmission();
   removeBusyOverlay();
   if (typeof jobId === "string") {
@@ -316,13 +324,14 @@ function stopAnalysisLocally() {
   return jobId;
 }
 
-// "Cancel" on either progress banner. A cancelled trusted-site flow returns to
-// the verdict it was started from and leaves the trusted list untouched (the
-// list is only ever written by a confirmed logo selection); a cancelled
-// analysis leaves no banner at all, so the page is exactly as interactive as
-// it was before the analysis started.
-function cancelAnalysisFromBanner() {
-  if (bannerActionPending || !alreadyAnalysing) return;
+// "Cancel" on either progress banner, and the Escape key while the shield is
+// up (issue #23). A cancelled trusted-site flow returns to the verdict it was
+// started from and leaves the trusted list untouched (the list is only ever
+// written by a confirmed logo selection); a cancelled analysis leaves no
+// banner at all, so the page is exactly as interactive as it was before the
+// analysis started.
+function cancelAnalysisFromUser({ force = false } = {}) {
+  if (!alreadyAnalysing || (bannerActionPending && !force)) return false;
   bannerActionPending = true;
   const restore = analysisMode === "add_to_trusted" ? restorableVerdict : null;
   stopAnalysisLocally();
@@ -334,6 +343,7 @@ function cancelAnalysisFromBanner() {
     removeBanner();
   }
   bannerActionPending = false;
+  return true;
 }
 
 // "Add to trusted", from a verdict banner (where nothing is running) or from
@@ -385,6 +395,191 @@ function setBannerActionsDisabled(disabled) {
     button.disabled = disabled;
   });
 }
+
+// =============================================================================
+// SHIELD SAFETY NET — issue #23
+//
+// The busy shield deliberately swallows every pointer event, so the page is
+// unusable for as long as it is up. That is only ever acceptable while the
+// user can still reach a way out of the analysis. Two things used to break
+// that pairing:
+//
+//   * the screenshot handshake hides the banner, and a capture_complete that
+//     never arrived left it hidden -- a live shield over an invisible Cancel
+//     button, until the 290-second job deadline;
+//   * the banner host is an ordinary child of the page's own body, so a
+//     single-page app clearing body.firstElementChild detached it while the
+//     separately appended shield stayed up -- and every `bannerEl !== null`
+//     test went on believing the banner was mounted.
+//
+// Everything below keeps one invariant: the shield is only ever up while a
+// connected, visible, actionable banner exists -- or while the bounded capture
+// window that is allowed to hide it has not yet expired.
+// =============================================================================
+
+// Comfortably longer than a healthy handshake (a one-second stability wait
+// plus the background's capture round trip) and far shorter than the job
+// deadlines, so it can only fire on a capture that is genuinely not coming
+// back -- a page whose rendering stopped mid-wait, a worker that died, a
+// dropped message.
+const CAPTURE_RECOVERY_TIMEOUT_MS = 10_000;
+let captureWatchdogHandle = null;
+
+function clearCaptureWatchdog() {
+  if (captureWatchdogHandle === null) return;
+  clearTimeout(captureWatchdogHandle);
+  captureWatchdogHandle = null;
+}
+
+function armCaptureWatchdog(jobId) {
+  clearCaptureWatchdog();
+  captureWatchdogHandle = setTimeout(() => {
+    captureWatchdogHandle = null;
+    abandonAnalysis(jobId, "capture_timeout");
+  }, CAPTURE_RECOVERY_TIMEOUT_MS);
+  captureWatchdogHandle?.unref?.();
+}
+
+// Releases every part of the capture hold at once: the watchdog that bounds
+// it, the flag that makes anything rendered next invisible, and the inline
+// style already hiding a banner that is on screen. Releasing one without the
+// others is what let a terminal verdict, failure or interruption paint itself
+// hidden behind a shield, so every terminal and recovery path calls this
+// before it renders.
+function clearCaptureHold() {
+  clearCaptureWatchdog();
+  bannerHiddenForCapture = false;
+  if (bannerEl !== null) bannerEl.style.removeProperty("visibility");
+}
+
+// Drops references into a host the page detached or moved under one of its own
+// containers. A connected host is not necessarily reachable: an SPA can park
+// it below `display:none`, `hidden` or `inert` content while the separately
+// mounted shield continues to own every pointer event. The banner host is only
+// valid in the exact top-level location in which we mounted it.
+function forgetUnreachableBannerHost() {
+  if (
+    bannerHostEl === null
+    || (bannerHostEl.isConnected !== false && bannerHostEl.parentElement === document.body)
+  ) return;
+  const unreachableHost = bannerHostEl;
+  bannerHostEl = null;
+  bannerEl = null;
+  bannerState = null;
+  unreachableHost.remove();
+  markExtensionMutation(unreachableHost);
+}
+
+function bannerIsMounted() {
+  forgetUnreachableBannerHost();
+  return bannerEl !== null;
+}
+
+// Connectivity and parentage catch detached/reparented hosts. Browser hit
+// testing catches the remaining cases -- page CSS or another top-layer element
+// making the visible Cancel control unreachable even though its host is still
+// connected. elementFromPoint() called from the document sees the closed
+// shadow tree as its host, which is exactly the result expected here.
+function bannerProvidesShieldEscape() {
+  if (!bannerIsMounted() || bannerHiddenForCapture) return false;
+  const cancelButton = bannerEl.querySelector(".yp-btn-cancel");
+  if (cancelButton === null) return false;
+  const rect = cancelButton.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return false;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  try {
+    return document.elementFromPoint(x, y) === bannerHostEl;
+  } catch {
+    return false;
+  }
+}
+
+// A shield the page itself removed blocks nothing, so it does not count as one.
+function shieldIsBlockingPage() {
+  if (busyOverlayEl === null) return false;
+  if (busyOverlayEl.isConnected === false) {
+    busyOverlayEl = null;
+    return false;
+  }
+  return true;
+}
+
+// Runs on every observed mutation, which is exactly what a page removing the
+// banner host produces. Exactly two windows legitimately pair a shield with no
+// mounted banner, and both are bounded: the screenshot handshake, by the
+// watchdog above, and the fraction of a second a delayed progress banner is
+// still waiting out. `capturePending` on its own is deliberately not one of
+// them -- it stays raised for a whole analysis if the background never asks
+// for the screenshot at all, which is precisely when the page must not be left
+// sealed.
+function ensureShieldHasEscape() {
+  if (!alreadyAnalysing || !shieldIsBlockingPage()) return;
+  if (bannerProvidesShieldEscape()) return;
+  if (bannerHiddenForCapture || progressTimer !== null) return;
+  if (remountShieldControls()) return;
+  if (abandonAnalysis(currentJobId, "banner_unavailable")) return;
+  // No job left to end, yet the shield still has no way out of it: it does not
+  // get to stay either way.
+  removeBusyOverlay();
+  unblockFormSubmission();
+}
+
+// Puts the banner the shield depends on back, without the usual delay: that
+// delay exists to keep a fast analysis from flashing a progress banner, not to
+// leave a sealed page waiting another quarter second for its Cancel button.
+function remountShieldControls() {
+  try {
+    // A trusted page's verdict is only ever painted once its screenshot is
+    // done (issue #77), so until then the shield's controls are the progress
+    // banner's -- which is what was on screen anyway.
+    const verdict = analysisMode === "trusted_drift" && !capturePending
+      ? "trusted"
+      : analysisProgressVerdict();
+    showBanner(verdict, {}, { immediate: true, preserveActionPending: true });
+  } catch {
+    return false;
+  }
+  return bannerProvidesShieldEscape();
+}
+
+// The one recovery for "the shield is up and its way out is gone". The job
+// ends on both sides -- letting it run on would leave the background working
+// for a page that can no longer show the answer -- the page is released, and
+// the retryable failure banner is the visible, actionable surface the shield
+// is not allowed to exist without. stopAnalysisLocally() takes the shield down
+// before the banner is attempted, so even a page hostile enough to defeat the
+// remount is left interactive.
+function abandonAnalysis(jobId, code) {
+  if (typeof jobId !== "string" || jobId !== currentJobId || !alreadyAnalysing) return false;
+  const retryMode = analysisMode;
+  stopAnalysisLocally();
+  setIconState("failed", bannerMessageFor("analysis_failed", { code }));
+  // The page is already released above. A document that will not accept the
+  // banner at all -- the very case that can bring us here -- must not turn
+  // this recovery into an exception on the way out.
+  try {
+    showBanner("analysis_failed", { code, retryMode });
+  } catch {
+    removeBanner();
+  }
+  return true;
+}
+
+// An emergency exit that depends on no part of the banner. The shield swallows
+// pointer events but never keys, so Escape still reaches this document even
+// when the page is completely sealed. The listener is inert unless a shield is
+// actually up, so it never competes with a page's own Escape handling, and it
+// consumes the key it acts on: while the shield owns the page, Escape is Yodel
+// Phish's control rather than the page's.
+document.addEventListener("keydown", (event) => {
+  if (event.isTrusted !== true || event.key !== "Escape") return;
+  if (!alreadyAnalysing || !shieldIsBlockingPage()) return;
+  if (!cancelAnalysisFromUser({ force: true })) return;
+  event.preventDefault();
+  event.stopImmediatePropagation?.();
+  event.stopPropagation();
+}, { capture: true });
 
 // =============================================================================
 // CROSS-DOMAIN LOGIN HANDOVER — issue #24
@@ -680,7 +875,7 @@ document.addEventListener("submit", (event) => {
 function handleManualTrigger() {
   if (alreadyAnalysing) return { ok: true, status: "analysing", jobId: currentJobId };
   if (deviceFlowActive) {
-    if (!bannerEl) activateDeviceFlowAdvisory(deviceFlowProvider);
+    if (!bannerIsMounted()) activateDeviceFlowAdvisory(deviceFlowProvider);
     return { ok: true, status: "device_flow_active" };
   }
 
@@ -714,6 +909,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ ok: false, reason: "stale_job" });
       return false;
     }
+    // Issue #23: the hidden-banner window opens here, so its deadline starts
+    // here too -- never inside preparePageForCapture(), whose own continuation
+    // is one of the things that can stop running.
+    armCaptureWatchdog(message.jobId);
     preparePageForCapture(message.jobId)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
@@ -722,14 +921,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.type === "capture_complete") {
     if (!isCurrentJobMessage(message)) return false;
-    bannerHiddenForCapture = false;
+    clearCaptureHold();
     capturePending = false;
-    if (bannerEl) bannerEl.style.removeProperty("visibility");
     if (alreadyAnalysing) {
       // The capture is what releases a held-back banner. A trusted refresh has
       // its verdict already ("trusted_drift" is only ever entered for it); every
       // other mode is still working and shows progress.
-      showBanner(analysisMode === "trusted_drift" ? "trusted" : analysisProgressVerdict(), {});
+      if (analysisMode === "trusted_drift") {
+        showBanner("trusted", {});
+        // The provisional verdict is already telling the user the page is
+        // safe. The drift analysis may finish in the background, but it must
+        // no longer leave an input-blocking shield with a banner that has no
+        // Cancel control.
+        removeBusyOverlay();
+      } else {
+        showBanner(analysisProgressVerdict(), {});
+      }
     }
     return false;
   }
@@ -743,7 +950,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     interruptionPending = false;
     currentJobId = null;
     analysisAttempted = false;
-    bannerHiddenForCapture = false;
+    clearCaptureHold();
     unblockFormSubmission();
     removeBanner();
     setIconState("active");
@@ -798,7 +1005,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ ok: true, blocked: submissionBlocker !== null });
       return false;
     }
-    if (bannerEl) {
+    if (bannerIsMounted()) {
       offerReanalysis();
       sendResponse({ ok: true, blocked: submissionBlocker !== null });
       return false;
@@ -833,11 +1040,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       // which the user reads as two banners (issue #77). capture_complete paints
       // it. Releasing the form and the icon does not wait -- neither of those
       // ends up in the screenshot.
-      if (!capturePending) showBanner(message.verdict, message.data ?? {});
+      if (!capturePending) {
+        showBanner(message.verdict, message.data ?? {});
+        removeBusyOverlay();
+      }
       sendResponse({ accepted: true });
       return false;
     }
     clearAnalysisDeadline();
+    clearCaptureHold();
     alreadyAnalysing = false;
     dismissed = false;
     analysisMode = null;
@@ -873,6 +1084,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === "continue_without_analysis") {
     if (!isCurrentJobMessage(message)) return false;
     clearAnalysisDeadline();
+    clearCaptureHold();
     alreadyAnalysing = false;
     interruptionPending = false;
     currentJobId = null;
@@ -889,6 +1101,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 function enterInterruptedState(jobId) {
   if (typeof jobId !== "string" || jobId !== currentJobId) return false;
   clearAnalysisDeadline();
+  clearCaptureHold();
   alreadyAnalysing = false;
   if (jobId !== undefined) currentJobId = jobId;
   interruptionPending = true;
@@ -909,6 +1122,7 @@ function enterFailedState(jobId, code) {
   if (typeof jobId !== "string" || jobId !== currentJobId) return false;
   const retryMode = analysisMode;
   clearAnalysisDeadline();
+  clearCaptureHold();
   alreadyAnalysing = false;
   dismissed = false;
   analysisMode = null;
@@ -1024,6 +1238,8 @@ const ANALYSIS_FAILURE_MESSAGES = Object.freeze({
   client_timeout: "Analysis did not finish before the page deadline.",
   dispatch_failed: "The extension background process could not be reached.",
   interruption_unavailable: "Analysis was interrupted and the recovery tab could not be opened.",
+  capture_timeout: "The page screenshot did not finish in time, so the analysis was stopped.",
+  banner_unavailable: "This page removed the Yodel Phish controls, so the analysis was stopped.",
   analysis_failed: "Analysis could not be completed.",
 });
 
@@ -1529,7 +1745,10 @@ const PROGRESS_DELAY_MS = 250;
 // capture round trip, so a healthy capture always answers first.
 const CAPTURE_PROGRESS_DELAY_MS = 2_000;
 
-function showBanner(verdict, data) {
+// `immediate` skips the delayed progress presentation. Only the shield's own
+// remount uses it (issue #23): that delay exists to keep a fast analysis from
+// flashing a progress banner, never to leave a blocked page without controls.
+function showBanner(verdict, data, { immediate = false, preserveActionPending = false } = {}) {
   const config = BANNER_CONFIG[verdict];
   if (!config) return;
   const message = bannerMessageFor(verdict, data);
@@ -1543,26 +1762,28 @@ function showBanner(verdict, data) {
   if (!PROGRESS_VERDICTS.has(verdict)) {
     capturePending = false;
   }
-  if (bannerEl !== null && state === bannerState) {
+  // A host the page detached is not a banner, so neither the deduplication
+  // below nor the reuse in renderBanner() may treat it as one (issue #23).
+  if (bannerIsMounted() && state === bannerState) {
     // A terminal response can legitimately restore the same verdict that was
     // visible when Add-to-trusted started. That still completes the old
     // button's transition and must give its controls back.
-    if (bannerActionPending) {
+    if (bannerActionPending && !preserveActionPending) {
       bannerActionPending = false;
       setBannerActionsDisabled(false);
     }
     return;
   }
 
-  if (PROGRESS_VERDICTS.has(verdict)) {
+  if (!immediate && PROGRESS_VERDICTS.has(verdict)) {
     progressTimer = setTimeout(() => {
       progressTimer = null;
-      renderBanner(verdict, config, data, message, state);
+      renderBanner(verdict, config, data, message, state, { preserveActionPending });
     }, capturePending ? CAPTURE_PROGRESS_DELAY_MS : PROGRESS_DELAY_MS);
     progressTimer?.unref?.();
     return;
   }
-  renderBanner(verdict, config, data, message, state);
+  renderBanner(verdict, config, data, message, state, { preserveActionPending });
 }
 
 function clearProgressTimer() {
@@ -1571,9 +1792,9 @@ function clearProgressTimer() {
   progressTimer = null;
 }
 
-function renderBanner(verdict, config, data, message, state) {
+function renderBanner(verdict, config, data, message, state, { preserveActionPending = false } = {}) {
   // Avoid replacing buttons that are already in the correct state.
-  if (bannerEl !== null && state === bannerState) return;
+  if (bannerIsMounted() && state === bannerState) return;
   bannerState = state;
 
   // Issue #14: the two verdicts that offer "Add to trusted" are also the two a
@@ -1586,7 +1807,7 @@ function renderBanner(verdict, config, data, message, state) {
     restorableVerdict = null;
   }
 
-  if (bannerEl === null) {
+  if (!bannerIsMounted()) {
     // The host carries no stable id or class, avoiding ordinary selector
     // collisions. It is still part of the shared document and page JavaScript
     // can observe or remove it; the closed root protects only its internals.
@@ -1641,7 +1862,7 @@ function renderBanner(verdict, config, data, message, state) {
   // as Add-to-trusted. Keep the old controls single-flight until this point so
   // a double click cannot cancel and restart the new job during the delayed
   // progress transition.
-  bannerActionPending = false;
+  if (!preserveActionPending) bannerActionPending = false;
   const messageEl = bannerEl.querySelector(".yp-message");
   if (messageEl !== null) renderBannerMessage(messageEl, bannerMessageParts(verdict, data));
 
@@ -1656,7 +1877,7 @@ function renderBanner(verdict, config, data, message, state) {
     void requestManualLogoSelection();
   });
 
-  bannerEl.querySelector(".yp-btn-cancel")?.addEventListener("click", cancelAnalysisFromBanner);
+  bannerEl.querySelector(".yp-btn-cancel")?.addEventListener("click", cancelAnalysisFromUser);
 
   // The handover prompt's three decisions (issue #24). Each consumes exactly
   // the displayed candidate; handleHandoverAction keeps them single-flight.
@@ -1701,6 +1922,7 @@ function renderBanner(verdict, config, data, message, state) {
   } else {
     stopProgressNote();
   }
+  if (preserveActionPending && bannerActionPending) setBannerActionsDisabled(true);
 }
 
 // Long analyses (e.g. when no logo is detected quickly) look stalled behind a
@@ -1748,6 +1970,7 @@ function updateProgressNote() {
 
 function removeBanner() {
   clearProgressTimer();
+  clearCaptureHold();
   capturePending = false;
   restorableVerdict = null;
   // Removing the banner is the other terminal path. It covers the routes that
@@ -1911,6 +2134,7 @@ function isExtensionOwnedNode(node) {
 
 function activateDeviceFlowAdvisory(provider) {
   clearAnalysisDeadline();
+  clearCaptureHold();
   // Device Code handling takes precedence over a pending handover (issue #24);
   // the advisory below replaces the prompt and its local state.
   clearHandoverLocalState();
