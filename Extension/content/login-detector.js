@@ -8,7 +8,9 @@
 //   2. An ACTIVE identity field
 //      + an ASSOCIATED forward action
 //      + (autocomplete contains "username" OR a local auth cue
-//         OR a coherent hidden password step)                  → 0.7
+//         OR a coherent hidden password step
+//         OR, for a form-owned field, a nearby compound
+//         identity-verification heading — issue #22)           → 0.7
 //
 // ACTIVE means the user could really type into or click the element right
 // now: not natively disabled (including the browser's exact <fieldset> /
@@ -100,6 +102,13 @@
   // The auth cue is deliberately only these three terms; localized pages are
   // supported through autocomplete="username", not through translated text.
   const AUTH_CUE_RE = /\b(?:sign[\s-]?in|log[\s-]?in|login)\b/;
+  // A separate, narrower cue for an email/identity-verification login stage
+  // (issue #22): a form whose heading asks to verify or confirm an email,
+  // identity or account. Kept apart from AUTH_CUE_RE so bare "verify",
+  // "verification", "security" or "continue" never qualify on their own — only
+  // the compound identity phrases below do.
+  const IDENTITY_VERIFICATION_CUE_RE =
+    /\b(?:(?:verify|confirm)\s+(?:your\s+)?(?:e[\s-]?mail(?:\s+address)?|identity|account)|(?:e[\s-]?mail|identity|account)\s+verification)\b/;
   // Names that make a generic button a forward/authentication action. Reveal,
   // Cancel, Close, Help and Reset controls never match.
   const FORWARD_ACTION_RE = /\b(?:sign[\s-]?in|log[\s-]?in|login|next|continue|submit|verify)\b/;
@@ -372,6 +381,48 @@
     );
   }
 
+  function isHeadingElement(el) {
+    return /^h[1-6]$/.test(tagOf(el)) || tokensOf(el, "role").includes("heading");
+  }
+
+  // Only a visible h1–h6 or role="heading" carrying the complete compound
+  // phrase is verification evidence; labels, buttons and paragraphs do not
+  // state the form purpose for this narrow pattern.
+  function isVisibleVerificationHeading(el, ctx) {
+    return isHeadingElement(el) &&
+      isRendered(el, ctx) &&
+      IDENTITY_VERIFICATION_CUE_RE.test(normalize(cueText(el, ctx)));
+  }
+
+  // A heading nested anywhere inside the form belongs to that form.
+  function containerHasVerificationHeading(container, cueCandidates, ctx) {
+    return cueCandidates.some(
+      (el) => isWithin(el, container) && isVisibleVerificationHeading(el, ctx)
+    );
+  }
+
+  // The verification cue for a form-owned identity field (issue #22). It is read
+  // from the form itself, or — for the common card/modal layout where the
+  // heading is a sibling of the <form> rather than inside it — from their one
+  // immediate shared parent. Only a direct-child heading qualifies there: a
+  // heading nested in another sibling widget is unrelated evidence. Broad
+  // document/application containers never qualify, and containers are never
+  // inferred from class names or ids.
+  function hasNearbyVerificationHeading(owner, cueCandidates, ctx) {
+    if (containerHasVerificationHeading(owner, cueCandidates, ctx)) return true;
+    const container = owner.parentElement;
+    if (
+      container === null ||
+      container === undefined ||
+      container === ctx.doc.body ||
+      container === ctx.doc.documentElement ||
+      isApplicationLandmark(container)
+    ) return false;
+    return cueCandidates.some(
+      (el) => el.parentElement === container && isVisibleVerificationHeading(el, ctx)
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Actions.
   // ---------------------------------------------------------------------------
@@ -613,7 +664,8 @@
       const cueContainer = dialogAncestor(owner) ?? owner;
       return containerHasAuthCue(cueContainer, cueCandidates, ctx) ||
         actionsCarryAuthCue(associated, ctx) ||
-        containerHasPasswordStep(owner, inputs, actionCandidates, ctx);
+        containerHasPasswordStep(owner, inputs, actionCandidates, ctx) ||
+        hasNearbyVerificationHeading(owner, cueCandidates, ctx);
     }
 
     const dialog = dialogAncestor(field);
