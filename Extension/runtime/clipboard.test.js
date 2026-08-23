@@ -2,6 +2,10 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
 const SCRIPT_PATH = require.resolve("./clipboard.js");
+const {
+  MAX_CLICKFIX_INSPECTION_LENGTH,
+  MAX_CLIPBOARD_TRANSPORT_LENGTH,
+} = require("../content/clickfix-policy.js");
 
 function loadClipboardWriter({ execImpl = () => true } = {}) {
   const listeners = [];
@@ -102,13 +106,30 @@ test("rejects requests from tabs and non-worker extension pages", async () => {
   assert.deepEqual(writer.writes, []);
 });
 
+// Issue #27 -- the writer's bound is the transport bound, not the ClickFix
+// inspection ceiling. Values ClickFix declines to inspect are still copied.
+test("writes a value past the inspection ceiling without truncating it", async () => {
+  const writer = loadClipboardWriter();
+  const text = `head${"x".repeat(MAX_CLICKFIX_INSPECTION_LENGTH + 1)}tail`;
+
+  const response = await writer.send({
+    target: "yodel-clickfix-clipboard",
+    type: "write_text",
+    text,
+  });
+
+  assert.deepEqual(response, { ok: true });
+  assert.deepEqual(writer.writes, [text]);
+  assert.equal(writer.writes[0].length, text.length);
+});
+
 test("fails closed for invalid, oversized, or refused clipboard writes", async () => {
   const writer = loadClipboardWriter({ execImpl: () => false });
 
   assert.deepEqual(await writer.send({
     target: "yodel-clickfix-clipboard",
     type: "write_text",
-    text: "x".repeat(65_537),
+    text: "x".repeat(MAX_CLIPBOARD_TRANSPORT_LENGTH + 1),
   }), { ok: false, error: "Invalid clipboard request" });
 
   assert.deepEqual(await writer.send({

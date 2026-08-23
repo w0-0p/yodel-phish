@@ -10,11 +10,13 @@
   const REQUEST_EVENT_RE = /^__yodelphish_clickfix_request_(?:[0-9]+_){5}[0-9]+$/;
   const RESULT_EVENT_RE = /^__yodelphish_clickfix_result_(?:[0-9]+_){5}[0-9]+$/;
   const RESULT_TIMEOUT_MS = 60_000;
+  const REQUEST_FIELD_SEPARATOR = "\0";
   const pendingRequests = new Map();
   let requestCounter = 0;
   let requestEventName = null;
   let resultEventName = null;
   let documentRecoveryGuardActive = false;
+  let pendingManualEvent = null;
 
   // Capture the built-ins used after installation. A page may replace globals
   // and prototype methods later, but that must not change what the hook calls.
@@ -31,6 +33,14 @@
   const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
   const objectGetPrototypeOf = Object.getPrototypeOf;
   const eventTargetAdd = EventTarget.prototype.addEventListener;
+  const clipboardEventPrototype =
+    typeof ClipboardEvent === "function" ? ClipboardEvent.prototype : null;
+  const clipboardDataGetter = clipboardEventPrototype === null
+    ? null
+    : objectGetOwnPropertyDescriptor(clipboardEventPrototype, "clipboardData")?.get ?? null;
+  const dataTransferSetData = typeof DataTransfer === "function" &&
+      typeof DataTransfer.prototype?.setData === "function"
+    ? DataTransfer.prototype.setData : null;
   const eventTargetRemove = EventTarget.prototype.removeEventListener;
   const eventTargetDispatch = EventTarget.prototype.dispatchEvent;
   const eventTargetGetter = objectGetOwnPropertyDescriptor(Event.prototype, "target")?.get ?? null;
@@ -51,7 +61,6 @@
   const customEventDetailGetter = objectGetOwnPropertyDescriptor(NativeCustomEvent.prototype, "detail")?.get ?? null;
   const regexpTest = RegExp.prototype.test;
   const jsonParse = JSON.parse;
-  const jsonStringify = JSON.stringify;
   const mutationObserverObserve = typeof NativeMutationObserver === "function"
     ? NativeMutationObserver.prototype.observe
     : null;
@@ -114,10 +123,60 @@
     return nativeApply(eventTargetDispatch, bridgeTarget, [event]);
   }
 
+  // Keep the clipboard value raw inside the immutable primitive bridge string.
+  // JSON escaping can expand one input code unit to six (`\\uXXXX`), which made
+  // valid values below the transport ceiling exceed the serialized guard. The
+  // operation and request id cannot contain NUL; every later NUL belongs to the
+  // clipboard value and is preserved verbatim.
+  function framePrivateRequest(operation, requestId, text = "") {
+    return `${operation}${REQUEST_FIELD_SEPARATOR}${requestId}${REQUEST_FIELD_SEPARATOR}${text}`;
+  }
+
+  function parsePrivateFrame(value) {
+    const operationEnd = value.indexOf(REQUEST_FIELD_SEPARATOR);
+    if (operationEnd <= 0) return null;
+    const requestIdEnd = value.indexOf(REQUEST_FIELD_SEPARATOR, operationEnd + 1);
+    if (requestIdEnd <= operationEnd + 1) return null;
+    return {
+      operation: value.slice(0, operationEnd),
+      requestId: value.slice(operationEnd + 1, requestIdEnd),
+      text: value.slice(requestIdEnd + 1),
+    };
+  }
+
+  // An oversized manual snapshot is produced in the isolated world, but only
+  // this synchronous MAIN listener retains the original trusted ClipboardEvent.
+  // Write the isolated snapshot into that event and preventDefault on the
+  // cancelable result event to acknowledge success before an approved cut is
+  // deleted.
+  function acceptManualClipboardFallback(resultEvent, data) {
+    if (data.operation !== "manual-fallback" ||
+        pendingManualEvent === null ||
+        data.requestId !== pendingManualEvent.requestId) return;
+    try {
+      const clipboardData = clipboardDataGetter === null
+        ? pendingManualEvent.event.clipboardData
+        : nativeApply(clipboardDataGetter, pendingManualEvent.event, []);
+      const setData = dataTransferSetData ?? clipboardData?.setData;
+      if (clipboardData === null || clipboardData === undefined ||
+          typeof setData !== "function") return;
+      nativeApply(setData, clipboardData, ["text/plain", data.text]);
+      nativeApply(preventDefault, resultEvent, []);
+    } catch {
+      // No acknowledgement means the isolated world keeps a cut unchanged.
+    }
+  }
+
   function onPrivateResult(event) {
     if (bridgeEventTarget(event) !== bridgeTarget) return;
     const serialized = bridgeEventDetail(event);
-    if (typeof serialized !== "string" || serialized.length > 512) return;
+    if (typeof serialized !== "string") return;
+    const framed = parsePrivateFrame(serialized);
+    if (framed !== null) {
+      acceptManualClipboardFallback(event, framed);
+      return;
+    }
+    if (serialized.length > 512) return;
 
     let data;
     try {
@@ -201,14 +260,18 @@
     if (documentRecoveryGuardActive || !nativeEventIsTrusted(event) ||
         requestEventName === null || resultEventName === null) return;
     requestCounter += 1;
+    const requestId = `manual-${requestCounter}`;
+    const pending = { requestId, event };
+    pendingManualEvent = pending;
     try {
-      dispatchPrivateEvent(requestEventName, jsonStringify({
-        operation,
-        requestId: `manual-${requestCounter}`,
-        manual: true,
-      }));
+      dispatchPrivateEvent(
+        requestEventName,
+        framePrivateRequest(operation, requestId)
+      );
     } catch {
       // The native copy was already cancelled, so relay failure stays closed.
+    } finally {
+      if (pendingManualEvent === pending) pendingManualEvent = null;
     }
   }
 
@@ -227,11 +290,10 @@
     if (documentRecoveryGuardActive || requestEventName === null || resultEventName === null) return;
     requestCounter += 1;
     try {
-      dispatchPrivateEvent(requestEventName, jsonStringify({
-        operation: "manual-intent",
-        requestId: `intent-${requestCounter}`,
-        manual: true,
-      }));
+      dispatchPrivateEvent(
+        requestEventName,
+        framePrivateRequest("manual-intent", `intent-${requestCounter}`)
+      );
     } catch {
       // The subsequent copy/cut gate still fails closed if the relay is lost.
     }
@@ -457,9 +519,10 @@
 
       nativeApply(mapSet, pendingRequests, [requestId, { resolve, reject, timeoutId }]);
       try {
-        // `text` is a primitive string by this point. JSON serialization
-        // snapshots it before dispatch into the isolated-world listener.
-        dispatchPrivateEvent(requestEventName, jsonStringify({ operation, requestId, text }));
+        // `text` is a primitive string by this point. Framing it into another
+        // primitive snapshots the exact code units before isolated-world
+        // dispatch without JSON escape expansion.
+        dispatchPrivateEvent(requestEventName, framePrivateRequest(operation, requestId, text));
       } catch {
         nativeApply(mapDelete, pendingRequests, [requestId]);
         cancelTimeout(timeoutId);

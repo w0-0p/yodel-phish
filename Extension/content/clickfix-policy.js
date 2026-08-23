@@ -5,9 +5,9 @@
 //   global; and
 // - as a CommonJS dependency of the bundled MV3 service worker.
 //
-// Keep this module free of DOM and Chrome APIs so the content mediator can
-// share its inspection limit while the service worker performs the
-// authoritative classification.
+// Keep this module free of DOM and Chrome APIs so the content mediator, the
+// service worker, and the offscreen writer share one set of length bounds
+// while the service worker performs the authoritative classification.
 (function attachClickfixPolicy(root, factory) {
   const policy = Object.freeze(factory());
   if (typeof module === "object" && module !== null && module.exports) {
@@ -22,7 +22,15 @@
     });
   }
 })(typeof globalThis === "object" ? globalThis : null, function createClickfixPolicy() {
-  const MAX_COPY_TEXT_LENGTH = 65_536;
+  // Inspection scope (issue #27). Clipboard values at or below this length are
+  // classified in full; longer values are explicitly outside ClickFix scope and
+  // are copied without inspection rather than warned about or blocked.
+  const MAX_CLICKFIX_INSPECTION_LENGTH = 65_536;
+  // Transport bound for the extension-owned clipboard path. It is deliberately
+  // far above the inspection ceiling so that out-of-scope values still reach
+  // the offscreen writer; exceeding it is an ordinary clipboard failure, never
+  // a ClickFix verdict.
+  const MAX_CLIPBOARD_TRANSPORT_LENGTH = 4_194_304;
 
   // Single source of truth for protected command names (issue #79). Command-
   // position matching, canonical-tool evidence, and proxy argument checks
@@ -77,7 +85,10 @@
   ]);
   const MAX_WRAPPER_DEPTH = 8;
   const MAX_WRAPPER_OPTIONS = 8;
-  const MAX_COMMAND_STARTS = 64;
+  // PARSER_LIMIT still guards wrapper depth, wrapper options, leading
+  // assignments, and command prefixes. It is deliberately no longer raised by
+  // the number of clauses: ordinary Markdown and documentation contain far more
+  // separators than any command, and counting them warned on benign text.
   const PARSER_LIMIT = Symbol("clickfix-parser-limit");
   const PARSER_LIMIT_TOOL = "unverified wrapped command";
   const WRAPPER_OPTIONS_WITH_VALUES = {
@@ -438,9 +449,12 @@
   // across cmd, PowerShell, and POSIX shells, so each unquoted marker is a
   // possible boundary. Clause boundaries also scope evidence co-location:
   // tool and behavior signals must fall inside the same clause to combine.
-  // The hard bound fails closed instead of growing this into a general parser.
-  function commandClauses(value) {
-    const clauses = [];
+  //
+  // Clauses are yielded one at a time rather than collected (issue #27): the
+  // input is already bounded by MAX_CLICKFIX_INSPECTION_LENGTH, so streaming
+  // keeps a separator-dense document from allocating a descriptor per line and
+  // lets the caller stop at the first conclusive verdict.
+  function* commandClauses(value) {
     let clauseStart = 0;
     let clauseAfterNonPipeChain = false;
     let clauseAfterPipe = false;
@@ -479,8 +493,7 @@
       const pipeSeparator = character === "|" && next !== "|";
       const nonPipeChain = character === ";" || character === "&" ||
         (character === "|" && next === "|");
-      if (clauses.length >= MAX_COMMAND_STARTS - 1) return PARSER_LIMIT;
-      clauses.push({
+      yield {
         start: clauseStart,
         end: index,
         nonPipeChained: clauseAfterNonPipeChain || nonPipeChain,
@@ -488,7 +501,7 @@
         groupFollows: opensGroup,
         dynamicCall: clauseDynamicCall,
         callOperator: clauseCallOperator,
-      });
+      };
       let doubled = false;
       if ((character === "&" || character === "|") && next === character) {
         index += 1;
@@ -509,7 +522,7 @@
       if (opensGroup) groupDepth += 1;
       if (closesGroup) groupDepth -= 1;
     }
-    clauses.push({
+    yield {
       start: clauseStart,
       end: value.length,
       nonPipeChained: clauseAfterNonPipeChain,
@@ -517,8 +530,7 @@
       groupFollows: false,
       dynamicCall: clauseDynamicCall,
       callOperator: clauseCallOperator,
-    });
-    return clauses;
+    };
   }
 
   const NO_COMMAND = Object.freeze({
@@ -1041,6 +1053,49 @@
     return null;
   }
 
+  // Post-normalization whitespace is only spaces and single newlines, so a
+  // clause made of separators alone carries no command shape and can be
+  // dropped before it is ever materialized as a string.
+  function isBlankClause(value, start, end) {
+    for (let index = start; index < end; index += 1) {
+      const character = value[index];
+      if (character !== " " && character !== "\n" && character !== "\t") return false;
+    }
+    return true;
+  }
+
+  // Stream analyzed clauses. Blank clauses are skipped without slicing, except
+  // when a dynamic call armed the group: `& ( )` is executable shape even when
+  // the group body is empty. A structural parser limit is surfaced as a final
+  // PARSER_LIMIT value and ends the iteration.
+  function* analyzedClauses(normalizedText) {
+    for (const clause of commandClauses(normalizedText)) {
+      if (!clause.dynamicCall && isBlankClause(normalizedText, clause.start, clause.end)) continue;
+      const text = normalizedText.slice(clause.start, clause.end);
+      const info = analyzeCommandClause(text, clause.dynamicCall);
+      if (info === PARSER_LIMIT) {
+        yield PARSER_LIMIT;
+        return;
+      }
+      yield {
+        ...info,
+        text,
+        nonPipeChained: clause.nonPipeChained,
+        afterPipe: clause.afterPipe,
+        groupFollows: clause.groupFollows,
+        dynamicCall: clause.dynamicCall,
+        callOperator: clause.callOperator,
+      };
+    }
+  }
+
+  const STRICT_KIND_REASONS = {
+    protected: "system or administrative command",
+    executable: "executable file reference in command position",
+    path: "explicit executable path in command position",
+    dynamic: "dynamic executable invocation",
+  };
+
   // settings: { mode: "strict" | "warn", excluded_domains: string[] }
   function detectClickfixCommand(value, settings = {}, context = {}) {
     const originalText = String(value ?? "");
@@ -1052,14 +1107,15 @@
       return { action: "allow", reasons: ["excluded domain"], originalText };
     }
 
-    if (originalText.length > MAX_COPY_TEXT_LENGTH) {
+    // Values past the inspection ceiling are out of ClickFix scope (issue #27).
+    // This is an accepted limitation, not a detection: the copy proceeds with
+    // the complete original value in both modes rather than being warned about,
+    // blocked, or silently dropped.
+    if (originalText.length > MAX_CLICKFIX_INSPECTION_LENGTH) {
       return {
-        action: mode === "warn" ? "warn" : "block",
-        reasons: ["clipboard text is too large to inspect safely"],
+        action: "allow",
+        reasons: ["clipboard content exceeds ClickFix inspection scope"],
         originalText,
-        normalizedText: "",
-        tool: "unverified content",
-        behavior: "inspection limit exceeded",
       };
     }
 
@@ -1078,97 +1134,72 @@
       originalText,
       normalizedText,
     });
-    const clauses = commandClauses(normalizedText);
-    if (clauses === PARSER_LIMIT) return limitResult();
-    const analyzed = [];
-    for (const clause of clauses) {
-      const text = normalizedText.slice(clause.start, clause.end);
-      const info = analyzeCommandClause(text, clause.dynamicCall);
-      if (info === PARSER_LIMIT) return limitResult();
-      analyzed.push({
-        ...info,
-        text,
-        nonPipeChained: clause.nonPipeChained,
-        afterPipe: clause.afterPipe,
-        groupFollows: clause.groupFollows,
-        dynamicCall: clause.dynamicCall,
-        callOperator: clause.callOperator,
-      });
-    }
+    // One pass over the streamed clauses in each mode. A clause that decides
+    // the verdict returns immediately; the lower-precedence findings are the
+    // only state carried forward, so a long document costs no more memory than
+    // a single command. A structural parser limit reached after a conclusive
+    // detection cannot change the action, only which detection is reported.
+    const strongResult = (strong, action) => ({
+      action,
+      reasons: ["high-confidence execution behavior", "corroborating execution risk signal"],
+      tool: "unrecognized command",
+      behavior: `${strong.primary} with ${strong.secondary}`,
+      originalText,
+      normalizedText,
+    });
 
     if (mode === "strict") {
-      const STRICT_KIND_REASONS = {
-        protected: "system or administrative command",
-        executable: "executable file reference in command position",
-        path: "explicit executable path in command position",
-        dynamic: "dynamic executable invocation",
-      };
-      for (const clause of analyzed) {
-        if (clause.kind === "none") continue;
-        const result = {
-          action: "block",
-          reasons: [STRICT_KIND_REASONS[clause.kind], ...clause.evidence],
-          tool: clause.tool,
-          originalText,
-          normalizedText,
-        };
-        if (clause.canonical !== null) result.canonicalTool = clause.canonical;
-        return result;
-      }
-      for (const clause of analyzed) {
-        const strong = strongBehaviorEvidence(clause);
-        if (strong !== null) {
-          return {
+      let strongFallback = null;
+      for (const clause of analyzedClauses(normalizedText)) {
+        if (clause === PARSER_LIMIT) return limitResult();
+        if (clause.kind !== "none") {
+          const result = {
             action: "block",
-            reasons: ["high-confidence execution behavior", "corroborating execution risk signal"],
-            tool: "unrecognized command",
-            behavior: `${strong.primary} with ${strong.secondary}`,
+            reasons: [STRICT_KIND_REASONS[clause.kind], ...clause.evidence],
+            tool: clause.tool,
             originalText,
             normalizedText,
           };
+          if (clause.canonical !== null) result.canonicalTool = clause.canonical;
+          return result;
         }
+        if (strongFallback === null) strongFallback = strongBehaviorEvidence(clause);
       }
+      if (strongFallback !== null) return strongResult(strongFallback, "block");
       return { action: "allow", reasons: [], originalText, normalizedText };
     }
 
-    for (const clause of analyzed) {
-      if (clause.kind === "none") continue;
-      const found = warnClauseEvidence(clause);
-      if (found !== null) {
-        const result = {
-          action: "warn",
-          reasons: found.reasons,
-          tool: clause.tool,
-          behavior: found.behavior,
-          originalText,
-          normalizedText,
-        };
-        if (clause.canonical !== null) result.canonicalTool = clause.canonical;
-        return result;
+    let strongFallback = null;
+    let shapedTool = null;
+    for (const clause of analyzedClauses(normalizedText)) {
+      if (clause === PARSER_LIMIT) return limitResult();
+      if (clause.kind !== "none") {
+        const found = warnClauseEvidence(clause);
+        if (found !== null) {
+          const result = {
+            action: "warn",
+            reasons: found.reasons,
+            tool: clause.tool,
+            behavior: found.behavior,
+            originalText,
+            normalizedText,
+          };
+          if (clause.canonical !== null) result.canonicalTool = clause.canonical;
+          return result;
+        }
+        if (shapedTool === null) shapedTool = clause.tool;
+        continue;
       }
+      if (strongFallback === null) strongFallback = strongBehaviorEvidence(clause);
     }
-    for (const clause of analyzed) {
-      if (clause.kind !== "none") continue;
-      const strong = strongBehaviorEvidence(clause);
-      if (strong !== null) {
-        return {
-          action: "warn",
-          reasons: ["high-confidence execution behavior", "corroborating execution risk signal"],
-          tool: "unrecognized command",
-          behavior: `${strong.primary} with ${strong.secondary}`,
-          originalText,
-          normalizedText,
-        };
-      }
-    }
+    if (strongFallback !== null) return strongResult(strongFallback, "warn");
     // Command-shaped content without risk signals stays copyable in warn mode
     // but is recorded as recognized so callers and diagnostics can see it.
-    const shaped = analyzed.find((clause) => clause.kind !== "none");
-    if (shaped !== undefined) {
+    if (shapedTool !== null) {
       return {
         action: "allow",
         reasons: ["command-shaped content without risk signals"],
-        tool: shaped.tool,
+        tool: shapedTool,
         originalText,
         normalizedText,
       };
@@ -1177,7 +1208,8 @@
   }
 
   return {
-    MAX_COPY_TEXT_LENGTH,
+    MAX_CLICKFIX_INSPECTION_LENGTH,
+    MAX_CLIPBOARD_TRANSPORT_LENGTH,
     normalizeForDetection,
     hostnameMatches,
     isExcludedDomain,

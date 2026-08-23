@@ -1,9 +1,19 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
-require("./clickfix-policy.js");
+const {
+  MAX_CLICKFIX_INSPECTION_LENGTH,
+  MAX_CLIPBOARD_TRANSPORT_LENGTH,
+} = require("./clickfix-policy.js");
 const CLICKFIX_SCRIPT_PATH = require.resolve("./clickfix.js");
 const PAGE_HOOK_SCRIPT_PATH = require.resolve("./clickfix-page-hook.js");
+
+const OVER_INSPECTION_LENGTH = MAX_CLICKFIX_INSPECTION_LENGTH + 1;
+const OVER_TRANSPORT_LENGTH = MAX_CLIPBOARD_TRANSPORT_LENGTH + 1;
+
+function framePrivateRequest(operation, requestId, text = "") {
+  return `${operation}\0${requestId}\0${text}`;
+}
 
 function flush() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -109,7 +119,7 @@ function createFakeEventTargetClass() {
   };
 }
 
-function clipboardEvent(type, explicitText, { isTrusted = true } = {}) {
+function clipboardEvent(type, explicitText, { isTrusted = true, setDataError = null } = {}) {
   const written = new Map();
   const event = new FakeEvent(type, { isTrusted });
   event.clipboardData = {
@@ -120,6 +130,7 @@ function clipboardEvent(type, explicitText, { isTrusted = true } = {}) {
         written.clear();
       },
       setData(format, value) {
+        if (setDataError !== null) throw setDataError;
         written.set(format, String(value));
       },
     };
@@ -340,6 +351,7 @@ async function loadClickfix({
 
   if (bridgeNames !== null) {
     fakeDocument.addEventListener(bridgeNames.resultEventName, (event) => {
+      if (event.detail.startsWith("manual-fallback\0")) return;
       bridgeResults.push(JSON.parse(event.detail));
     });
   }
@@ -374,8 +386,8 @@ async function loadClickfix({
     dispatchCopy(text, options) {
       return dispatch("copy", clipboardEvent("copy", text, options));
     },
-    dispatchCut(text) {
-      return dispatch("cut", clipboardEvent("cut", text));
+    dispatchCut(text, options) {
+      return dispatch("cut", clipboardEvent("cut", text, options));
     },
     async dispatchBridgeRequest(text, {
       requestId = "request-1",
@@ -383,7 +395,7 @@ async function loadClickfix({
     } = {}) {
       if (bridgeNames === null) throw new Error("private bridge was not bootstrapped");
       fakeDocument.dispatchEvent(new FakeCustomEvent(bridgeNames.requestEventName, {
-        detail: JSON.stringify({ requestId, operation, text }),
+        detail: framePrivateRequest(operation, requestId, text),
         bubbles: false,
         composed: false,
       }));
@@ -878,12 +890,139 @@ test("a hostile keydown handler cannot use the genuine wrapper to overwrite manu
   assert.deepEqual(page.fakeClipboard.nativeWriteTextCalls, []);
 });
 
-test("over-limit bridge text fails closed before background transport", async () => {
+// Issue #27 -- the inspection ceiling is not a transport ceiling. Values past
+// it still reach the background, which classifies them as out of scope and
+// copies them through the extension-owned writer.
+test("bridge text past the inspection ceiling is relayed for an allowed copy", async () => {
   const page = await loadClickfix();
-  const result = await page.dispatchBridgeRequest("x".repeat(65_537), { requestId: "large" });
+  const text = "x".repeat(OVER_INSPECTION_LENGTH);
+  const result = await page.dispatchBridgeRequest(text, { requestId: "oversized" });
 
-  assert.equal(result.status, "blocked");
+  assert.equal(result.status, "copied");
+  const relayed = page.lastMessage("clickfix_clipboard_request");
+  assert.equal(relayed.operation, "writeText");
+  assert.equal(relayed.text, text);
+  assert.equal(relayed.text.length, OVER_INSPECTION_LENGTH);
+});
+
+test("Clipboard.write text past the inspection ceiling is relayed intact", async () => {
+  const page = await loadClickfix();
+  const text = `head${"y".repeat(OVER_INSPECTION_LENGTH)}tail`;
+  const result = await page.dispatchBridgeRequest(text, {
+    requestId: "oversized-write",
+    operation: "write",
+  });
+
+  assert.equal(result.status, "copied");
+  const relayed = page.lastMessage("clickfix_clipboard_request");
+  assert.equal(relayed.operation, "write");
+  assert.equal(relayed.text, text);
+});
+
+// Framing keeps escape-heavy text within the bound defined for raw clipboard
+// values; the former JSON envelope expanded this input beyond the bridge cap.
+test("the private bridge preserves transportable NUL-heavy text", async () => {
+  const page = await loadClickfix();
+  const text = "\0".repeat(700_000);
+  const legacyLength = JSON.stringify({ requestId: "nul-heavy", operation: "writeText", text }).length;
+  assert.ok(legacyLength > MAX_CLIPBOARD_TRANSPORT_LENGTH + 512);
+
+  const result = await page.dispatchBridgeRequest(text, { requestId: "nul-heavy" });
+  assert.equal(result.status, "copied");
+  const relayed = page.lastMessage("clickfix_clipboard_request");
+  assert.equal(relayed.text, text);
+  assert.equal(relayed.text.length, text.length);
+});
+
+
+test("bridge text past the transport bound is an error, never a ClickFix verdict", async () => {
+  const page = await loadClickfix();
+  const result = await page.dispatchBridgeRequest("x".repeat(OVER_TRANSPORT_LENGTH), {
+    requestId: "untransportable",
+  });
+
+  assert.equal(result.status, "error");
+  assert.notEqual(result.status, "blocked");
   assert.equal(page.lastMessage("clickfix_clipboard_request"), undefined);
+});
+
+test("a trusted manual copy past the inspection ceiling is delegated, not dropped", async () => {
+  const page = await loadClickfix();
+  const text = `start${"z".repeat(OVER_INSPECTION_LENGTH)}end`;
+  const event = page.dispatchCopy(text);
+  await flush();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(event.writtenText, undefined);
+  const relayed = page.lastMessage("clickfix_clipboard_request");
+  assert.equal(relayed.operation, "copy");
+  assert.equal(relayed.text, text);
+});
+
+test("a trusted manual cut past the inspection ceiling deletes only after copied", async () => {
+  const value = `before ${"q".repeat(OVER_INSPECTION_LENGTH)} after`;
+  const page = await loadClickfix();
+  const input = new FakeInputElement(value, 7, 7 + OVER_INSPECTION_LENGTH);
+  page.setActiveElement(input);
+
+  page.dispatchCut(undefined);
+  await flush();
+
+  const relayed = page.lastMessage("clickfix_clipboard_request");
+  assert.equal(relayed.operation, "cut");
+  assert.equal(relayed.text, "q".repeat(OVER_INSPECTION_LENGTH));
+  assert.equal(input.value, "before  after");
+});
+
+
+// Values beyond the extension-message transport bound still complete through
+// the trusted ClipboardEvent rather than being cancelled and lost.
+test("a trusted manual copy past the transport bound writes the exact event data", async () => {
+  const page = await loadClickfix({ installMainHook: true });
+  const text = `head${"z".repeat(OVER_TRANSPORT_LENGTH)}tail`;
+  page.setSelectionText(text);
+  const event = page.dispatchCopy(undefined);
+  await flush();
+
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(event.writtenText, text);
+  assert.equal(page.lastMessage("clickfix_clipboard_request"), undefined);
+});
+
+test("a trusted manual cut past the transport bound writes before deleting", () => {
+  const selected = "q".repeat(OVER_TRANSPORT_LENGTH);
+  const value = `before ${selected} after`;
+  const page = loadClickfix({ installMainHook: true });
+  return page.then((loaded) => {
+    const input = new FakeInputElement(value, 7, 7 + selected.length);
+    loaded.setActiveElement(input);
+
+    const event = loaded.dispatchCut(undefined);
+
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(event.writtenText, selected);
+    assert.equal(input.value, "before  after");
+    assert.equal(input.dispatched[0].inputType, "deleteByCut");
+    assert.equal(loaded.lastMessage("clickfix_clipboard_request"), undefined);
+  });
+});
+
+test("a failed oversized manual cut write leaves the selection unchanged", () => {
+  const selected = "r".repeat(OVER_TRANSPORT_LENGTH);
+  const value = `before ${selected} after`;
+  const page = loadClickfix({ installMainHook: true });
+  return page.then((loaded) => {
+    const input = new FakeInputElement(value, 7, 7 + selected.length);
+    loaded.setActiveElement(input);
+
+    const event = loaded.dispatchCut(undefined, { setDataError: new Error("clipboard unavailable") });
+
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(event.writtenText, undefined);
+    assert.equal(input.value, value);
+    assert.deepEqual(input.dispatched, []);
+    assert.equal(loaded.lastMessage("clickfix_clipboard_request"), undefined);
+  });
 });
 
 test("the private bridge cannot create a gestureless clipboard-write capability", async () => {

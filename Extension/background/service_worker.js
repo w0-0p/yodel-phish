@@ -106,7 +106,7 @@ const CLICKFIX_CLIPBOARD_TIMEOUT_MS = 5_000;
 const CLICKFIX_INTERSTITIAL_BASE = chrome.runtime.getURL(INTERSTITIAL_PAGE + "?kind=clickfix");
 const CLICKFIX_OPAQUE_SOURCE_URL = "opaque-frame:";
 const CLICKFIX_WARNING_EXPIRY_ALARM = "clickfix-warning-expiry";
-const { MAX_COPY_TEXT_LENGTH, detectClickfixCommand } = clickfixPolicy;
+const { MAX_CLIPBOARD_TRANSPORT_LENGTH, detectClickfixCommand } = clickfixPolicy;
 
 // Device-code phishing protection (issue #39).
 const DEVICE_FLOW_INTERSTITIAL_URL = chrome.runtime.getURL(INTERSTITIAL_PAGE + "?kind=device_flow");
@@ -3669,10 +3669,14 @@ async function handleMessage(message, tabId, senderUrl, sender, context = {}) {
       if (clickfixContextUrl === null || tabId === undefined) {
         return invalidSettingsRequest("forbidden");
       }
-      if (!CLICKFIX_OPERATIONS.has(message.operation) ||
-          typeof message.text !== "string" ||
-          message.text.length > MAX_COPY_TEXT_LENGTH) {
+      if (!CLICKFIX_OPERATIONS.has(message.operation) || typeof message.text !== "string") {
         return { ok: true, status: "blocked" };
+      }
+      // A value beyond what the extension-owned writer can carry is a transport
+      // failure, not a ClickFix verdict (issue #27). Values that merely exceed
+      // the inspection ceiling are classified as "allow" and copied in full.
+      if (message.text.length > MAX_CLIPBOARD_TRANSPORT_LENGTH) {
+        return { ok: false, code: "clipboard_transport_limit" };
       }
       // Keep classification and an allowed clipboard write in the same settings
       // transaction. Otherwise a strict-mode change or exclusion removal could

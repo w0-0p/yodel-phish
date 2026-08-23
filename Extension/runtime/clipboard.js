@@ -4,7 +4,12 @@
 (function installClickfixClipboardWriter() {
   const TARGET = "yodel-clickfix-clipboard";
   const SERVICE_WORKER_URL = chrome.runtime.getURL("dist/service_worker.js");
-  const MAX_TEXT_LENGTH = 65_536;
+  // Transport bound only. It intentionally mirrors the shared policy's
+  // MAX_CLIPBOARD_TRANSPORT_LENGTH rather than its inspection ceiling: values
+  // too long for ClickFix to classify are still copied verbatim (issue #27).
+  // Kept as a literal so this endpoint stays loadable without the policy
+  // module; a source guard in the background tests pins the two together.
+  const MAX_TRANSPORT_TEXT_LENGTH = 4_194_304;
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.target !== TARGET) return false;
@@ -12,7 +17,7 @@
       return false;
     }
     if (message.type !== "write_text" || typeof message.text !== "string" ||
-        message.text.length > MAX_TEXT_LENGTH) {
+        message.text.length > MAX_TRANSPORT_TEXT_LENGTH) {
       sendResponse({ ok: false, error: "Invalid clipboard request" });
       return false;
     }
