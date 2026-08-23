@@ -42,16 +42,23 @@ function clickfixDiagnosticPreview(value) {
 // on an extension page, so each warning re-asserts its own alert: "blocked"
 // (blinking red cross) for a blocking page, "interrupted"/"suspicious" (orange
 // "!") for a warn-level one. Only asserted when a real warning is displayed --
-// an expired-request page has nothing left to alert about.
+// a page whose record no longer exists has nothing left to alert about.
 function showBadge(state, title) {
   chrome.runtime.sendMessage({ type: "set_icon_state", state, title }).catch(() => {});
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  // Issue #29: ClickFix has its own entry point, and the kind follows the
+  // document rather than the query string. clickfix.html can therefore never
+  // render another kind's copy, and interstitial.html -- whose static markup
+  // carries the phishing heading -- can never be talked into rendering a
+  // clipboard warning by an edited "?kind=".
   const requestedKind = new URLSearchParams(location.search).get("kind");
-  const kind = requestedKind === "interrupted" || requestedKind === "clickfix" || requestedKind === "device_flow"
-    ? requestedKind
-    : "phishing";
+  const kind = /(?:^|\/)clickfix\.html$/.test(location.pathname)
+    ? "clickfix"
+    : requestedKind === "interrupted" || requestedKind === "device_flow"
+      ? requestedKind
+      : "phishing";
 
   const brandEl = document.getElementById("yp-brand");
   const iconEl = document.getElementById("yp-icon");
@@ -72,8 +79,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   // (orange) — the same split the background colour and the action badge
   // already make. It travels with showBadge because both answer the same
   // question, and because the states that display no warning at all (an
-  // expired ClickFix request, an interruption or phishing record that no
-  // longer exists) call neither and correctly keep the plain brand line.
+  // interruption or phishing record that no longer exists) call neither and
+  // correctly keep the plain brand line. A ClickFix page has no such state: it
+  // either renders its verdict or closes itself (issue #29).
   function announce(severity, badgeState, badgeTitle) {
     brandEl.textContent = severity === "alert" ? "Yodel Phish Alert" : "Yodel Phish Warning";
     showBadge(badgeState, badgeTitle);
@@ -91,93 +99,93 @@ document.addEventListener("DOMContentLoaded", async () => {
     iconEl.innerHTML = WARNING_ICON;
     closeBtn.textContent = "Cancel";
 
-    // The warning tab can finish loading before a cold MV3 worker has bound its
-    // tab ID in storage.session. Retry to a real startup-scale deadline rather
-    // than permanently reporting expiry after a 250 ms scheduling hiccup.
-    let response;
-    const bindingDeadline = Date.now() + 5_000;
-    do {
-      response = await chrome.runtime.sendMessage({ type: "get_clickfix_warning" }).catch(() => undefined);
-      if (response?.ok === true) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    } while (Date.now() < bindingDeadline);
+    // State before navigation (issue #29): the background persists the verdict
+    // bound to this exact tab and only then navigates the tab here, the way the
+    // phishing and device-code pages already work. One lookup is therefore
+    // authoritative -- there is no binding race left to retry against, so the
+    // five-second retry loop and the expired-request page it fed are gone.
+    const response = await chrome.runtime.sendMessage({ type: "get_clickfix_warning" }).catch(() => undefined);
 
+    // A lookup that still fails means the record was removed or corrupted from
+    // outside this flow. Nothing has been painted yet, and there is no honest
+    // page to show: ask the background to take the tab down and hand focus back
+    // to the page the request came from.
     if (response?.ok !== true) {
-      titleEl.textContent = "Clipboard request expired";
-      messageEl.textContent = "The command was not copied.";
-      hintEl.textContent = "Return to the original page and retry only if you intended to copy it.";
-      closeBtn.textContent = "Close";
-    } else {
-      const strict = response.mode !== "warn";
-      document.body.classList.add(strict ? "yp-kind-clickfix-block" : "yp-kind-clickfix-warn");
-      titleEl.textContent = strict ? "Dangerous command blocked" : "Potentially dangerous command";
-      announce(
-        strict ? "alert" : "warning",
-        strict ? "blocked" : "suspicious",
-        `Yodel Phish — ${titleEl.textContent}`
-      );
-      messageEl.textContent = strict
-        ? `${response.source_host} attempted to place a system command on your clipboard. It was not copied.`
-        : `${response.source_host} attempted to place this command on your clipboard.`;
-      hintEl.textContent =
-        "Pasting commands from websites into Run, PowerShell, Command Prompt, or Terminal can install malware. " +
-        "Continue only if you understand the command and intended to run it.";
-      const explanation = [];
-      if (typeof response.tool === "string" && response.tool !== "") {
-        explanation.push(`Detected command tool: ${response.tool}.`);
-      }
-      if (typeof response.behavior === "string" && response.behavior !== "") {
-        explanation.push(`Risky behavior: ${response.behavior}.`);
-      }
-      if (explanation.length === 0 && Array.isArray(response.reasons)) {
-        const safeReasons = response.reasons
-          .filter((reason) => typeof reason === "string" && reason !== "")
-          .slice(0, 4);
-        if (safeReasons.length > 0) explanation.push(`Reason: ${safeReasons.join("; ")}.`);
-      }
-      if (explanation.length > 0) {
-        commandReasonEl.textContent = explanation.join(" ");
-        commandReasonEl.hidden = false;
-      }
-      commandPreviewEl.textContent = clickfixDiagnosticPreview(response.text);
-      commandLabelEl.hidden = false;
-      commandPreviewEl.hidden = false;
-
-      if (!strict) {
-        proceedBtn.hidden = false;
-        proceedBtn.textContent = "Copy underlying text anyway";
-        proceedBtn.addEventListener("click", async function approveClickfix() {
-          if (!this.dataset.confirm) {
-            this.dataset.confirm = "1";
-            this.textContent = "Confirm — copy underlying text";
-            this.classList.add("yp-btn-proceed-confirm");
-            return;
-          }
-          this.disabled = true;
-          const result = await chrome.runtime.sendMessage({ type: "clickfix_copy_anyway" }).catch(() => undefined);
-          if (result?.ok === true) {
-            // The confirmation click was the user's last required action
-            // (issue #3): the text is on the clipboard, so close immediately
-            // and hand focus back to the original page.
-            chrome.runtime.sendMessage({ type: "close_tab" }).catch(() => {});
-            return;
-          }
-          proceedBtn.hidden = true;
-          closeBtn.textContent = "Return to page";
-          titleEl.textContent = "Command not copied";
-          messageEl.textContent = "The clipboard request expired or the protected write failed.";
-          hintEl.textContent = "Return to the original page and retry only if you still intend to copy it.";
-          titleEl.focus({ preventScroll: true });
-        });
-      }
+      chrome.runtime.sendMessage({ type: "clickfix_warning_unavailable" }).catch(() => {});
+      return;
     }
 
-    titleEl.focus({ preventScroll: true });
+    const strict = response.mode !== "warn";
+    document.body.classList.add(strict ? "yp-kind-clickfix-block" : "yp-kind-clickfix-warn");
+    titleEl.textContent = strict ? "Dangerous command blocked" : "Potentially dangerous command";
+    announce(
+      strict ? "alert" : "warning",
+      strict ? "blocked" : "suspicious",
+      `Yodel Phish — ${titleEl.textContent}`
+    );
+    messageEl.textContent = strict
+      ? `${response.source_host} attempted to place a system command on your clipboard. It was not copied.`
+      : `${response.source_host} attempted to place this command on your clipboard.`;
+    hintEl.textContent =
+      "Pasting commands from websites into Run, PowerShell, Command Prompt, or Terminal can install malware. " +
+      "Continue only if you understand the command and intended to run it.";
+    const explanation = [];
+    if (typeof response.tool === "string" && response.tool !== "") {
+      explanation.push(`Detected command tool: ${response.tool}.`);
+    }
+    if (typeof response.behavior === "string" && response.behavior !== "") {
+      explanation.push(`Risky behavior: ${response.behavior}.`);
+    }
+    if (explanation.length === 0 && Array.isArray(response.reasons)) {
+      const safeReasons = response.reasons
+        .filter((reason) => typeof reason === "string" && reason !== "")
+        .slice(0, 4);
+      if (safeReasons.length > 0) explanation.push(`Reason: ${safeReasons.join("; ")}.`);
+    }
+    if (explanation.length > 0) {
+      commandReasonEl.textContent = explanation.join(" ");
+      commandReasonEl.hidden = false;
+    }
+    commandPreviewEl.textContent = clickfixDiagnosticPreview(response.text);
+    commandLabelEl.hidden = false;
+    commandPreviewEl.hidden = false;
+
+    if (!strict) {
+      proceedBtn.hidden = false;
+      proceedBtn.textContent = "Copy underlying text anyway";
+      proceedBtn.addEventListener("click", async function approveClickfix() {
+        if (!this.dataset.confirm) {
+          this.dataset.confirm = "1";
+          this.textContent = "Confirm — copy underlying text";
+          this.classList.add("yp-btn-proceed-confirm");
+          return;
+        }
+        this.disabled = true;
+        const result = await chrome.runtime.sendMessage({ type: "clickfix_copy_anyway" }).catch(() => undefined);
+        if (result?.ok === true) {
+          // The confirmation click was the user's last required action
+          // (issue #3): the text is on the clipboard, so close immediately
+          // and hand focus back to the original page.
+          chrome.runtime.sendMessage({ type: "close_tab" }).catch(() => {});
+          return;
+        }
+        proceedBtn.hidden = true;
+        closeBtn.textContent = "Return to page";
+        titleEl.textContent = "Command not copied";
+        messageEl.textContent = "The clipboard request expired or the protected write failed.";
+        hintEl.textContent = "Return to the original page and retry only if you still intend to copy it.";
+        titleEl.focus({ preventScroll: true });
+      });
+    }
 
     closeBtn.addEventListener("click", async () => {
       await chrome.runtime.sendMessage({ type: "clickfix_cancel" }).catch(() => undefined);
       await chrome.runtime.sendMessage({ type: "close_tab" }).catch(() => undefined);
     });
+
+    // The card carries the real verdict now; this is the page's first paint.
+    document.body.classList.remove("yp-kind-clickfix-pending");
+    titleEl.focus({ preventScroll: true });
     return;
   }
 

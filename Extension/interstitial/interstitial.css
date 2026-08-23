@@ -8,6 +8,9 @@
   /* One size for every line of body copy on every warning kind (issue #76);
      only the heading is larger. */
   --yp-text-size: 18px;
+  /* Severity-neutral backdrop for the one frame a ClickFix page spends
+     retrieving its already-persisted verdict (issue #29). */
+  --yp-pending: #37474f;
 }
 
 * , *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -33,6 +36,19 @@ body.yp-kind-interrupted {
 
 body.yp-kind-clickfix-warn {
   --yp-bg: var(--yp-orange);
+}
+
+/* Issue #29 — a ClickFix page is navigated only after its verdict exists, so
+   it never shows a loading, expired, or unavailable state. The card is hidden
+   until the single lookup returns and the real verdict has been written into
+   it; a failed lookup closes the tab with nothing ever painted. This is a
+   reveal, not a spinner: there is no interim copy to read. */
+body.yp-kind-clickfix-pending {
+  --yp-bg: var(--yp-pending);
+}
+
+body.yp-kind-clickfix-pending .yp-card {
+  visibility: hidden;
 }
 
 .yp-card {

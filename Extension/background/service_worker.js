@@ -34,7 +34,15 @@ import {
 import { createCaptureTracker, createSelectorSessionStore, selectorSessionStatus } from "./selectorSessions.mjs";
 import { createTrustedAddIntentStore } from "./trustedAddIntents.mjs";
 import { createInterruptionTabs } from "./interruptionTabs.mjs";
-import { createClickfixWarningStore } from "./clickfixWarnings.mjs";
+import {
+  CLICKFIX_WARNING_STAGING_URL,
+  createClickfixWarningStore,
+} from "./clickfixWarnings.mjs";
+import {
+  abandonClickfixWarningTab,
+  createClickfixWarningNavigationMonitor,
+  openClickfixWarningTab,
+} from "./clickfixWarningTabs.mjs";
 import clickfixPolicy from "../content/clickfix-policy.js";
 import {
   DEFAULT_DEVICE_FLOW_REGISTRY,
@@ -80,6 +88,10 @@ const OFFSCREEN_TARGET = "yodel-offscreen";
 const CLICKFIX_CLIPBOARD_TARGET = "yodel-clickfix-clipboard";
 const OFFSCREEN_DOCUMENT = "runtime/offscreen.html";
 const INTERSTITIAL_PAGE = "interstitial/interstitial.html";
+// Issue #29: ClickFix has its own entry point rather than a query-string kind
+// on the shared page, so a clipboard warning can never paint the phishing
+// page's static "Deceptive site ahead" heading while its verdict is fetched.
+const CLICKFIX_INTERSTITIAL_PAGE = "interstitial/clickfix.html";
 const PHISHING_STATE_KEY = "phishing_warning_state";
 const ANALYSIS_HISTORY_KEY = "analysis_history";
 const MAX_ANALYSIS_HISTORY = 25;
@@ -103,7 +115,7 @@ const CLICKFIX_OPERATIONS = new Set(["writeText", "write", "copy", "cut"]);
 const MAX_CLICKFIX_DOMAIN_EXCLUSIONS = 50;
 const MAX_CLICKFIX_DOMAIN_LENGTH = 253;
 const CLICKFIX_CLIPBOARD_TIMEOUT_MS = 5_000;
-const CLICKFIX_INTERSTITIAL_BASE = chrome.runtime.getURL(INTERSTITIAL_PAGE + "?kind=clickfix");
+const CLICKFIX_INTERSTITIAL_BASE = chrome.runtime.getURL(CLICKFIX_INTERSTITIAL_PAGE + "?kind=clickfix");
 const CLICKFIX_OPAQUE_SOURCE_URL = "opaque-frame:";
 const CLICKFIX_WARNING_EXPIRY_ALARM = "clickfix-warning-expiry";
 const { MAX_CLIPBOARD_TRANSPORT_LENGTH, detectClickfixCommand } = clickfixPolicy;
@@ -209,6 +221,7 @@ const interruptionTabs = createInterruptionTabs({
   readyTimeoutMs: INTERRUPTION_READY_TIMEOUT_MS,
 });
 const clickfixWarnings = createClickfixWarningStore(chrome.storage.session);
+const clickfixWarningNavigationMonitor = createClickfixWarningNavigationMonitor();
 
 async function scheduleClickfixWarningExpiry() {
   const nextExpiry = await clickfixWarnings.nextExpiry();
@@ -313,21 +326,55 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
-async function cleanupClickfixWarningTabNavigation(tabId, url) {
+// Issue #29: one atomic decision per warning-tab navigation. The former
+// getWarning()-then-discardWarningTab() pair could observe "no warning for this
+// tab" and delete the record that was bound in between; reconciliation reads
+// and writes inside a single queued transaction, so no such window exists.
+//
+// Called synchronously by every navigation listener before that listener awaits
+// anything else, so the store's FIFO queue reconciles a tab's navigations in
+// the order the browser reported them.
+async function reconcileClickfixWarningTabNavigation(
+  tabId,
+  url,
+  { phase = "updated", documentId } = {}
+) {
   const requestId = clickfixRequestIdFromInterstitial(url);
-  if (requestId === null || await clickfixWarnings.getWarning(requestId, tabId) === null) {
-    await clickfixWarnings.discardWarningTab(tabId);
+  const result = await clickfixWarnings.reconcileWarningTabNavigation({
+    warningTabId: tabId,
+    requestId,
+    url,
+    phase,
+    ...(documentId === undefined ? {} : { documentId }),
+  });
+  if (result.outcome === "discarded") {
+    clickfixWarningNavigationMonitor.fail(
+      tabId,
+      new Error("ClickFix warning navigation was replaced")
+    );
+  } else if (phase === "committed" && result.outcome === "activated") {
+    clickfixWarningNavigationMonitor.commit(tabId, requestId);
   }
+  return result;
 }
 
 async function cleanupClickfixCommittedNavigation(details) {
   const documentId = typeof details.documentId === "string" && details.documentId !== ""
     ? details.documentId
     : undefined;
-  await clickfixWarnings.discardSourceDocument(details.tabId, details.frameId, documentId);
-  if (details.frameId === 0) {
-    await cleanupClickfixWarningTabNavigation(details.tabId, details.url);
-  }
+  // Both enqueued before the first await so a later event for the same tab
+  // cannot overtake either of them in the store's queue.
+  const sourceCleanup = clickfixWarnings.discardSourceDocument(
+    details.tabId, details.frameId, documentId
+  );
+  const warningTabCleanup = details.frameId === 0
+    ? reconcileClickfixWarningTabNavigation(details.tabId, details.url, {
+        phase: "committed",
+        ...(documentId === undefined ? {} : { documentId }),
+      })
+    : null;
+  await sourceCleanup;
+  if (warningTabCleanup !== null) await warningTabCleanup;
   await scheduleClickfixWarningExpiry();
 }
 
@@ -428,7 +475,7 @@ chrome.tabs.onUpdated.addListener(async (updatedTabId, changeInfo) => {
     // navigation the provider makes while the user reads the banner, so its
     // badge landed inside this window every time (issue #77-adjacent).
     invalidateActionFeedback(updatedTabId);
-    await cleanupClickfixWarningTabNavigation(updatedTabId, changeInfo.url)
+    await reconcileClickfixWarningTabNavigation(updatedTabId, changeInfo.url)
       .then(scheduleClickfixWarningExpiry)
       .catch((error) => {
         console.warn("[YodelPhish] Failed to clean navigated ClickFix warning tab:", error);
@@ -473,7 +520,16 @@ for (const [event, reasonHint, source] of [
   ],
 ]) {
   event.addListener((details) => {
-    void clickfixWarnings.discardSourceDocument(details.tabId, details.frameId)
+    // Issue #29: History API and fragment navigation do not replace the
+    // document, so the exact document a clipboard request is bound to survives
+    // them and its immutable request must too -- SPAs such as GitHub run late
+    // pushState()/replaceState() calls while the user reads the warning.
+    // Passing the still-live document id retains that record while still
+    // collecting warnings left behind by documents this frame has replaced.
+    const documentId = typeof details.documentId === "string" && details.documentId !== ""
+      ? details.documentId
+      : undefined;
+    void clickfixWarnings.discardSourceDocument(details.tabId, details.frameId, documentId)
       .then(scheduleClickfixWarningExpiry)
       .catch((error) => {
         console.warn("[YodelPhish] Failed to discard navigated ClickFix source state:", error);
@@ -647,6 +703,14 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
 
 chrome.webNavigation.onErrorOccurred.addListener((details) => {
   if (details.frameId !== 0) return;
+  if (!clickfixWarningNavigationMonitor.fail(
+    details.tabId,
+    new Error(details.error || "ClickFix warning navigation failed")
+  )) {
+    void cleanupRestartedClickfixNavigationFailure(details.tabId).catch((error) => {
+      console.warn("[YodelPhish] Failed to clean aborted ClickFix warning navigation:", error);
+    });
+  }
   const preparation = sameTabSourcePreparations.get(details.tabId);
   sameTabSourcePreparations.delete(details.tabId);
   void Promise.resolve(preparation)
@@ -1084,6 +1148,10 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 });
 
 chrome.tabs.onRemoved.addListener((removedTabId) => {
+  clickfixWarningNavigationMonitor.fail(
+    removedTabId,
+    new Error("ClickFix warning tab was closed")
+  );
   captureTracker.interruptTab(removedTabId);
   sameTabSourcePreparations.delete(removedTabId);
   createdDeviceFlowTargetPreparations.delete(removedTabId);
@@ -1352,18 +1420,24 @@ function isPendingPhishingUrl(url, pending) {
 
 function isInterstitialUrl(url) {
   // startsWith (not ===) so this also matches the "?kind=interrupted" variant.
-  return typeof url === "string" && url.startsWith(chrome.runtime.getURL(INTERSTITIAL_PAGE));
+  return typeof url === "string" && (
+    url.startsWith(chrome.runtime.getURL(INTERSTITIAL_PAGE)) ||
+    url.startsWith(chrome.runtime.getURL(CLICKFIX_INTERSTITIAL_PAGE))
+  );
 }
 
 function isInterruptionUrl(url) {
   return url === chrome.runtime.getURL(INTERSTITIAL_PAGE + "?kind=interrupted");
 }
 
+// The one address that can carry a ClickFix verdict: this extension's ClickFix
+// entry point, with the exact request id of a record bound to the asking tab.
+// A stale or hand-edited address therefore cannot claim a different record.
 function clickfixRequestIdFromInterstitial(url) {
   if (typeof url !== "string") return null;
   try {
     const parsed = new URL(url);
-    const expected = new URL(chrome.runtime.getURL(INTERSTITIAL_PAGE));
+    const expected = new URL(chrome.runtime.getURL(CLICKFIX_INTERSTITIAL_PAGE));
     if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) return null;
     if (parsed.searchParams.get("kind") !== "clickfix") return null;
     const requestId = parsed.searchParams.get("request");
@@ -1373,6 +1447,10 @@ function clickfixRequestIdFromInterstitial(url) {
   } catch {
     return null;
   }
+}
+
+function clickfixInterstitialUrl(requestId) {
+  return `${CLICKFIX_INTERSTITIAL_BASE}&request=${encodeURIComponent(requestId)}`;
 }
 
 function clickfixSenderContextUrl(sender) {
@@ -1447,54 +1525,69 @@ async function writeClickfixClipboardText(text) {
   }
 }
 
+// The ClickFix warning lifecycle lives in clickfixWarningTabs.mjs so the exact
+// ordering this issue turns on -- stage inactive, persist bound, revalidate the
+// source document, then navigate and activate -- is driven directly by tests.
+// Everything below is the chrome.* wiring it is given.
+const clickfixWarningTabDependencies = {
+  tabs: chrome.tabs,
+  warnings: clickfixWarnings,
+  interstitialUrl: clickfixInterstitialUrl,
+  stagingUrl: CLICKFIX_WARNING_STAGING_URL,
+  getWarningTabDocument: (tabId) => waitForClickfixStagingDocument(tabId),
+  navigationMonitor: clickfixWarningNavigationMonitor,
+  isSourceDocumentAlive: (warning) => isClickfixSourceDocumentAlive(warning),
+  onStateChanged: () => scheduleClickfixWarningExpiry(),
+};
+
 async function openClickfixWarning(sender, sourceUrl, text, decision, mode) {
-  const sourceTabId = sender.tab.id;
-  const sourceFrameId = Number.isInteger(sender.frameId) && sender.frameId >= 0 ? sender.frameId : 0;
-  if (typeof sender.documentId !== "string" || sender.documentId === "") return null;
-  const warning = await clickfixWarnings.createWarning({
-    sourceTabId,
-    sourceFrameId,
+  const presentation = await openClickfixWarningTab({
+    sourceTabId: sender.tab.id,
+    sourceFrameId: Number.isInteger(sender.frameId) && sender.frameId >= 0 ? sender.frameId : 0,
     sourceDocumentId: sender.documentId,
     sourceUrl,
+    windowId: sender.tab.windowId,
     mode,
     decision: summarizeClickfixDecision(decision),
     text,
-  });
-  if (warning === null) return null;
-  // A navigation commit may race this in-flight runtime message and complete
-  // its cleanup before the new warning record is created. Validate the exact
-  // initiating document after creation; a later commit will instead delete
-  // the record and make tab binding fail closed.
-  if (!(await isClickfixSourceDocumentAlive(warning))) {
-    await clickfixWarnings.discardWarning(warning.requestId);
-    await scheduleClickfixWarningExpiry();
-    return null;
+  }, clickfixWarningTabDependencies);
+  if (presentation.error !== undefined) {
+    console.warn("[YodelPhish] Could not present a ClickFix warning:", presentation.error);
   }
-  await scheduleClickfixWarningExpiry();
+  return presentation;
+}
 
-  let warningTab;
+const CLICKFIX_STAGING_DOCUMENT_TIMEOUT_MS = 2_000;
+const CLICKFIX_STAGING_DOCUMENT_POLL_MS = 25;
+
+async function waitForClickfixStagingDocument(tabId) {
+  const deadline = Date.now() + CLICKFIX_STAGING_DOCUMENT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => null);
+    if (frame?.url === CLICKFIX_WARNING_STAGING_URL &&
+        typeof frame.documentId === "string" && frame.documentId !== "") {
+      return { url: frame.url, documentId: frame.documentId };
+    }
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab === null || (typeof tab.url === "string" &&
+        tab.url !== "" && tab.url !== CLICKFIX_WARNING_STAGING_URL)) {
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, CLICKFIX_STAGING_DOCUMENT_POLL_MS));
+  }
+  return null;
+}
+
+async function cleanupRestartedClickfixNavigationFailure(tabId) {
+  const warning = await clickfixWarnings.abandonWarningTab(tabId);
+  if (warning === null) return;
   try {
-    warningTab = await chrome.tabs.create({
-      url: `${CLICKFIX_INTERSTITIAL_BASE}&request=${encodeURIComponent(warning.requestId)}`,
-      active: true,
-      openerTabId: sourceTabId,
-      ...(Number.isInteger(sender.tab.windowId) ? { windowId: sender.tab.windowId } : {}),
-    });
-  } catch (error) {
-    await clickfixWarnings.discardWarning(warning.requestId);
     await scheduleClickfixWarningExpiry();
-    throw error;
+  } catch {
+    // Alarm maintenance must not strand the failed warning tab.
   }
-
-  if (!Number.isInteger(warningTab?.id) ||
-      await clickfixWarnings.bindWarningTab(warning.requestId, warningTab.id) === null) {
-    if (Number.isInteger(warningTab?.id)) await chrome.tabs.remove(warningTab.id).catch(() => {});
-    await clickfixWarnings.discardWarning(warning.requestId);
-    await scheduleClickfixWarningExpiry();
-    throw new Error("Could not bind the ClickFix warning tab");
-  }
-  await scheduleClickfixWarningExpiry();
-  return warning;
+  await chrome.tabs.update(warning.sourceTabId, { active: true }).catch(() => {});
+  await chrome.tabs.remove(tabId).catch(() => {});
 }
 
 async function isClickfixSourceDocumentAlive(warning) {
@@ -3698,14 +3791,17 @@ async function handleMessage(message, tabId, senderUrl, sender, context = {}) {
         };
       });
       if (inspection.copied) return { ok: true, status: "copied" };
-      const warning = await openClickfixWarning(
+      const presentation = await openClickfixWarning(
         sender,
         clickfixContextUrl,
         message.text,
         inspection.decision,
         inspection.mode
       );
-      if (warning === null) return { ok: false, code: "rate_limited" };
+      // The copy stays blocked either way; a setup failure is reported to the
+      // page as a plain failure rather than as a verdict, because no warning
+      // was presented for the user to answer.
+      if (!presentation.ok) return { ok: false, code: presentation.code };
       return {
         ok: true,
         status: inspection.decision.action === "warn" ? "warning" : "blocked",
@@ -4102,6 +4198,19 @@ async function handleMessage(message, tabId, senderUrl, sender, context = {}) {
       } finally {
         await scheduleClickfixWarningExpiry();
       }
+    }
+
+    // The ClickFix page is navigated only after its record exists, so its one
+    // lookup failing means the record was externally removed or corrupted.
+    // There is no expired, unavailable, or loading page to fall back to
+    // (issue #29): the warning tab is taken down and the source tab gets its
+    // focus back, exactly as a withdrawn setup would have left things.
+    case "clickfix_warning_unavailable": {
+      if (tabId === undefined || clickfixRequestIdFromInterstitial(senderUrl) === null) {
+        return { ok: false };
+      }
+      await abandonClickfixWarningTab(tabId, clickfixWarningTabDependencies);
+      return { ok: true };
     }
 
     // The phishing interstitial is a hard block: it reports what was detected

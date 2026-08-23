@@ -461,7 +461,7 @@ test("the worker prepares candidates on navigation events and binds them on comm
 test("the worker invalidates candidates on history, errors, replacement and closure", async () => {
   const worker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   assert.match(worker, /invalidateHandoverForHistoryChange\(details\)/);
-  assert.match(worker, /onErrorOccurred\.addListener[\s\S]{0,900}invalidateHandoverCandidate\(details\.tabId\)/);
+  assert.match(worker, /onErrorOccurred\.addListener[\s\S]{0,1600}invalidateHandoverCandidate\(details\.tabId\)/);
   assert.match(worker, /type: "handover_invalidated"/);
   assert.match(worker, /chrome\.tabs\.onReplaced\.addListener/);
   assert.match(worker, /handoverCandidates\.discardTab\(removedTabId\)/);
