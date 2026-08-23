@@ -875,6 +875,41 @@ test("service-worker storage protocol is trusted, bounded, and returns targeted 
   assert.doesNotMatch(settingsPage, /tag\.innerHTML/);
 });
 
+// Issue #27 -- the clipboard request path bounds transport, not inspection.
+// service_worker.js is bundled rather than imported by these tests, so its
+// wiring is pinned at the source level.
+test("the clipboard request path separates the transport bound from a ClickFix verdict", async () => {
+  const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+  const policy = await readFile(new URL("../content/clickfix-policy.js", import.meta.url), "utf8");
+  const offscreenWriter = await readFile(new URL("../runtime/clipboard.js", import.meta.url), "utf8");
+  const clipboardCase = serviceWorker.slice(
+    serviceWorker.indexOf('case "clickfix_clipboard_request"'),
+    serviceWorker.indexOf('case "open_clickfix_settings"')
+  );
+
+  // The clause bound is gone; the structural parser limits are not.
+  assert.doesNotMatch(policy, /MAX_COMMAND_STARTS/);
+  assert.match(policy, /MAX_WRAPPER_DEPTH/);
+  assert.match(policy, /MAX_WRAPPER_OPTIONS/);
+  assert.doesNotMatch(serviceWorker, /MAX_COPY_TEXT_LENGTH/);
+
+  // Past the inspection ceiling the policy allows, so nothing in this path may
+  // reject a copy for merely exceeding it.
+  assert.match(
+    clipboardCase,
+    /message\.text\.length > MAX_CLIPBOARD_TRANSPORT_LENGTH\) \{\s*return \{ ok: false, code: "clipboard_transport_limit" \};/,
+    "an untransportable value must fail as a transport error, never as a blocked verdict"
+  );
+  assert.doesNotMatch(clipboardCase, /MAX_CLICKFIX_INSPECTION_LENGTH/);
+
+  // The offscreen writer keeps its own literal so it stays loadable without the
+  // policy module. Pin the two together instead of letting them drift.
+  const policyBound = /MAX_CLIPBOARD_TRANSPORT_LENGTH = ([0-9_]+);/.exec(policy)?.[1];
+  const writerBound = /MAX_TRANSPORT_TEXT_LENGTH = ([0-9_]+);/.exec(offscreenWriter)?.[1];
+  assert.ok(policyBound !== undefined && writerBound !== undefined);
+  assert.equal(writerBound, policyBound, "the offscreen writer must accept everything the worker relays");
+});
+
 test("split-incognito workers reject diagnostics before shared local storage is opened", async () => {
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
   const writerStart = serviceWorker.indexOf("async function appendAnalysisHistory(record)");

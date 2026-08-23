@@ -8,6 +8,23 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 
 const PAGE_HOOK_SCRIPT_PATH = require.resolve("./clickfix-page-hook.js");
+const {
+  MAX_CLICKFIX_INSPECTION_LENGTH,
+  MAX_CLIPBOARD_TRANSPORT_LENGTH,
+} = require("./clickfix-policy.js");
+
+const OVER_INSPECTION_LENGTH = MAX_CLICKFIX_INSPECTION_LENGTH + 1;
+
+function parsePrivateRequestFrame(value) {
+  const operationEnd = value.indexOf("\0");
+  const requestIdEnd = value.indexOf("\0", operationEnd + 1);
+  assert.ok(operationEnd > 0 && requestIdEnd > operationEnd + 1);
+  return {
+    operation: value.slice(0, operationEnd),
+    requestId: value.slice(operationEnd + 1, requestIdEnd),
+    text: value.slice(requestIdEnd + 1),
+  };
+}
 
 class FakeDOMException extends Error {
   constructor(message, name) {
@@ -224,7 +241,7 @@ function loadPageHook({
     observedBootstrap.push(event.detail);
   }, { capture: true });
   fakeDocument.addEventListener(requestEventName, (event) => {
-    privateRequests.push(JSON.parse(event.detail));
+    privateRequests.push(parsePrivateRequestFrame(event.detail));
   }, { capture: true });
   fakeDocument.dispatchEvent(new FakeCustomEvent("__yodelphish_clickfix_bootstrap_v1__", {
     detail: JSON.stringify({ requestEventName, resultEventName }),
@@ -454,6 +471,74 @@ test("Clipboard.prototype.write cannot bypass text/plain inspection", async () =
   hook.dispatchResult(request.requestId, "blocked");
   await assert.rejects(promise, (error) => error.name === "NotAllowedError");
   assert.deepEqual(hook.nativeWriteCalls, []);
+});
+
+// Issue #27 -- the hook has no length opinion of its own. A value past the
+// ClickFix inspection ceiling is relayed whole and resolves normally once the
+// extension-owned copy succeeds.
+test("writeText past the inspection ceiling relays the exact value and resolves", async () => {
+  const hook = loadPageHook();
+  const text = `head${"x".repeat(OVER_INSPECTION_LENGTH)}tail`;
+
+  const promise = hook.clipboard.writeText(text);
+  const request = hook.lastRequest();
+
+  assert.equal(request.operation, "writeText");
+  assert.equal(request.text, text);
+  assert.equal(request.text.length, text.length);
+  assert.deepEqual(hook.nativeWriteTextCalls, []);
+
+  hook.dispatchResult(request.requestId, "copied");
+  await assert.doesNotReject(promise);
+  assert.deepEqual(hook.nativeWriteTextCalls, []);
+});
+
+// Escape-heavy text stays raw in the private frame instead of expanding past
+// a bound that is defined in terms of clipboard text.
+test("writeText preserves a transportable value that JSON would over-expand", async () => {
+  const hook = loadPageHook();
+  const text = "\0".repeat(700_000);
+  const legacyLength = JSON.stringify({ operation: "writeText", requestId: "1", text }).length;
+  assert.ok(legacyLength > MAX_CLIPBOARD_TRANSPORT_LENGTH + 512);
+
+  const promise = hook.clipboard.writeText(text);
+  const request = hook.lastRequest();
+  assert.equal(request.text, text);
+  assert.equal(request.text.length, text.length);
+  hook.dispatchResult(request.requestId, "copied");
+  await assert.doesNotReject(promise);
+});
+
+test("Clipboard.write past the inspection ceiling behaves like any other text item", async () => {
+  const hook = loadPageHook();
+  const text = `start${"y".repeat(OVER_INSPECTION_LENGTH)}end`;
+  const item = new hook.ClipboardItem({
+    "text/plain": new Blob([text], { type: "text/plain" }),
+  });
+
+  const promise = hook.clipboard.write([item]);
+  await flush();
+  const request = hook.lastRequest();
+
+  assert.equal(request.operation, "write");
+  assert.equal(request.text, text);
+  assert.deepEqual(hook.nativeWriteCalls, []);
+
+  hook.dispatchResult(request.requestId, "copied");
+  await assert.doesNotReject(promise);
+  assert.deepEqual(hook.nativeWriteCalls, []);
+});
+
+// A transport failure surfaces as an ordinary rejected clipboard write. The
+// hook never reports it as a ClickFix warning or interstitial.
+test("an error result rejects the write without any ClickFix verdict surfacing", async () => {
+  const hook = loadPageHook();
+
+  const promise = hook.clipboard.writeText("x".repeat(OVER_INSPECTION_LENGTH));
+  hook.dispatchResult(hook.lastRequest().requestId, "error");
+
+  await assert.rejects(promise, (error) => error.name === "NotAllowedError");
+  assert.deepEqual(hook.nativeWriteTextCalls, []);
 });
 
 test("Clipboard.write preserves the native path for non-text-only items", async () => {

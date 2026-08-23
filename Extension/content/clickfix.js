@@ -8,6 +8,7 @@
 (function installClickfixMediator() {
   const policy = globalThis.YodelClickfixPolicy;
   const BOOTSTRAP_EVENT = "__yodelphish_clickfix_bootstrap_v1__";
+  const REQUEST_FIELD_SEPARATOR = "\0";
   const REQUEST_TIMEOUT_MS = 10_000;
   const RATE_WINDOW_MS = 10_000;
   const MANUAL_COPY_GUARD_MS = 6_000;
@@ -29,7 +30,6 @@
   const customEventDetailGetter = typeof NativeCustomEvent === "function"
     ? Object.getOwnPropertyDescriptor(NativeCustomEvent.prototype, "detail")?.get ?? null
     : null;
-  const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;
   const dateNow = Date.now;
   const scheduleMicrotask = typeof globalThis.queueMicrotask === "function"
@@ -45,7 +45,8 @@
     : null;
 
   if (policy === null || typeof policy !== "object" ||
-      !Number.isInteger(policy.MAX_COPY_TEXT_LENGTH) || policy.MAX_COPY_TEXT_LENGTH < 1) {
+      !Number.isInteger(policy.MAX_CLIPBOARD_TRANSPORT_LENGTH) ||
+      policy.MAX_CLIPBOARD_TRANSPORT_LENGTH < 1) {
     console.error("[YodelPhish] ClickFix policy failed to load; clipboard mediation is unavailable.");
     return;
   }
@@ -79,12 +80,13 @@
     return `__yodelphish_clickfix_${kind}_${words[0]}_${words[1]}_${words[2]}_${words[3]}_${words[4]}_${words[5]}`;
   }
 
-  function dispatchPrivateEvent(type, detail) {
+  function dispatchPrivateEvent(type, detail, cancelable = false) {
     if (typeof NativeCustomEvent !== "function") return false;
     const event = new NativeCustomEvent(type, {
       detail,
       bubbles: false,
       composed: false,
+      cancelable,
     });
     return nativeApply(eventTargetDispatch, bridgeTarget, [event]);
   }
@@ -165,25 +167,49 @@
     dispatchPrivateEvent(resultEventName, jsonStringify({ requestId, status }));
   }
 
+  function framePrivateMessage(operation, requestId, text = "") {
+    return `${operation}${REQUEST_FIELD_SEPARATOR}${requestId}${REQUEST_FIELD_SEPARATOR}${text}`;
+  }
+
+  function requestManualClipboardFallback(requestId, text) {
+    if (resultEventName === null) return false;
+    const accepted = dispatchPrivateEvent(
+      resultEventName, framePrivateMessage("manual-fallback", requestId, text), true
+    );
+    return accepted === false;
+  }
+
+  function parsePrivateRequestFrame(serialized) {
+    const operationEnd = serialized.indexOf(REQUEST_FIELD_SEPARATOR);
+    if (operationEnd <= 0) return null;
+    const requestIdEnd = serialized.indexOf(REQUEST_FIELD_SEPARATOR, operationEnd + 1);
+    if (requestIdEnd <= operationEnd + 1) return null;
+    return {
+      operation: serialized.slice(0, operationEnd),
+      requestId: serialized.slice(operationEnd + 1, requestIdEnd),
+      // Split only the two framing separators. Any NUL after them is part of
+      // the clipboard value and remains code-unit-for-code-unit equivalent.
+      text: serialized.slice(requestIdEnd + 1),
+    };
+  }
+
   function handlePrivateRequest(requestEvent) {
     if (eventTarget(requestEvent) !== bridgeTarget) return;
     const serialized = eventDetail(requestEvent);
-    if (typeof serialized !== "string" || serialized.length > policy.MAX_COPY_TEXT_LENGTH + 512) return;
-
-    let data;
-    try {
-      data = jsonParse(serialized);
-    } catch {
+    if (typeof serialized !== "string" ||
+        serialized.length > policy.MAX_CLIPBOARD_TRANSPORT_LENGTH + 512) {
       return;
     }
-    const programmatic = data !== null && typeof data === "object" &&
+
+    const data = parsePrivateRequestFrame(serialized);
+    if (data === null) return;
+    const programmatic =
       (data.operation === "writeText" || data.operation === "write") &&
       typeof data.text === "string";
-    const manual = data !== null && typeof data === "object" &&
+    const manual =
       (data.operation === "copy" || data.operation === "cut") &&
-      data.manual === true && data.text === undefined;
-    const manualIntent = data !== null && typeof data === "object" &&
-      data.operation === "manual-intent" && data.manual === true && data.text === undefined;
+      data.text === "";
+    const manualIntent = data.operation === "manual-intent" && data.text === "";
     if ((programmatic === false && manual === false && manualIntent === false) ||
         !REQUEST_ID_RE.test(data.requestId)) {
       return;
@@ -207,14 +233,24 @@
       } catch {
         return;
       }
-      if (snapshot.text === "" || snapshot.text.length > policy.MAX_COPY_TEXT_LENGTH) return;
+      if (snapshot.text === "") return;
+      if (snapshot.text.length > policy.MAX_CLIPBOARD_TRANSPORT_LENGTH) {
+        const copied = requestManualClipboardFallback(data.requestId, snapshot.text);
+        if (copied && data.operation === "cut") deleteApprovedCut(snapshot);
+        return;
+      }
       mediateManualSnapshot(snapshot, data.operation);
       return;
     }
-    if (dateNow() < manualCopyGuardUntil ||
-        !hasProgrammaticClipboardAuthority() ||
-        data.text.length > policy.MAX_COPY_TEXT_LENGTH) {
+    if (dateNow() < manualCopyGuardUntil || !hasProgrammaticClipboardAuthority()) {
       sendResult("blocked");
+      return;
+    }
+    // A value the extension-owned path cannot carry is a transport failure, not
+    // a ClickFix verdict (issue #27). Report it as an error so the page hook
+    // rejects the write instead of the caller reading it as a detection.
+    if (data.text.length > policy.MAX_CLIPBOARD_TRANSPORT_LENGTH) {
+      sendResult("error");
       return;
     }
     mediateProgrammaticRequest(data).then(sendResult);
@@ -336,6 +372,23 @@
     }
   }
 
+  // The MAIN-world gate has already cancelled the native event to prevent page
+  // handlers from replacing its contents. When the exact snapshot is too large
+  // for extension messaging, finish that same trusted event locally through
+  // ClipboardEvent.clipboardData instead of silently losing the copy or cut.
+  function writeManualEventClipboard(event, snapshot, operation) {
+    const clipboardData = event.clipboardData;
+    const setData = clipboardData?.setData;
+    if (typeof setData !== "function") return false;
+    try {
+      nativeApply(setData, clipboardData, ["text/plain", snapshot.text]);
+    } catch {
+      return false;
+    }
+    if (operation === "cut") deleteApprovedCut(snapshot);
+    return true;
+  }
+
   async function mediateManualSnapshot(snapshot, operation) {
     if (!rateLimitAllowsRequest()) return;
     try {
@@ -361,8 +414,13 @@
 
     if (event.isTrusted !== true || navigator.userActivation?.isActive !== true) return;
     const snapshot = snapshotClipboardText(event);
-    if (snapshot.text === "" || snapshot.text.length > policy.MAX_COPY_TEXT_LENGTH) return;
-    mediateManualSnapshot(snapshot, event.type === "cut" ? "cut" : "copy");
+    if (snapshot.text === "") return;
+    const operation = event.type === "cut" ? "cut" : "copy";
+    if (snapshot.text.length > policy.MAX_CLIPBOARD_TRANSPORT_LENGTH) {
+      writeManualEventClipboard(event, snapshot, operation);
+      return;
+    }
+    mediateManualSnapshot(snapshot, operation);
   }
 
   function installProtectedListeners() {
