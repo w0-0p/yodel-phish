@@ -833,6 +833,7 @@ test("enforceTrustedVariantCap: an append site cannot leave a third variant stor
 
 test("service-worker storage protocol is trusted, bounded, and returns targeted mutation results", async () => {
   const serviceWorker = await readFile(new URL("./service_worker.js", import.meta.url), "utf8");
+  const warningTabs = await readFile(new URL("./clickfixWarningTabs.mjs", import.meta.url), "utf8");
   const settingsPage = await readFile(new URL("../settings/settings.js", import.meta.url), "utf8");
   const manifest = JSON.parse(await readFile(new URL("../manifest.json", import.meta.url), "utf8"));
 
@@ -845,19 +846,60 @@ test("service-worker storage protocol is trusted, bounded, and returns targeted 
   assert.match(serviceWorker, /if \(listType === "trusted"\) touchTrustedEntry\(entry\)/);
   assert.match(serviceWorker, /return { ...source, mode, excluded_domains }/);
   assert.doesNotMatch(settingsPage, /regex_exclusions|regex exclusion/i);
+  // Issue #29 -- state before navigation, the invariant phishing and
+  // device-code already hold. The ordering itself is exercised directly in
+  // clickfixWarningTabs.test.mjs; pinned here is the wiring that gives that
+  // module the real chrome.tabs API, the real store, and the two addresses it
+  // stages and navigates to.
   const warningOpenStart = serviceWorker.indexOf("async function openClickfixWarning");
-  const warningCreate = serviceWorker.indexOf("clickfixWarnings.createWarning", warningOpenStart);
-  const sourceLiveness = serviceWorker.indexOf("isClickfixSourceDocumentAlive(warning)", warningCreate);
-  const warningTabCreate = serviceWorker.indexOf("chrome.tabs.create", sourceLiveness);
-  assert.ok(warningOpenStart >= 0 && warningCreate > warningOpenStart);
-  assert.ok(sourceLiveness > warningCreate && warningTabCreate > sourceLiveness);
-  const clickfixRequestStart = serviceWorker.indexOf('case "clickfix_clipboard_request"');
-  const clickfixRequestEnd = serviceWorker.indexOf('case "open_clickfix_settings"', clickfixRequestStart);
-  const clickfixRequest = serviceWorker.slice(clickfixRequestStart, clickfixRequestEnd);
+  assert.ok(warningOpenStart >= 0);
   assert.match(
-    clickfixRequest,
-    /withSettings\(async \(state\) => \{[\s\S]*?detectClickfixCommand[\s\S]*?if \(decision\.action === "allow"\) \{[\s\S]*?await writeClickfixClipboardText\(message\.text\)/,
-    "classification and allowed writes must remain serialized with settings mutations"
+    serviceWorker,
+    /const clickfixWarningTabDependencies = \{\s*tabs: chrome\.tabs,\s*warnings: clickfixWarnings,\s*interstitialUrl: clickfixInterstitialUrl,\s*stagingUrl: CLICKFIX_WARNING_STAGING_URL,/
+  );
+  assert.match(
+    serviceWorker.slice(warningOpenStart),
+    /openClickfixWarningTab\(\{[\s\S]*?sourceDocumentId: sender\.documentId,[\s\S]*?\}, clickfixWarningTabDependencies\)/
+  );
+  assert.match(
+    serviceWorker,
+    /CLICKFIX_INTERSTITIAL_PAGE = "interstitial\/clickfix\.html"/,
+    "the clipboard warning has its own entry point, never the phishing markup"
+  );
+  // No path can create, bind, or navigate an unbound warning any more.
+  assert.doesNotMatch(serviceWorker, /clickfixWarnings\.createWarning\b/);
+  assert.doesNotMatch(serviceWorker, /bindWarningTab/);
+  assert.doesNotMatch(serviceWorker, /warningTabId: null/);
+  assert.doesNotMatch(warningTabs, /warningTabId: null/);
+  assert.doesNotMatch(warningTabs, /active: true[\s\S]{0,200}createBoundWarning/);
+
+  // Navigation cleanup is one atomic store transaction, never a getWarning()
+  // check followed by a separate discardWarningTab().
+  const reconcileStart = serviceWorker.indexOf("function reconcileClickfixWarningTabNavigation");
+  assert.ok(reconcileStart >= 0);
+  assert.match(
+    serviceWorker.slice(reconcileStart, serviceWorker.indexOf("\n}", reconcileStart)),
+    /const requestId = clickfixRequestIdFromInterstitial\(url\);[\s\S]*?clickfixWarnings\.reconcileWarningTabNavigation\(\{[\s\S]*?warningTabId: tabId,[\s\S]*?requestId,[\s\S]*?url,[\s\S]*?phase,/
+  );
+  assert.match(
+    serviceWorker.slice(reconcileStart, serviceWorker.indexOf("\n}", reconcileStart)),
+    /phase === "committed"[\s\S]*?clickfixWarningNavigationMonitor\.commit\(tabId, requestId\)/
+  );
+  assert.match(warningTabs, /beginWarningTabNavigation[\s\S]*?await tabs\.update/);
+  assert.doesNotMatch(serviceWorker, /clickfixWarnings\.discardWarningTab\(/);
+
+  // Same-document history and fragment updates keep the source document alive,
+  // so they pass its id and retain the request bound to it.
+  const sameDocumentStart = serviceWorker.indexOf("onHistoryStateUpdated,");
+  const sameDocumentDiscard = serviceWorker.indexOf(
+    "clickfixWarnings.discardSourceDocument(details.tabId, details.frameId, documentId)",
+    sameDocumentStart
+  );
+  assert.ok(sameDocumentStart >= 0 && sameDocumentDiscard > sameDocumentStart);
+  assert.doesNotMatch(
+    serviceWorker,
+    /discardSourceDocument\(details\.tabId, details\.frameId\)/,
+    "a same-document change must never invalidate warnings for the whole frame"
   );
   assert.doesNotMatch(serviceWorker, /getSettingsRenderState/);
   assert.doesNotMatch(serviceWorker, /case "get_settings_state"/);

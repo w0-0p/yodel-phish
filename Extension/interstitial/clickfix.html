@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Clipboard warning — Yodel Phish</title>
+  <link rel="stylesheet" href="interstitial.css" />
+</head>
+<!--
+  Issue #29 — the clipboard warning has its own entry point rather than a
+  query-string kind on the shared page, so it cannot paint another warning
+  kind's copy. Every word this document can put on screen is written below or
+  by the clipboard branch of interstitial.js.
+
+  It is navigated only after its verdict is already persisted and bound to this
+  exact tab, so it has no loading state. The card carries no copy at all and
+  yp-kind-clickfix-pending keeps it invisible; interstitial.js performs one
+  lookup, fills the card in, and only then reveals it. A lookup that fails
+  closes the tab without ever showing a card.
+
+  interstitial.js is shared with interstitial.html and looks up the ids below;
+  the ones this kind never uses are absent and resolve to null.
+-->
+<body class="yp-kind-clickfix-pending">
+
+  <main class="yp-card" role="alert" aria-live="assertive" aria-atomic="false">
+    <p class="yp-brand" id="yp-brand">Yodel Phish</p>
+    <span class="yp-icon" id="yp-icon"></span>
+    <h1 id="yp-title" tabindex="-1"></h1>
+    <p class="yp-message" id="yp-message"></p>
+    <p class="yp-hint" id="yp-hint"></p>
+    <p class="yp-command-reason" id="yp-command-reason" hidden></p>
+    <p class="yp-command-label" id="yp-command-label" hidden>Clipboard text (control characters shown as ⟦…⟧)</p>
+    <pre class="yp-command-preview" id="yp-command-preview" dir="ltr" aria-labelledby="yp-command-label" hidden></pre>
+
+    <div class="yp-actions">
+      <button id="yp-btn-close" class="yp-btn yp-btn-close">Cancel</button>
+      <!-- Warn mode only; it sets its own label. Strict mode is a hard block. -->
+      <button id="yp-btn-proceed" class="yp-btn yp-btn-proceed" hidden></button>
+    </div>
+  </main>
+
+  <script src="interstitial.js"></script>
+</body>
+</html>

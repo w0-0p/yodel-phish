@@ -1,16 +1,23 @@
 // =============================================================================
 // CLICKFIX WARNING SESSIONS
 //
-// A warning is opened in an extension-owned tab, while the clipboard request
-// originates in a web-page frame. MV3 may suspend the service worker between
+// State before navigation (issue #29). A warning record is created already
+// bound to the extension-owned tab that will display it, exactly as the
+// phishing and device-code flows persist their verdict before navigating a
+// known tab. There is no unbound record and no post-navigation binding step,
+// so a concurrent navigation cleanup can never delete a record in the window
+// between "this tab has no warning yet" and "this tab is the warning tab".
+//
+// The clipboard request originates in a web-page frame while the warning is
+// shown in a separate tab, and MV3 may suspend the service worker between
 // those two steps, so the minimum state needed to finish the decision lives in
 // chrome.storage.session rather than an in-memory Map.
 //
-// Every operation is serialized through one FIFO queue. This makes binding,
-// consuming, expiry pruning, and tab cleanup atomic read-modify-write actions
-// even when browser events arrive concurrently. Records are copied on ingress
-// and returned as deeply frozen snapshots; callers never receive a reference
-// to the mutable storage state.
+// Every operation is serialized through one FIFO queue. This makes creation,
+// consumption, expiry pruning, navigation reconciliation, and tab cleanup
+// atomic read-modify-write actions even when browser events arrive
+// concurrently. Records are copied on ingress and returned as deeply frozen
+// snapshots; callers never receive a reference to the mutable storage state.
 //
 // Active records are capped globally and per source tab. Successful opens are
 // also recorded in a short, persisted per-source sliding window, so restarting
@@ -27,7 +34,18 @@ export const CLICKFIX_WARNING_MAX_ACTIVE_PER_SOURCE_TAB = 3;
 export const CLICKFIX_WARNING_OPEN_RATE_LIMIT = 3;
 export const CLICKFIX_WARNING_OPEN_RATE_WINDOW_MS = 10 * 1000;
 
+// The address the warning tab is created at, before the record that authorizes
+// its interstitial exists. Exported so the service worker opens the staging tab
+// at exactly the address this store recognizes as expected staging navigation.
+export const CLICKFIX_WARNING_STAGING_URL = "about:blank";
+
+// "staging": created and bound to a verified about:blank document.
+// "navigating": the source was revalidated and navigation was authorized.
+// "active": the exact matching interstitial navigation committed.
+export const CLICKFIX_WARNING_STATUSES = ["staging", "navigating", "active"];
+
 const CLICKFIX_MODES = new Set(["strict", "warn"]);
+const CLICKFIX_STATUSES = new Set(CLICKFIX_WARNING_STATUSES);
 const MAX_ID_LENGTH = 128;
 
 /**
@@ -35,10 +53,13 @@ const MAX_ID_LENGTH = 128;
  * compatible object (`get(keys)` and `set(values)`).
  *
  * Returned API:
- *   createWarning(input)
- *   bindWarningTab(requestId, warningTabId)
+ *   canCreateWarning(sourceTabId)
+ *   createBoundWarning(input)
+ *   beginWarningTabNavigation(requestId, warningTabId)
  *   getWarning(requestId, warningTabId)
  *   consumeWarning(requestId, warningTabId)
+ *   reconcileWarningTabNavigation({ warningTabId, requestId, url })
+ *   abandonWarningTab(warningTabId)
  *   discardWarning(requestId)
  *   discardTab(tabId)
  *   discardSourceDocument(sourceTabId, sourceFrameId, currentDocumentId?)
@@ -50,6 +71,7 @@ export function createClickfixWarningStore(storageArea, {
   ttlMs = CLICKFIX_WARNING_TTL_MS,
   now = () => Date.now(),
   cryptoApi = globalThis.crypto,
+  stagingUrl = CLICKFIX_WARNING_STAGING_URL,
   queue,
 } = {}) {
   requireStorageArea(storageArea);
@@ -60,6 +82,7 @@ export function createClickfixWarningStore(storageArea, {
   if (cryptoApi === null || typeof cryptoApi !== "object" || typeof cryptoApi.randomUUID !== "function") {
     throw new TypeError("cryptoApi.randomUUID is required");
   }
+  requireNonEmptyString(stagingUrl, "stagingUrl");
 
   const withState = createStorageDomain({
     storageArea,
@@ -76,36 +99,50 @@ export function createClickfixWarningStore(storageArea, {
 
   return {
     /**
-     * Creates an unbound warning record and returns its immutable snapshot, or
-     * null when an active-session cap or the durable open-rate limit is hit.
+     * Read-only capacity probe. The authoritative decision is still made
+     * atomically inside createBoundWarning; this only lets the caller avoid
+     * opening a staging tab it would immediately have to close again.
      */
-    async createWarning(input) {
+    async canCreateWarning(sourceTabId) {
+      requireTabId(sourceTabId, "sourceTabId");
+      return withState((state) => ({
+        value: admissionRefusal(state, sourceTabId) === null,
+        changed: false,
+      }));
+    },
+
+    /**
+     * Creates a warning already bound to the tab that will display it, and
+     * returns its immutable snapshot — or null when an active-session cap or
+     * the durable open-rate limit is hit. There is no unbound creation path:
+     * every navigable record carries its warning tab from the moment it exists.
+     */
+    async createBoundWarning(input) {
       const fields = normalizeNewWarning(input);
       return withState((state) => {
-        if (Object.keys(state.warnings_by_id).length >= CLICKFIX_WARNING_MAX_ACTIVE) {
-          return { value: null, changed: false };
+        // A browser reuses tab ids. The warning tab is brand new, so any record
+        // still claiming it belongs to a closed tab and is evicted here rather
+        // than left to shadow the record being created.
+        let changed = false;
+        for (const [requestId, record] of Object.entries(state.warnings_by_id)) {
+          if (record.warningTabId === fields.warningTabId) {
+            delete state.warnings_by_id[requestId];
+            changed = true;
+          }
         }
 
-        let activeForSourceTab = 0;
-        for (const record of Object.values(state.warnings_by_id)) {
-          if (record.sourceTabId === fields.sourceTabId) activeForSourceTab += 1;
-        }
-        if (activeForSourceTab >= CLICKFIX_WARNING_MAX_ACTIVE_PER_SOURCE_TAB) {
-          return { value: null, changed: false };
-        }
-
-        const sourceKey = String(fields.sourceTabId);
-        const recentOpens = state.warning_open_timestamps_by_source_tab[sourceKey] ?? [];
-        if (recentOpens.length >= CLICKFIX_WARNING_OPEN_RATE_LIMIT) {
-          return { value: null, changed: false };
+        if (admissionRefusal(state, fields.sourceTabId) !== null) {
+          return { value: null, changed };
         }
 
         const requestId = uniqueRequestId(state.warnings_by_id, cryptoApi);
         const createdAt = state.current_time;
+        const sourceKey = String(fields.sourceTabId);
+        const recentOpens = state.warning_open_timestamps_by_source_tab[sourceKey] ?? [];
         const stored = {
           requestId,
           ...fields,
-          warningTabId: null,
+          status: "staging",
           createdAt,
           expiresAt: createdAt + ttlMs,
         };
@@ -116,28 +153,25 @@ export function createClickfixWarningStore(storageArea, {
     },
 
     /**
-     * Binds the extension warning tab exactly once. Repeating the same binding
-     * is idempotent; attempting to move a session to another tab is rejected.
+     * Atomically authorizes the staged tab to leave its verified staging
+     * document. Returning null means cleanup won the race, so the caller must
+     * not navigate the tab. This closes the async source-liveness window.
      */
-    async bindWarningTab(requestId, warningTabId) {
+    async beginWarningTabNavigation(requestId, warningTabId) {
       requireRequestId(requestId);
       requireTabId(warningTabId, "warningTabId");
       return withState((state) => {
-        const record = state.warnings_by_id[requestId] ?? null;
-        if (record === null) return { value: null, changed: false };
-        if (record.warningTabId !== null && record.warningTabId !== warningTabId) {
+        const record = matchingWarning(state, requestId, warningTabId);
+        if (record === null || record.status !== "staging") {
           return { value: null, changed: false };
         }
-        if (record.warningTabId === warningTabId) {
-          return { value: immutableRecord(record), changed: false };
-        }
-        const bound = { ...record, warningTabId };
-        state.warnings_by_id[requestId] = bound;
-        return { value: immutableRecord(bound), changed: true };
+        const navigating = { ...record, status: "navigating" };
+        state.warnings_by_id[requestId] = navigating;
+        return { value: immutableRecord(navigating), changed: true };
       });
     },
 
-    /** Returns a warning only to the exact warning tab to which it was bound. */
+    /** Returns a warning only to the exact warning tab to which it is bound. */
     async getWarning(requestId, warningTabId) {
       requireRequestId(requestId);
       requireTabId(warningTabId, "warningTabId");
@@ -165,7 +199,90 @@ export function createClickfixWarningStore(storageArea, {
       });
     },
 
-    /** Removes a warning regardless of whether its UI tab was bound yet. */
+    /**
+     * Reconciles either an advisory tabs.onUpdated URL or an authoritative
+     * webNavigation.onCommitted document. Only a committed, matching
+     * interstitial can activate a warning.
+     *
+     * Outcomes:
+     *   "none"       no record is bound to this tab; nothing to do
+     *   "staging"    the verified pre-navigation document; the record is kept
+     *   "navigating" the authorized target URL was observed before commit
+     *   "activated"  the exact matching interstitial committed
+     *   "discarded"  an unauthorized or competing navigation removed the record
+     */
+    async reconcileWarningTabNavigation(navigation) {
+      const { warningTabId, requestId, url, phase, documentId } =
+        normalizeNavigation(navigation);
+      return withState((state) => {
+        const entry = warningEntryForTab(state, warningTabId);
+        if (entry === null) return { value: { outcome: "none", warning: null }, changed: false };
+        const [boundRequestId, record] = entry;
+
+        if (requestId !== null) {
+          if (requestId !== boundRequestId) {
+            delete state.warnings_by_id[boundRequestId];
+            return { value: { outcome: "discarded", warning: immutableRecord(record) }, changed: true };
+          }
+          if (phase === "updated") {
+            if (record.status === "navigating") {
+              return { value: { outcome: "navigating", warning: immutableRecord(record) }, changed: false };
+            }
+            if (record.status === "active") {
+              return { value: { outcome: "activated", warning: immutableRecord(record) }, changed: false };
+            }
+            delete state.warnings_by_id[boundRequestId];
+            return { value: { outcome: "discarded", warning: immutableRecord(record) }, changed: true };
+          }
+          if (record.status === "active") {
+            return { value: { outcome: "activated", warning: immutableRecord(record) }, changed: false };
+          }
+          if (record.status !== "navigating") {
+            delete state.warnings_by_id[boundRequestId];
+            return { value: { outcome: "discarded", warning: immutableRecord(record) }, changed: true };
+          }
+          const active = { ...record, status: "active" };
+          state.warnings_by_id[boundRequestId] = active;
+          return { value: { outcome: "activated", warning: immutableRecord(active) }, changed: true };
+        }
+
+        // tabs.onUpdated has no document identity, so a late notification of
+        // the original staging address is only advisory. A committed staging
+        // address is safe solely when it is the exact document we bound before
+        // persistence while setup is still in flight. Any committed return after
+        // activation is a navigation away, even if history restores that original
+        // document identity, and cannot retain the authorization.
+        if (isStagingNavigation(url, stagingUrl)) {
+          if (phase === "committed" &&
+              (record.status === "active" || documentId !== record.stagingDocumentId)) {
+            delete state.warnings_by_id[boundRequestId];
+            return { value: { outcome: "discarded", warning: immutableRecord(record) }, changed: true };
+          }
+          return { value: { outcome: "staging", warning: immutableRecord(record) }, changed: false };
+        }
+
+        delete state.warnings_by_id[boundRequestId];
+        return { value: { outcome: "discarded", warning: immutableRecord(record) }, changed: true };
+      });
+    },
+
+    /**
+     * Atomically removes and returns whatever record is bound to a warning tab,
+     * so a caller that has to tear the tab down can also return focus to the
+     * exact source tab the warning came from.
+     */
+    async abandonWarningTab(warningTabId) {
+      requireTabId(warningTabId, "warningTabId");
+      return withState((state) => {
+        const entry = warningEntryForTab(state, warningTabId);
+        if (entry === null) return { value: null, changed: false };
+        const [requestId, record] = entry;
+        delete state.warnings_by_id[requestId];
+        return { value: immutableRecord(record), changed: true };
+      });
+    },
+
+    /** Removes one warning by id, whatever state its tab is in. */
     async discardWarning(requestId) {
       requireRequestId(requestId);
       return withState((state) => {
@@ -193,9 +310,15 @@ export function createClickfixWarningStore(storageArea, {
     },
 
     /**
-     * Removes stale warnings for one source frame after navigation. When a
-     * current document id is supplied its records are retained; omitting it
-     * removes every warning originating in the frame.
+     * Removes stale warnings for one source frame after a *document
+     * replacement*. When a current document id is supplied its records are
+     * retained; omitting it removes every warning originating in the frame.
+     *
+     * Same-document navigation (History API, fragment changes) keeps the exact
+     * document alive and must therefore pass that document's id, which retains
+     * the immutable clipboard request bound to it (issue #29). SPAs such as
+     * GitHub run late pushState()/replaceState() calls that would otherwise
+     * invalidate a request the user is still deciding on.
      */
     async discardSourceDocument(sourceTabId, sourceFrameId, currentDocumentId) {
       requireTabId(sourceTabId, "sourceTabId");
@@ -255,19 +378,74 @@ export function createClickfixWarningStore(storageArea, {
   };
 }
 
+// null when a new warning may be created for this source tab, otherwise the
+// reason it may not. Shared by the probe and the authoritative create so the
+// two can never drift apart.
+function admissionRefusal(state, sourceTabId) {
+  if (Object.keys(state.warnings_by_id).length >= CLICKFIX_WARNING_MAX_ACTIVE) {
+    return "global_cap";
+  }
+  let activeForSourceTab = 0;
+  for (const record of Object.values(state.warnings_by_id)) {
+    if (record.sourceTabId === sourceTabId) activeForSourceTab += 1;
+  }
+  if (activeForSourceTab >= CLICKFIX_WARNING_MAX_ACTIVE_PER_SOURCE_TAB) {
+    return "source_tab_cap";
+  }
+  const recentOpens = state.warning_open_timestamps_by_source_tab[String(sourceTabId)] ?? [];
+  return recentOpens.length >= CLICKFIX_WARNING_OPEN_RATE_LIMIT ? "rate_limit" : null;
+}
+
+function isStagingNavigation(url, stagingUrl) {
+  // An event that carries no address at all says nothing about where the tab
+  // went, so it never destroys a record.
+  return typeof url !== "string" || url === "" || url === stagingUrl;
+}
+
+function warningEntryForTab(state, warningTabId) {
+  for (const entry of Object.entries(state.warnings_by_id)) {
+    if (entry[1].warningTabId === warningTabId) return entry;
+  }
+  return null;
+}
+
+function normalizeNavigation(navigation) {
+  if (!isPlainObject(navigation)) throw new TypeError("navigation must be an object");
+  requireTabId(navigation.warningTabId, "warningTabId");
+  const requestId = navigation.requestId ?? null;
+  if (requestId !== null) requireRequestId(requestId);
+  if (navigation.url !== undefined && navigation.url !== null && typeof navigation.url !== "string") {
+    throw new TypeError("url must be a string when present");
+  }
+  const phase = navigation.phase ?? "updated";
+  if (phase !== "updated" && phase !== "committed") {
+    throw new TypeError("phase must be updated or committed");
+  }
+  const documentId = navigation.documentId ?? null;
+  if (documentId !== null) requireNonEmptyString(documentId, "documentId");
+  return { warningTabId: navigation.warningTabId, requestId, url: navigation.url, phase, documentId };
+}
+
 function normalizeNewWarning(input) {
   if (!isPlainObject(input)) throw new TypeError("warning input must be an object");
+  requireTabId(input.warningTabId, "warningTabId");
   requireTabId(input.sourceTabId, "sourceTabId");
+  if (input.warningTabId === input.sourceTabId) {
+    throw new TypeError("warningTabId must not be the source tab");
+  }
   requireFrameId(input.sourceFrameId);
   requireNonEmptyString(input.sourceDocumentId, "sourceDocumentId");
+  requireNonEmptyString(input.stagingDocumentId, "stagingDocumentId");
   requireNonEmptyString(input.sourceUrl, "sourceUrl");
   if (!CLICKFIX_MODES.has(input.mode)) throw new TypeError("mode must be strict or warn");
   if (typeof input.text !== "string") throw new TypeError("text must be a string");
 
   return {
+    warningTabId: input.warningTabId,
     sourceTabId: input.sourceTabId,
     sourceFrameId: input.sourceFrameId,
     sourceDocumentId: input.sourceDocumentId,
+    stagingDocumentId: input.stagingDocumentId,
     sourceUrl: input.sourceUrl,
     mode: input.mode,
     decision: clonePlainValue(input.decision),
@@ -289,10 +467,19 @@ function normalizeState(value, currentTime, ttlMs) {
     !isPlainObject(value.warning_open_timestamps_by_source_tab);
   let pruned = 0;
   const retainedPerSourceTab = new Map();
+  const claimedWarningTabs = new Set();
 
   for (const [requestId, candidate] of Object.entries(source)) {
     const record = normalizeStoredRecord(requestId, candidate, ttlMs);
     if (record === null || record.expiresAt <= currentTime) {
+      dirty = true;
+      pruned += 1;
+      continue;
+    }
+    // One warning tab displays exactly one warning. A second record claiming
+    // the same tab can only be corruption, and keeping it would make
+    // tab-scoped lookup ambiguous.
+    if (claimedWarningTabs.has(record.warningTabId)) {
       dirty = true;
       pruned += 1;
       continue;
@@ -305,6 +492,7 @@ function normalizeState(value, currentTime, ttlMs) {
       continue;
     }
     warningsById[requestId] = record;
+    claimedWarningTabs.add(record.warningTabId);
     retainedPerSourceTab.set(record.sourceTabId, retainedForTab + 1);
   }
 
@@ -352,7 +540,11 @@ function normalizeStoredRecord(requestId, value, ttlMs) {
   if (!validRequestId(requestId) || !isPlainObject(value) || value.requestId !== requestId) return null;
   if (!validTabId(value.sourceTabId) || !validFrameId(value.sourceFrameId)) return null;
   if (!validNonEmptyString(value.sourceDocumentId) || !validNonEmptyString(value.sourceUrl)) return null;
-  if (value.warningTabId !== null && !validTabId(value.warningTabId)) return null;
+  if (!validNonEmptyString(value.stagingDocumentId)) return null;
+  // Issue #29: a record with no warning tab is not a lifecycle this store can
+  // produce any more. Anything claiming one is stale or corrupt state.
+  if (!validTabId(value.warningTabId) || value.warningTabId === value.sourceTabId) return null;
+  if (!CLICKFIX_STATUSES.has(value.status)) return null;
   if (!CLICKFIX_MODES.has(value.mode) || typeof value.text !== "string") return null;
   if (!Number.isFinite(value.createdAt) || !Number.isFinite(value.expiresAt)) return null;
   if (value.expiresAt <= value.createdAt || value.expiresAt - value.createdAt > ttlMs) return null;
@@ -368,8 +560,10 @@ function normalizeStoredRecord(requestId, value, ttlMs) {
     sourceTabId: value.sourceTabId,
     sourceFrameId: value.sourceFrameId,
     sourceDocumentId: value.sourceDocumentId,
+    stagingDocumentId: value.stagingDocumentId,
     sourceUrl: value.sourceUrl,
     warningTabId: value.warningTabId,
+    status: value.status,
     mode: value.mode,
     decision,
     text: value.text,
@@ -419,8 +613,10 @@ function cloneRecord(record) {
     sourceTabId: record.sourceTabId,
     sourceFrameId: record.sourceFrameId,
     sourceDocumentId: record.sourceDocumentId,
+    stagingDocumentId: record.stagingDocumentId,
     sourceUrl: record.sourceUrl,
     warningTabId: record.warningTabId,
+    status: record.status,
     mode: record.mode,
     decision: clonePlainValue(record.decision),
     text: record.text,
