@@ -49,7 +49,18 @@
 //      username token, and only associates through the smallest shared ancestor
 //      that holds a compatible forward action and a coherent password step. A
 //      <main>/application landmark may bound the search but is never that
-//      ancestor: sharing only a broad <main> or <body> is never an association.
+//      ancestor: sharing only a broad <main> or <body> is never an association
+//      there.
+//   5. One narrowly fenced landmark bridge (issue #32) for the identifier-first
+//      flows rule 4 cannot see: the identity step and its still-hidden password
+//      step share a region below the landmark while the forward action sits in
+//      a sibling region, so nothing smaller than the landmark holds all three.
+//      It is not a "same <main>" rule — it additionally demands the
+//      standardized username token, no local profile/settings context, a usable
+//      password step inside the identity field's own region, an active
+//      forward-named action in that same closest landmark but outside that
+//      region, a visible English authentication heading owned by that landmark,
+//      and no other form, dialog or nested landmark owning supporting evidence.
 // Modal or application containers are never inferred from class names or ids.
 //
 // The candidate walk covers open Shadow roots as well as the light DOM (issue
@@ -99,8 +110,10 @@
     "open", "disabled", "src", "width", "height",
   ]);
 
-  // The auth cue is deliberately only these three terms; localized pages are
-  // supported through autocomplete="username", not through translated text.
+  // The auth cue is deliberately English-only. autocomplete="username" can
+  // remove the need for English cue text once an action is associated by native
+  // form semantics, but it does not make named form-less actions language-
+  // neutral. In particular, issue #32 covers the English Google flow only.
   const AUTH_CUE_RE = /\b(?:sign[\s-]?in|log[\s-]?in|login)\b/;
   // A separate, narrower cue for an email/identity-verification login stage
   // (issue #22): a form whose heading asks to verify or confirm an email,
@@ -385,13 +398,35 @@
     return /^h[1-6]$/.test(tagOf(el)) || tokensOf(el, "role").includes("heading");
   }
 
-  // Only a visible h1–h6 or role="heading" carrying the complete compound
-  // phrase is verification evidence; labels, buttons and paragraphs do not
-  // state the form purpose for this narrow pattern.
-  function isVisibleVerificationHeading(el, ctx) {
+  // A rendered h1–h6 / role="heading" whose own text carries `cueRe`. Headings
+  // are the only elements that state what a region is for; labels, links,
+  // buttons and paragraphs do not, so the two narrow patterns below read their
+  // cue exclusively from one.
+  function isVisibleHeadingMatching(el, ctx, cueRe) {
     return isHeadingElement(el) &&
       isRendered(el, ctx) &&
-      IDENTITY_VERIFICATION_CUE_RE.test(normalize(cueText(el, ctx)));
+      cueRe.test(normalize(cueText(el, ctx)));
+  }
+
+  // Only a heading carrying the complete compound phrase is verification
+  // evidence (issue #22).
+  function isVisibleVerificationHeading(el, ctx) {
+    return isVisibleHeadingMatching(el, ctx, IDENTITY_VERIFICATION_CUE_RE);
+  }
+
+  // The strict authentication cue, stated by a heading inside `container`. Used
+  // only by the landmark bridge (issue #32): a "Sign in" label or header button
+  // can belong to a shell that merely surrounds unrelated content, while a
+  // heading names the purpose of the region it introduces.
+  function containerHasAuthenticationHeading(container, cueCandidates, ctx) {
+    return cueCandidates.some(
+      (el) =>
+        isWithin(el, container) &&
+        closestApplicationLandmark(el) === container &&
+        dialogAncestor(el) === null &&
+        nativeFormAncestor(el) === null &&
+        isVisibleHeadingMatching(el, ctx, AUTH_CUE_RE)
+    );
   }
 
   // A heading nested anywhere inside the form belongs to that form.
@@ -475,6 +510,16 @@
     return isFormAssociated(el) ? (el.form ?? null) : null;
   }
 
+  // Headings are not form-associated, so they have no native `.form` answer.
+  // This bounded ancestry check prevents a heading inside an unrelated form
+  // from naming the purpose of a surrounding landmark.
+  function nativeFormAncestor(el) {
+    for (let cur = el.parentElement; cur !== null && cur !== undefined; cur = cur.parentElement) {
+      if (tagOf(cur) === "form") return cur;
+    }
+    return null;
+  }
+
   function isDialogContainer(el) {
     if (tagOf(el) === "dialog") return true;
     if (getAttr(el, "aria-modal") === "true") return true;
@@ -530,6 +575,13 @@
     return roles.includes("main") || roles.includes("application");
   }
 
+  function closestApplicationLandmark(el) {
+    for (let cur = el.parentElement; cur !== null && cur !== undefined; cur = cur.parentElement) {
+      if (isApplicationLandmark(cur)) return cur;
+    }
+    return null;
+  }
+
   // A password input is a coherent later step of a form-less multi-step flow
   // when it is standardized as the current-password field, or when
   // password-stage evidence sits in its own locality — an auth cue or
@@ -561,10 +613,11 @@
     return false;
   }
 
-  // The deep fallback must not reinterpret a profile/settings control as an
-  // identifier step merely because distant account controls share a wrapper.
-  // This veto is intentionally local and deep-only: normal form/dialog/shallow
-  // login association has already had priority before the fallback is reached.
+  // Neither non-local pattern may reinterpret a profile/settings control as an
+  // identifier step merely because distant account controls share a wrapper or
+  // a landmark. This veto is intentionally local, and applies only to those two
+  // patterns: normal form/dialog/shallow login association has already had
+  // priority before either is reached.
   function hasLocalNonCredentialAccountContext(field, cueCandidates, ctx) {
     if (NON_CREDENTIAL_ACCOUNT_CONTEXT_RE.test(fieldMetadata(field, ctx))) return true;
     let local = field.parentElement;
@@ -610,9 +663,9 @@
   // token, and it still demands a compatible forward action and a coherent
   // password step, so a lone distant username field followed by a stray button
   // never qualifies. The smallest such shared ancestor is the flow container; a
-  // bounding landmark, <body> or <html> is never it.
+  // bounding landmark, <body> or <html> is never it. The caller has already
+  // rejected fields without that token and fields in profile/settings context.
   function deepCredentialFlowMatches(field, forwardActions, inputs, actionCandidates, cueCandidates, ctx) {
-    if (hasLocalNonCredentialAccountContext(field, cueCandidates, ctx)) return false;
     for (
       let container = field.parentElement;
       container !== null &&
@@ -646,10 +699,73 @@
     return false;
   }
 
+  // The smallest element holding both `el` and `other` strictly below
+  // `boundary`, or null when nothing under `boundary` holds both. Light-DOM
+  // ancestry only, like every other association walk: a region is shared within
+  // one node tree or not at all.
+  function sharedRegionBelow(el, other, boundary) {
+    for (
+      let region = el.parentElement;
+      region !== null && region !== undefined && region !== boundary;
+      region = region.parentElement
+    ) {
+      if (isWithin(other, region)) return region;
+    }
+    return null;
+  }
+
+  // Landmark bridge for English form-less, identifier-first credential
+  // flows (issue #32). Their identity step keeps the not-yet-shown password
+  // step in its own region while the forward action lives in a sibling region, so the only
+  // element enclosing all three is the landmark — which the deep fallback above
+  // deliberately refuses to treat as an association. This is the one bounded
+  // exception, and it is not a "controls sharing <main> associate" rule: the
+  // field must be the standardized username step, its password step must sit
+  // inside the field's own region (an unrelated branch never bridges), the
+  // action must be outside that region yet inside the same closest landmark,
+  // every supporting element must share that closest landmark, none may be
+  // fenced off by another form or dialog, and a rendered heading must state
+  // that the landmark is the authentication step. A newsletter field with a
+  // honeypot password, a profile control, or a stray forward action in a
+  // page shell satisfies none of those.
+  //
+  // Like the deep fallback, it is reached only by an active, form-less,
+  // dialog-less field, and only after the profile/settings veto. Every password
+  // input still reachable here is hidden by construction: an active one has
+  // already returned the password confidence, and the disabled, inert and
+  // read-only ones are rejected below.
+  function landmarkBridgeMatches(field, forwardActions, inputs, cueCandidates, ctx) {
+    const landmark = closestApplicationLandmark(field);
+    if (landmark === null) return false;
+    // A landmark role on <body> describes the document, not a region inside it:
+    // honouring it here would bridge the whole page.
+    if (landmark === ctx.doc.body || landmark === ctx.doc.documentElement) return false;
+    if (!containerHasAuthenticationHeading(landmark, cueCandidates, ctx)) return false;
+
+    const bridgeActions = forwardActions.filter(
+      (el) =>
+        formOwner(el) === null &&
+        dialogAncestor(el) === null &&
+        closestApplicationLandmark(el) === landmark
+    );
+    if (bridgeActions.length === 0) return false;
+
+    return inputs.some((pw) => {
+      if (!isPotentialPasswordStep(pw)) return false;
+      if (formOwner(pw) !== null || dialogAncestor(pw) !== null) return false;
+      if (closestApplicationLandmark(pw) !== landmark) return false;
+      const region = sharedRegionBelow(field, pw, landmark);
+      if (region === null) return false;
+      return bridgeActions.some((action) => !isWithin(action, region));
+    });
+  }
+
   function identityPatternMatches(field, forwardActions, actionCandidates, cueCandidates, inputs, ctx) {
     // autocomplete="username" is strong standardized evidence and replaces the
-    // textual cue, so localized pages need no English text. An associated
-    // forward action is still required in every branch.
+    // separate textual cue after an action has been associated. Native submit
+    // semantics therefore support localized form-owned flows; named form-less
+    // actions, including the issue #32 bridge, remain English-only. An
+    // associated forward action is still required in every branch.
     const usernameAutocomplete = tokensOf(field, "autocomplete").includes("username");
 
     const owner = formOwner(field);
@@ -703,13 +819,16 @@
       container = container.parentElement;
     }
 
-    // Deeply nested, form-less, multi-step credential pages (issue #5) reach
-    // past that shallow limit, but only with the standardized username token to
-    // enter and a coherent hidden password step to anchor the association.
-    if (usernameAutocomplete) {
-      return deepCredentialFlowMatches(field, forwardActions, inputs, actionCandidates, cueCandidates, ctx);
-    }
-    return false;
+    // Deeply nested, form-less, multi-step credential pages (issues #5 and #32)
+    // reach past that shallow limit. Both need the standardized username token
+    // to enter, both refuse a field in profile/settings context, and both still
+    // demand their own password step and forward action: the first associates
+    // through the smallest wrapper holding every step, the second bridges a
+    // landmark for the flows that have no such wrapper.
+    if (!usernameAutocomplete) return false;
+    if (hasLocalNonCredentialAccountContext(field, cueCandidates, ctx)) return false;
+    return deepCredentialFlowMatches(field, forwardActions, inputs, actionCandidates, cueCandidates, ctx) ||
+      landmarkBridgeMatches(field, forwardActions, inputs, cueCandidates, ctx);
   }
 
   // ---------------------------------------------------------------------------

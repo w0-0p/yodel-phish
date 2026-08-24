@@ -172,7 +172,10 @@ function wireRoot(root) {
 }
 
 function page(...children) {
-  const body = el("body", {}, ...children);
+  return pageOf(el("body", {}, ...children));
+}
+
+function pageOf(body) {
   const html = el("html", {}, body);
   const documentRoot = { children: [html] };
   wireRoot(documentRoot);
@@ -192,6 +195,14 @@ function page(...children) {
 
 function detect(...children) {
   const { document, window } = page(...children);
+  return detectLoginPage(document, window);
+}
+
+// Detection on a document whose <body> itself carries `props` — the one
+// container a fixture cannot otherwise express, since every other element is
+// written as a child.
+function detectInBody(props, ...children) {
+  const { document, window } = pageOf(el("body", props, ...children));
   return detectLoginPage(document, window);
 }
 
@@ -397,7 +408,7 @@ test("off-canvas honeypot placement is excluded but below-the-fold stays detecta
 // Pattern 2 — identity field + associated forward action + cue.
 // -----------------------------------------------------------------------------
 
-test("autocomplete=username with a fully localized UI is a login page", () => {
+test("a form-owned autocomplete=username field supports a fully localized UI", () => {
   const result = detect(
     el("form", {},
       el("h1", { text: "Connexion à votre espace" }),
@@ -406,7 +417,7 @@ test("autocomplete=username with a fully localized UI is a login page", () => {
     )
   );
 
-  assert.equal(result.isLogin, true, "autocomplete=username must not require any English text");
+  assert.equal(result.isLogin, true, "a native submit associates without English action text");
   assert.equal(result.confidence, IDENTITY_CONFIDENCE);
 });
 
@@ -896,19 +907,22 @@ test("a form-less multi-step credential page allows separate email-step wrappers
 });
 
 // -----------------------------------------------------------------------------
-// Issue #5 — deeply nested, form-less, identifier-first multi-step flows.
+// Issue #5 — deeply nested, form-less, identifier-first multi-step flows that
+// still share one wrapper.
 //
 // The identity step is shown while the forward action and the still-hidden
 // password step sit in separate, deeply nested wrapper trees whose nearest
-// shared ancestor is far beyond LOCAL_ASSOCIATION_MAX_DEPTH. Google's first
-// sign-in step is one such page. The fixtures use no host, id, class-name or
-// exact-depth checks and no <form>/dialog container.
+// shared ancestor is far beyond LOCAL_ASSOCIATION_MAX_DEPTH — but is still a
+// real element below any landmark. Flows whose steps share nothing smaller than
+// <main> are a different shape and are covered by the issue #32 section below.
+// The fixtures use no host, id, class-name or exact-depth checks and no
+// <form>/dialog container.
 // -----------------------------------------------------------------------------
 
-test("a deeply nested form-less identifier-first credential page is detected", () => {
-  // The three steps are ~7 ancestors above the identity field, well past the
-  // shallow four-level reach. The password step is present but hidden, exactly
-  // as a first sign-in step keeps its later password view in the DOM.
+test("a deeply nested credential flow sharing one wrapper is detected", () => {
+  // The shared flow wrapper is ~7 ancestors above the identity field, well past
+  // the shallow four-level reach. The password step is present but hidden, and
+  // standardized as the current-password field.
   const flow = el("div", {},
     nest(6,
       el("label", { for: "identifier", text: "Email or phone" }),
@@ -1150,6 +1164,259 @@ test("a newsletter form with a hidden password honeypot is not a login page", ()
   );
 
   assert.equal(result.isLogin, false);
+});
+
+// -----------------------------------------------------------------------------
+// Issue #32 — the English landmark bridge for identifier-first credential flows.
+//
+// The current English Google identifier-first step has neither a <form> nor a
+// dialog. Other languages are outside the scope of this issue because both the heading
+// and named form-less action cues used by the bridge are English-only.
+// Its identity region holds the visible identifier together with the password
+// view it will reveal — hidden, with no current-password token and no
+// authentication cue of its own — while the forward action sits in a sibling
+// region. Nothing smaller than <main> encloses all three, and the issue #5
+// fallback above deliberately never associates through a landmark, so this
+// shape needs the separate bridge and every one of its conditions is load
+// bearing. The fixtures use no host, id, class-name or exact-depth checks.
+// -----------------------------------------------------------------------------
+
+// The password view the identifier step will reveal: still hidden, and — unlike
+// the issue #5 fixtures — carrying nothing that would make it coherent on its
+// own.
+function futurePasswordStep() {
+  return el("div", { style: { display: "none" } },
+    el("input", { type: "password", name: "Passwd", rect: { width: 0, height: 0 } })
+  );
+}
+
+function identifierInput() {
+  return el("input", {
+    id: "identifier",
+    type: "text",
+    name: "identifier",
+    autocomplete: "username webauthn",
+  });
+}
+
+test("the current identifier-first sign-in step is detected through the landmark bridge", () => {
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sign in" }),
+      nest(3,
+        nest(3,
+          el("label", { for: "identifier", text: "Email or phone" }),
+          identifierInput()
+        ),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("button", { type: "button", text: "Next" }))
+    )
+  );
+
+  assert.equal(result.isLogin, true, "the identifier step must match across the landmark");
+  assert.equal(result.confidence, IDENTITY_CONFIDENCE);
+});
+
+test("the same identifier-first structure without an authentication heading does not match", () => {
+  // Only the heading is removed. Without it, nothing states that this landmark
+  // is the authentication step, and sharing <main> alone must never associate.
+  const result = detect(
+    el("main", {},
+      nest(3,
+        nest(3, identifierInput()),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("button", { type: "button", text: "Next" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a landmark alone is not authentication evidence");
+});
+
+test("a password step in an unrelated branch of the landmark does not bridge", () => {
+  // Identity field, password input and action are three separate branches of
+  // one <main>: the password step is not part of the identity region, so there
+  // is no credential flow to bridge — the heading cannot supply one.
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sign in" }),
+      nest(3, identifierInput()),
+      nest(3, futurePasswordStep()),
+      nest(3, el("button", { type: "button", text: "Next" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "the password step must share the identity field's own region");
+});
+
+test("a profile/settings region is not bridged by a sign-in heading elsewhere in the landmark", () => {
+  // An account-settings screen: its "Sign in details" section heading matches
+  // the authentication cue, and the profile region even holds a hidden password
+  // input, but a profile control is never an identifier step.
+  const result = detect(
+    el("main", {},
+      el("h2", { text: "Sign in details" }),
+      el("div", {},
+        el("h3", { text: "Profile settings" }),
+        nest(2, el("input", { type: "text", name: "identifier", autocomplete: "username" })),
+        nest(2, futurePasswordStep())
+      ),
+      nest(3, el("button", { type: "button", text: "Continue" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "local profile context vetoes the bridge");
+});
+
+test("a newsletter field with a hidden honeypot password does not bridge a landmark", () => {
+  // A landing page with a sign-in section heading and, elsewhere, a newsletter
+  // widget whose honeypot password sits right beside the email field. Without
+  // the standardized username token the bridge is never entered.
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sign in to read more" }),
+      el("div", {},
+        el("input", { type: "email", autocomplete: "email", placeholder: "Email address" }),
+        el("input", {
+          type: "password",
+          name: "hp",
+          rect: { width: 0, height: 0 },
+          style: { display: "none" },
+        })
+      ),
+      nest(3, el("button", { type: "button", text: "Subscribe" })),
+      nest(3, el("button", { type: "button", text: "Next" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "an email field is not the standardized username step");
+});
+
+test("the landmark bridge refuses a heading inside a separate dialog", () => {
+  const result = detect(
+    el("main", {},
+      nest(3,
+        nest(3, identifierInput()),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("button", { type: "button", text: "Next" })),
+      el("div", { role: "dialog" }, el("h1", { text: "Sign in" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a separate dialog cannot name the landmark");
+});
+
+test("the landmark bridge refuses a heading inside a nested application landmark", () => {
+  const result = detect(
+    el("main", {},
+      nest(3,
+        nest(3, identifierInput()),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("button", { type: "button", text: "Next" })),
+      el("section", { role: "application" }, el("h1", { text: "Sign in" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a nested application cannot name its surrounding landmark");
+});
+
+test("the landmark bridge refuses a heading inside an unrelated native form", () => {
+  const result = detect(
+    el("main", {},
+      nest(3,
+        nest(3, identifierInput()),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("button", { type: "button", text: "Next" })),
+      el("form", {}, el("h1", { text: "Sign in" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a separate form cannot name the landmark");
+});
+
+test("the landmark bridge refuses a password inside a nested application landmark", () => {
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sign in" }),
+      nest(3,
+        nest(3, identifierInput()),
+        el("section", { role: "application" }, nest(3, futurePasswordStep()))
+      ),
+      nest(3, el("button", { type: "button", text: "Next" }))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a password in a nested application belongs to another region");
+});
+
+test("the landmark bridge refuses an action owned by another form", () => {
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sign in" }),
+      nest(3,
+        nest(3, identifierInput()),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("form", {}, el("button", { text: "Next" })))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "a form-less field cannot borrow an action owned by a form");
+});
+
+test("the landmark bridge refuses an action inside a separate dialog", () => {
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sign in" }),
+      nest(3,
+        nest(3, identifierInput()),
+        nest(3, futurePasswordStep())
+      ),
+      nest(3, el("div", { role: "dialog" }, el("button", { type: "button", text: "Next" })))
+    )
+  );
+
+  assert.equal(result.isLogin, false, "controls in separate dialog-like regions cannot associate");
+});
+
+test("a landmark role on <body> does not bridge the whole document", () => {
+  // The same shape that matches inside <main>, with the landmark role on <body>
+  // instead. <body> describes the document rather than a region within it, so
+  // bridging it would associate every control on the page with every other.
+  const result = detectInBody({ role: "main" },
+    el("h1", { text: "Sign in" }),
+    el("div", {},
+      nest(3, identifierInput()),
+      nest(3, futurePasswordStep())
+    ),
+    nest(3, el("button", { type: "button", text: "Next" }))
+  );
+
+  assert.equal(result.isLogin, false, "the document itself is not an authentication region");
+});
+
+test("an embedded marketing-page login form keeps the password confidence", () => {
+  // A rendered password field inside an ordinary content page still matches the
+  // password pattern outright: the narrow bridge above changes nothing for the
+  // genuine embedded login forms that were already detected.
+  const result = detect(
+    el("main", {},
+      el("h1", { text: "Sleep better tonight" }),
+      el("section", {},
+        el("h2", { text: "Log in" }),
+        el("input", { type: "email", autocomplete: "username" }),
+        el("input", { type: "password", autocomplete: "current-password" }),
+        el("button", { text: "Log in" })
+      )
+    )
+  );
+
+  assert.equal(result.isLogin, true);
+  assert.equal(result.confidence, PASSWORD_CONFIDENCE);
 });
 
 test("plain wrapper divs do not broaden form-less association", () => {
