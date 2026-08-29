@@ -1,6 +1,6 @@
 {
   "name": "yodel-phish-extension",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local anti-phishing protection for Chromium browsers",
   "license": "AGPL-3.0-only",
   "private": true,

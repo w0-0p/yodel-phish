@@ -5,7 +5,7 @@ impersonation, ClickFix-style clipboard attacks, and suspicious OAuth
 device-code navigation. Detection runs locally with OCR, OpenCV, YOLO, and
 DINOv2.
 
-> **Beta software:** version 0.1.0 is intended for testing.
+> **Beta software:** version 0.1.1 is intended for testing.
 
 ## Privacy
 
@@ -56,10 +56,10 @@ npm run test:integration
 npm run package
 ```
 
-The ZIP is written as `build/yodel-phish-0.1.0.zip`. Packaging uses an
+The ZIP is written as `build/yodel-phish-0.1.1.zip`. Packaging uses an
 explicit allowlist, verifies model hashes again, and places `manifest.json`
 at the archive root. It also writes
-`build/yodel-phish-0.1.0.zip.SOURCE.txt`, which identifies the corresponding
+`build/yodel-phish-0.1.1.zip.SOURCE.txt`, which identifies the corresponding
 source for that exact version and must be distributed beside the ZIP.
 
 ## Advanced settings

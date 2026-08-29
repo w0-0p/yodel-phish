@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Yodel Phish",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minimum_chrome_version": "116",
   "incognito": "split",
   "description": "Anti-phishing browser extension — detects login page impersonation.",

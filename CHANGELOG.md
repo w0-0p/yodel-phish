@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.1 — beta
+
+- Hardened login detection for deeply nested and form-less identifier-first
+  pages, email-verification stages, and Google sign-in variants.
+- Added lightweight cross-domain login handover so related authentication
+  navigations can retain the correct analysis context.
+- Made trusted-site enrollment interactive and bound it to the active document,
+  preventing stale or repeatedly cancelled logo-selection flows.
+- Moved logo detection into a cancellable worker and made navigation,
+  progress-banner, shield, and overlay cleanup more reliable.
+- Strengthened ClickFix protection for long clipboard values and arbitrarily
+  complex command clauses, with warnings decided before navigation.
+- Added browser integration coverage for login detection, banners, shields,
+  inference workers, UI overlays, and ClickFix warnings.
+- Added the GitHub Pages documentation site and refreshed privacy, security,
+  model provenance, and public build documentation.
+
 ## 0.1.0 — beta
 
 - Initial public beta source release.

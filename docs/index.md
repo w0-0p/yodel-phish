@@ -20,7 +20,7 @@
   <a href="https://github.com/w0-0p/yodel-phish/blob/main/PRIVACY.md">Privacy</a>
 </p>
 
-> **Public beta:** Yodel Phish version 0.1.0 is still being tested.
+> **Public beta:** Yodel Phish version 0.1.1 is still being tested.
 
 ## Yodel Phish protects from
 
