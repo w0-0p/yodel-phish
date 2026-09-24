@@ -20,7 +20,7 @@
   <a href="https://github.com/w0-0p/yodel-phish/blob/main/PRIVACY.md">Privacy</a>
 </p>
 
-> **Public beta:** Yodel Phish version 0.1.1 is still being tested.
+> **Public beta:** Yodel Phish version 0.1.*.
 
 ## Yodel Phish protects from
 
@@ -45,7 +45,7 @@ Yodel Phish performs its analysis inside the browser. When it finds a page that 
 
 1. **Define trusted references.** After installation, visit the login pages of services you use, such as email or online banking. Yodel Phish detects the login form and lets you add the site to your trusted list and select the service's logo. It stores the hostname, logo, and relevant brand terms locally.
 2. **Detect login pages.** While browsing, when a page contains sign-in controls, Yodel Phish compares it with your trusted references. If it visually resembles a trusted site but uses a different domain, the extension raises a warning.
-3. **Compare multiple signals.** OYodel Phish checks brand text with OCR, compares logos with computer vision, and uses DINOv2 embeddings for additional visual similarity. These signals are analysed and combined into a detection score.
+3. **Compare multiple signals.** Yodel Phish checks brand text with OCR, compares logos with computer vision, and uses DINOv2 embeddings for additional visual similarity. These signals are analysed and combined into a detection score.
 4. **Show the result.** Trusted sites receive a confirmation banner. Suspicious pages trigger a warning. High-confidence impersonation attempts are blocked with no option to continue.
 
 *Menu Walkthrough*
@@ -118,6 +118,9 @@ Advanced controls can reduce the default protection level. They are intended for
 ## Install and try it
 
 Yodel Phish currently targets Chrome and compatible Chromium browsers, version 116 or later.
+
+[Chrome Store](https://chromewebstore.google.com/detail/yodel-phish/fcfhkppicmpjddbkhaffnpjcgnkgeocc)  
+[Edge Store](https://microsoftedge.microsoft.com/addons/detail/yodel-phish/fodeeecpnppefjpbaochmcglikhimjpf)
 
 For a local build from source:
 
